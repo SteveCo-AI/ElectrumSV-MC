@@ -74,6 +74,14 @@ struct Account {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AddressScan {
+    account_id: i64,
+    wallet_instance_token: String,
+    end_index_exclusive: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct History {
     account_id: Option<i64>,
     limit: Option<i64>,
@@ -221,7 +229,7 @@ async fn dispatch_inner(
     }
     if matches!(
         method,
-        "connect_server" | "disconnect_server" | "sync_wallet"
+        "connect_server" | "disconnect_server" | "sync_wallet" | "scan_address_range"
     ) && !caps.network
     {
         return Err((-32000, "network capability disabled".into()));
@@ -284,6 +292,13 @@ async fn dispatch_inner(
         "sync_wallet" => {
             let p: Account = parse(params)?;
             output(crate::commands::network::sync_wallet_inner(state, p.account_id).await)
+        }
+        "scan_address_range" => {
+            let p: AddressScan = parse(params)?;
+            if !(1..=1000).contains(&p.end_index_exclusive) || p.wallet_instance_token.is_empty() {
+                return Err((-32602, "Invalid params".into()));
+            }
+            output(crate::commands::network::scan_address_range_inner(state, p.account_id, &p.wallet_instance_token, p.end_index_exclusive).await)
         }
         "prepare_tx" => {
             let p: Prepare = parse(params)?;

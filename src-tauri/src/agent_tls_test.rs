@@ -80,6 +80,218 @@ async fn server(cert: &'static [u8], target: String, raw: String, txid: String,
     (port, task)
 }
 
+async fn scan_server(targets: std::collections::HashMap<String, (String,String,u64)>, histories: Arc<AtomicUsize>, gate: Option<(tokio::sync::oneshot::Sender<()>,tokio::sync::oneshot::Receiver<()>)>, bad_index: bool) -> (u16, tokio::task::JoinHandle<()>) {
+    let acceptor = TlsAcceptor::from(Arc::new(server_config(CERT)));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let targets = Arc::new(targets);
+    let task = tokio::spawn(async move {
+        let mut gate = gate;
+        let (socket, _) = listener.accept().await.unwrap();
+        let tls = acceptor.accept(socket).await.unwrap();
+        let (read, mut write) = tokio::io::split(tls);
+        let mut lines = BufReader::new(read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let req: Value = serde_json::from_str(&line).unwrap();
+            let method = req["method"].as_str().unwrap();
+            let key = req["params"][0].as_str().unwrap_or("");
+            let target = targets.get(key);
+            let result = match method {
+                "server.version" => json!(["local-test", "1.4"]),
+                "blockchain.scripthash.get_history" => {
+                    histories.fetch_add(1, Ordering::SeqCst);
+                    if let Some((started,resume)) = gate.take() { let _ = started.send(()); let _ = resume.await; }
+                    target.map_or(json!([]), |(_,txid,_)| json!([{"tx_hash":txid,"height":123}]))
+                }
+                "blockchain.scripthash.get_balance" => json!({"confirmed":target.map_or(0, |(_,_,value)| *value), "unconfirmed":0}),
+                "blockchain.scripthash.listunspent" => target.map_or(json!([]), |(_,txid,value)| json!([{"tx_hash":txid,"tx_pos":if bad_index { u64::from(u32::MAX)+1 } else { 0 },"value":value,"height":123}])),
+                "blockchain.transaction.get" => targets.values().find(|(_,txid,_)| txid == key).map_or(Value::Null, |(raw,_,_)| json!(raw)),
+                "blockchain.scripthash.subscribe" => Value::Null,
+                _ => panic!("unexpected scan RPC method {method}"),
+            };
+            let response = json!({"id":req["id"], "result":result});
+            if write.write_all(format!("{response}\n").as_bytes()).await.is_err() { break; }
+        }
+    });
+    (port, task)
+}
+
+#[tokio::test]
+async fn agent_tls_explicit_scan_both_branches_preserves_marker() {
+    use bsv::compat::bip32::ExtendedKey;
+    use crate::db::repositories;
+    for marker in [false,true] {
+        let dir = std::env::temp_dir().join(format!("electrumsv-explicit-scan-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = AppState::new();
+        state.data_dir = dir.to_str().unwrap().into();
+        let caps = Capabilities { network: true, ..Default::default() };
+        let call = |method, params| dispatch_inner(&state, caps, method, params, None);
+        let created = call("create_wallet", json!({"name":"synthetic","password":"pw","mnemonic":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"})).await.unwrap();
+        let account = created["account_id"].as_i64().unwrap();
+        let (pool,xprv,token) = {
+            let guard = state.active_wallet.lock().unwrap();
+            let wallet = guard.as_ref().unwrap();
+            (wallet.db_pool.clone(),wallet.decrypted_xprv.clone().unwrap(),wallet.instance_token.clone())
+        };
+        let master: (i64,) = sqlx::query_as("SELECT default_masterkey_id FROM Accounts WHERE account_id=?").bind(account).fetch_one(&pool).await.unwrap();
+        sqlx::query("INSERT INTO KeyInstances (keyinstance_id,account_id,masterkey_id,derivation_type,derivation_data,script_type,flags,date_created,date_updated) VALUES (-1,?,?,?,?,?,0,1,1)")
+            .bind(account).bind(master.0).bind(repositories::derivation_type::BIP32).bind(br#"{"subpath":[0,0]}"#.as_slice()).bind(repositories::script_type::P2PKH).execute(&pool).await.unwrap();
+        if marker { sqlx::query("INSERT INTO WalletData(key,value,date_created,date_updated) VALUES (?,?,1,1)").bind(format!("address_discovery_v1_{account}")).bind("done").execute(&pool).await.unwrap(); }
+        let key = ExtendedKey::from_string(&xprv).unwrap();
+        let mut targets = std::collections::HashMap::new();
+        for chain in 0..=1 {
+            let public = key.derive(&format!("{chain}/25")).unwrap().public_key().unwrap();
+            let address = crate::core::address::pubkey_to_p2pkh_address(&public);
+            let target = crate::network::backend::scripthash_from_address(&address).unwrap();
+            let mut tx = Transaction::new();
+            tx.inputs.push(TransactionInput { source_txid: Some("00".repeat(32)), source_output_index: u32::MAX, ..Default::default() });
+            tx.outputs.push(TransactionOutput { satoshis: Some(50_000 + chain), locking_script: P2PKH::from_address(&address).unwrap().lock().unwrap(), change: false });
+            targets.insert(target, (tx.to_hex().unwrap(),tx.id().unwrap(),50_000+chain));
+        }
+        let histories = Arc::new(AtomicUsize::new(0));
+        let (port, server_task) = scan_server(targets, histories.clone(), None, false).await;
+        dispatch_inner(&state, caps, "connect_server", json!({"host":"127.0.0.1","port":port}), Some(roots())).await.unwrap();
+        let params = json!({"account_id":account,"wallet_instance_token":token,"end_index_exclusive":26});
+        assert_eq!(dispatch_inner(&state, Capabilities::default(), "scan_address_range", params.clone(), None).await.unwrap_err().0, -32000);
+        assert_eq!(call("scan_address_range", json!({"account_id":account,"wallet_instance_token":token,"end_index_exclusive":1001})).await.unwrap_err().0, -32602);
+        let result = call("scan_address_range", params).await.unwrap();
+        assert_eq!((result["start_index"].as_u64(),result["end_index_exclusive"].as_u64(),result["new_keys"].as_u64()),(Some(0),Some(26),Some(2)));
+        assert_eq!(histories.load(Ordering::SeqCst),55);
+        let keys = repositories::get_keyinstances_for_account(&pool,account).await.unwrap();
+        assert_eq!(keys.len(),3);
+        assert!(keys.iter().any(|key| key.keyinstance_id == -1));
+        let outputs = repositories::get_utxos_for_account(&pool,account).await.unwrap();
+        for chain in 0..=1 {
+            let discovered = keys.iter().find(|key| serde_json::from_slice::<Value>(&key.derivation_data).unwrap()["subpath"] == json!([chain,25])).unwrap();
+            let output = outputs.iter().find(|out| out.value == 50_000 + chain).unwrap();
+            assert_eq!(output.keyinstance_id,discovered.keyinstance_id);
+        }
+        assert_eq!(repositories::get_wallet_data(&pool,&format!("address_discovery_v1_{account}")).await.unwrap().as_deref(),marker.then_some("done"));
+        let history = call("get_history",json!({"account_id":account})).await.unwrap();
+        assert_eq!(history.as_array().unwrap().len(),2);
+        let balance = call("get_balance",json!({"account_id":account})).await.unwrap();
+        let key_snapshot = keys.iter().map(|key| (key.keyinstance_id,key.derivation_data.clone())).collect::<Vec<_>>();
+        let output_snapshot = outputs.iter().map(|out| (out.tx_hash.clone(),out.tx_index,out.keyinstance_id,out.value,out.script_pubkey.clone())).collect::<Vec<_>>();
+        let history_count = histories.load(Ordering::SeqCst);
+        drop(pool);
+        call("close_wallet",json!({})).await.unwrap();
+        let wallet_path = created["wallet_path"].as_str().unwrap();
+        crate::services::wallet_service::open_wallet(&state,wallet_path).await.unwrap();
+        crate::services::wallet_service::unlock_wallet_authorized(&state,"pw",None).await.unwrap();
+        let pool = { state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone() };
+        let reopened_keys = repositories::get_keyinstances_for_account(&pool,account).await.unwrap();
+        assert_eq!(reopened_keys.iter().map(|key| (key.keyinstance_id,key.derivation_data.clone())).collect::<Vec<_>>(),key_snapshot);
+        let reopened_outputs = repositories::get_utxos_for_account(&pool,account).await.unwrap();
+        assert_eq!(reopened_outputs.iter().map(|out| (out.tx_hash.clone(),out.tx_index,out.keyinstance_id,out.value,out.script_pubkey.clone())).collect::<Vec<_>>(),output_snapshot);
+        assert_eq!(call("get_history",json!({"account_id":account})).await.unwrap(),history);
+        assert_eq!(call("get_balance",json!({"account_id":account})).await.unwrap(),balance);
+        assert_eq!(repositories::get_wallet_data(&pool,&format!("address_discovery_v1_{account}")).await.unwrap().as_deref(),marker.then_some("done"));
+        assert!(crate::commands::network::sync_wallet_inner(&state,Some(account)).await.unwrap().synced);
+        let extra_histories = histories.load(Ordering::SeqCst)-history_count;
+        if marker { assert_eq!(extra_histories,keys.len()); } else { assert!(extra_histories > keys.len()); }
+        let resynced_keys = repositories::get_keyinstances_for_account(&pool,account).await.unwrap();
+        assert_eq!(resynced_keys.iter().map(|key| (key.keyinstance_id,key.derivation_data.clone())).collect::<Vec<_>>(),key_snapshot);
+        let resynced_outputs = repositories::get_utxos_for_account(&pool,account).await.unwrap();
+        assert_eq!(resynced_outputs.iter().map(|out| (out.tx_hash.clone(),out.tx_index,out.keyinstance_id,out.value,out.script_pubkey.clone())).collect::<Vec<_>>(),output_snapshot);
+        assert_eq!(call("get_history",json!({"account_id":account})).await.unwrap(),history);
+        assert_eq!(call("get_balance",json!({"account_id":account})).await.unwrap(),balance);
+        assert_eq!(repositories::get_wallet_data(&pool,&format!("address_discovery_v1_{account}")).await.unwrap().as_deref(),Some("done"));
+        call("disconnect_server",json!({})).await.unwrap();
+        server_task.abort();
+        drop(pool);
+        call("close_wallet",json!({})).await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn agent_tls_explicit_scan_rejects_wallet_reopen_before_commit() {
+    use crate::db::repositories;
+    let dir = std::env::temp_dir().join(format!("electrumsv-scan-reopen-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut state = AppState::new();
+    state.data_dir = dir.to_str().unwrap().into();
+    let caps = Capabilities { network: true, ..Default::default() };
+    let call = |method, params| dispatch_inner(&state, caps, method, params, None);
+    let created = call("create_wallet", json!({"name":"synthetic","password":"pw","mnemonic":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"})).await.unwrap();
+    let account = created["account_id"].as_i64().unwrap();
+    let path = created["wallet_path"].as_str().unwrap().to_owned();
+    let (pool,token) = {
+        let guard = state.active_wallet.lock().unwrap();
+        let wallet = guard.as_ref().unwrap();
+        (wallet.db_pool.clone(),wallet.instance_token.clone())
+    };
+    let master: (i64,) = sqlx::query_as("SELECT default_masterkey_id FROM Accounts WHERE account_id=?").bind(account).fetch_one(&pool).await.unwrap();
+    sqlx::query("INSERT INTO KeyInstances (keyinstance_id,account_id,masterkey_id,derivation_type,derivation_data,script_type,flags,date_created,date_updated) VALUES (-1,?,?,?,?,?,0,1,1)")
+        .bind(account).bind(master.0).bind(repositories::derivation_type::BIP32).bind(br#"{"subpath":[0,0]}"#.as_slice()).bind(repositories::script_type::P2PKH).execute(&pool).await.unwrap();
+    let (started_tx,started_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx,resume_rx) = tokio::sync::oneshot::channel();
+    let (port,server_task) = scan_server(std::collections::HashMap::new(), Arc::new(AtomicUsize::new(0)), Some((started_tx,resume_rx)), false).await;
+    dispatch_inner(&state,caps,"connect_server",json!({"host":"127.0.0.1","port":port}),Some(roots())).await.unwrap();
+    let scan = crate::commands::network::scan_address_range_inner(&state,account,&token,1);
+    tokio::pin!(scan);
+    tokio::select! { result = &mut scan => panic!("scan finished before barrier: {result:?}"), _ = started_rx => {} }
+    drop(pool);
+    call("close_wallet",json!({})).await.unwrap();
+    crate::services::wallet_service::open_wallet(&state,&path).await.unwrap();
+    resume_tx.send(()).unwrap();
+    assert!(scan.await.unwrap_err().contains("active wallet changed"));
+    let pool = { state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone() };
+    let keys = repositories::get_keyinstances_for_account(&pool,account).await.unwrap();
+    assert_eq!(keys.len(),1);
+    assert_eq!(keys[0].keyinstance_id,-1);
+    assert!(repositories::get_wallet_data(&pool,&format!("address_discovery_v1_{account}")).await.unwrap().is_none());
+    assert!(repositories::get_utxos_for_account(&pool,account).await.unwrap().is_empty());
+    call("disconnect_server",json!({})).await.unwrap();
+    server_task.abort();
+    drop(pool);
+    call("close_wallet",json!({})).await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn agent_tls_explicit_scan_rejects_overflowing_index_without_commit() {
+    use bsv::compat::bip32::ExtendedKey;
+    use crate::db::repositories;
+    let dir = std::env::temp_dir().join(format!("electrumsv-scan-bad-index-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut state = AppState::new();
+    state.data_dir = dir.to_str().unwrap().into();
+    let caps = Capabilities { network: true, ..Default::default() };
+    let call = |method, params| dispatch_inner(&state,caps,method,params,None);
+    let created = call("create_wallet",json!({"name":"synthetic","password":"pw","mnemonic":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"})).await.unwrap();
+    let account = created["account_id"].as_i64().unwrap();
+    let (pool,xprv,token) = {
+        let guard = state.active_wallet.lock().unwrap();
+        let wallet = guard.as_ref().unwrap();
+        (wallet.db_pool.clone(),wallet.decrypted_xprv.clone().unwrap(),wallet.instance_token.clone())
+    };
+    let public = ExtendedKey::from_string(&xprv).unwrap().derive("0/0").unwrap().public_key().unwrap();
+    let address = crate::core::address::pubkey_to_p2pkh_address(&public);
+    let target = crate::network::backend::scripthash_from_address(&address).unwrap();
+    let mut funding = Transaction::new();
+    funding.inputs.push(TransactionInput { source_txid:Some("00".repeat(32)), source_output_index:u32::MAX, ..Default::default() });
+    funding.outputs.push(TransactionOutput { satoshis:Some(50), locking_script:P2PKH::from_address(&address).unwrap().lock().unwrap(), change:false });
+    let mut targets = std::collections::HashMap::new();
+    targets.insert(target,(funding.to_hex().unwrap(),funding.id().unwrap(),50));
+    let (port,server_task) = scan_server(targets,Arc::new(AtomicUsize::new(0)),None,true).await;
+    dispatch_inner(&state,caps,"connect_server",json!({"host":"127.0.0.1","port":port}),Some(roots())).await.unwrap();
+    assert!(crate::commands::network::scan_address_range_inner(&state,account,&token,1).await.unwrap_err().contains("tx_pos"));
+    assert!(repositories::get_keyinstances_for_account(&pool,account).await.unwrap().is_empty());
+    assert!(repositories::get_wallet_data(&pool,&format!("address_discovery_v1_{account}")).await.unwrap().is_none());
+    assert!(repositories::get_utxos_for_account(&pool,account).await.unwrap().is_empty());
+    assert!(call("get_history",json!({"account_id":account})).await.unwrap().as_array().unwrap().is_empty());
+    let transactions: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM Transactions").fetch_one(&pool).await.unwrap();
+    let deltas: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM TransactionDeltas").fetch_one(&pool).await.unwrap();
+    assert_eq!((transactions.0,deltas.0),(0,0));
+    call("disconnect_server",json!({})).await.unwrap();
+    server_task.abort();
+    drop(pool);
+    call("close_wallet",json!({})).await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn agent_tls_synthetic_negative_key_and_discovery_sync() {
     use bsv::compat::bip32::ExtendedKey;

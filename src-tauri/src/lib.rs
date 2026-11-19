@@ -77,6 +77,7 @@ pub fn run() {
             commands::network::disconnect_server,
             commands::network::set_network_backend,
             commands::network::sync_wallet,
+            commands::network::scan_address_range,
             commands::network::ban_server,
             commands::network::get_servers_by_status,
             // Header Store commands (Milestone 4 — Header-Store / SPV)

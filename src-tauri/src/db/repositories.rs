@@ -163,6 +163,13 @@ pub async fn get_keyinstances_for_account(
     Ok(rows)
 }
 
+pub async fn get_keyinstances_for_account_bounded(pool: &SqlitePool, account_id: i64, max: u32) -> anyhow::Result<Vec<KeyInstanceRow>> {
+    let rows = sqlx::query_as::<_, KeyInstanceRow>("SELECT * FROM KeyInstances WHERE account_id = ? ORDER BY keyinstance_id LIMIT ?")
+        .bind(account_id).bind(i64::from(max) + 1).fetch_all(pool).await?;
+    if rows.len() > max as usize { anyhow::bail!("scan key limit exceeded"); }
+    Ok(rows)
+}
+
 /// Get a single KeyInstance by ID.
 pub async fn get_keyinstance(
     pool: &SqlitePool,
@@ -644,6 +651,50 @@ pub struct SyncKeySnapshot {
     pub outputs: Vec<SyncOutput>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ScanDerivationSource {
+    pub account_id: i64,
+    pub master: MasterKeyRow,
+}
+
+pub(crate) async fn load_scan_derivation_source(pool: &SqlitePool, account_id: i64) -> anyhow::Result<ScanDerivationSource> {
+    let master: MasterKeyRow = sqlx::query_as("SELECT m.* FROM Accounts a JOIN MasterKeys m ON m.masterkey_id=a.default_masterkey_id WHERE a.account_id=?")
+        .bind(account_id).fetch_one(pool).await?;
+    Ok(ScanDerivationSource { account_id, master })
+}
+
+pub(crate) fn validate_scan_inventory(
+    source: &ScanDerivationSource, keys: &[KeyInstanceRow], discovered: &[(u64,u64)],
+    end: u32, deadline: tokio::time::Instant,
+) -> anyhow::Result<std::collections::HashMap<SyncKeyRef,(u64,u64)>> {
+    use std::collections::{HashMap,HashSet};
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct KeyPath { subpath: [u32;2] }
+    if !(1..=1000).contains(&end) || source.master.derivation_type != derivation_type::BIP32 || source.master.parent_masterkey_id.is_some() {
+        anyhow::bail!("unsupported scan derivation source or range");
+    }
+    let mut paths = HashMap::new();
+    let mut unique = HashSet::new();
+    for key in keys {
+        if tokio::time::Instant::now() >= deadline { anyhow::bail!("scan deadline exceeded"); }
+        if key.account_id != source.account_id || key.masterkey_id != Some(source.master.masterkey_id)
+            || key.derivation_type != derivation_type::BIP32 || key.script_type != script_type::P2PKH || key.derivation_data.len() > 256 {
+            anyhow::bail!("unsupported scan key inventory");
+        }
+        let path: KeyPath = serde_json::from_slice(&key.derivation_data).map_err(|_| anyhow::anyhow!("unsupported scan key path"))?;
+        let (chain,index) = (u64::from(path.subpath[0]),u64::from(path.subpath[1]));
+        if chain > 1 || index >= (1 << 31) || !unique.insert((chain,index)) { anyhow::bail!("unsupported or duplicate scan key path"); }
+        paths.insert(SyncKeyRef::Existing(key.keyinstance_id),(chain,index));
+    }
+    for (position,&(chain,index)) in discovered.iter().enumerate() {
+        if tokio::time::Instant::now() >= deadline { anyhow::bail!("scan deadline exceeded"); }
+        if chain > 1 || index >= u64::from(end) || !unique.insert((chain,index)) { anyhow::bail!("unsupported or duplicate discovered path"); }
+        paths.insert(SyncKeyRef::Discovered(position),(chain,index));
+    }
+    Ok(paths)
+}
+
 /// Atomically replace one account's previously fetched and validated sync snapshot.
 pub async fn replace_sync_snapshot(
     pool: &SqlitePool, account_id: i64, expected_keys: &[KeyInstanceRow],
@@ -737,6 +788,200 @@ async fn sync_upsert_transaction(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, h
     let flags = if height.is_none() { tx_flags::IS_UNCONFIRMED } else { 0 };
     sqlx::query("INSERT INTO Transactions (tx_hash, tx_data, block_height, flags, date_created, date_updated) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(tx_hash) DO UPDATE SET tx_data = COALESCE(excluded.tx_data, Transactions.tx_data), block_height = excluded.block_height, flags = excluded.flags, date_updated = excluded.date_updated")
         .bind(hash).bind(raw).bind(height).bind(flags).bind(now).bind(now).execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// Merge snapshots whose script-to-key ownership was validated by the scan collector.
+pub(crate) async fn merge_explicit_scan_snapshot(
+    pool: &SqlitePool, account_id: i64, expected_keys: &[KeyInstanceRow],
+    source: &ScanDerivationSource, discovered: &[(u64, u64)], snapshots: &[SyncKeySnapshot], end: u32, deadline: tokio::time::Instant,
+) -> anyhow::Result<()> {
+    merge_explicit_scan_impl(pool, account_id, expected_keys, source, discovered, snapshots, end, deadline, #[cfg(test)] None).await
+}
+
+#[cfg(test)]
+struct ScanTestBarrier { started: tokio::sync::oneshot::Sender<()>, resume: tokio::sync::oneshot::Receiver<()> }
+
+async fn merge_explicit_scan_impl(
+    pool: &SqlitePool, account_id: i64, expected_keys: &[KeyInstanceRow],
+    source: &ScanDerivationSource, discovered: &[(u64, u64)], snapshots: &[SyncKeySnapshot], end: u32, deadline: tokio::time::Instant,
+    #[cfg(test)] barrier: Option<ScanTestBarrier>,
+) -> anyhow::Result<()> {
+    use std::collections::{HashMap, HashSet};
+    if expected_keys.len() > 100_000 || discovered.len() > 2000 { anyhow::bail!("scan key limit exceeded"); }
+    let key_paths = validate_scan_inventory(source, expected_keys, discovered, end, deadline)?;
+    let record: serde_json::Value = serde_json::from_slice(&source.master.derivation_data).map_err(|_| anyhow::anyhow!("invalid scan derivation source"))?;
+    let xpub = record.get("xpub").and_then(|value| value.as_str()).ok_or_else(|| anyhow::anyhow!("invalid scan derivation source"))?;
+    let account_key = bsv::compat::bip32::ExtendedKey::from_string(xpub).map_err(|_| anyhow::anyhow!("invalid scan derivation source"))?;
+    let expected: HashSet<SyncKeyRef> = expected_keys.iter().map(|k| SyncKeyRef::Existing(k.keyinstance_id))
+        .chain((0..discovered.len()).map(SyncKeyRef::Discovered)).collect();
+    let provided: HashSet<SyncKeyRef> = snapshots.iter().map(|s| s.key_id).collect();
+    if expected.len() != expected_keys.len() + discovered.len() || provided.len() != snapshots.len() || expected != provided {
+        anyhow::bail!("scan snapshot must contain every key exactly once");
+    }
+    if discovered.iter().collect::<HashSet<_>>().len() != discovered.len() { anyhow::bail!("duplicate discovered derivation path"); }
+    let mut outpoints = HashSet::new();
+    let mut raw_by_hash: HashMap<&[u8], &[u8]> = HashMap::new();
+    let mut heights: HashMap<&[u8], Option<i64>> = HashMap::new();
+    let mut history_count = 0usize;
+    for snapshot in snapshots {
+        if tokio::time::Instant::now() >= deadline { anyhow::bail!("scan deadline exceeded before commit"); }
+        for item in &snapshot.transactions {
+            history_count = history_count.checked_add(1).ok_or_else(|| anyhow::anyhow!("scan history count overflow"))?;
+            if history_count > 100_000 || item.raw.len() > 4 * 1024 * 1024 { anyhow::bail!("scan history or transaction size limit exceeded"); }
+            if item.raw.is_empty() { anyhow::bail!("scan transaction has no validated raw data"); }
+            if let Some(old) = raw_by_hash.insert(&item.hash, &item.raw) {
+                if old != item.raw.as_ref() { anyhow::bail!("conflicting scan transaction data"); }
+            }
+            if let Some(old) = heights.insert(&item.hash, item.height) {
+                if old != item.height { anyhow::bail!("inconsistent scan transaction heights"); }
+            }
+        }
+        let history: HashSet<&[u8]> = snapshot.transactions.iter().map(|item| item.hash.as_slice()).collect();
+        if history.len() != snapshot.transactions.len() { anyhow::bail!("duplicate scan history entry"); }
+        for output in &snapshot.outputs {
+            if tokio::time::Instant::now() >= deadline { anyhow::bail!("scan deadline exceeded before commit"); }
+            if !outpoints.insert((output.hash.as_slice(), output.index)) { anyhow::bail!("duplicate UTXO outpoint in scan"); }
+            if outpoints.len() > 100_000 { anyhow::bail!("scan output limit exceeded"); }
+            if !history.contains(output.hash.as_slice()) { anyhow::bail!("scan output missing validated history"); }
+        }
+    }
+    if raw_by_hash.len() > 4096 || raw_by_hash.values().try_fold(0usize, |total, raw| total.checked_add(raw.len())).is_none_or(|size| size > 64 * 1024 * 1024) {
+        anyhow::bail!("scan raw transaction limit exceeded");
+    }
+    let mut parsed_by_hash = HashMap::new();
+    for (hash, raw) in &raw_by_hash {
+        if tokio::time::Instant::now() >= deadline { anyhow::bail!("scan deadline exceeded before commit"); }
+        crate::core::transaction::validate_transaction_wire(raw).map_err(anyhow::Error::msg)?;
+        let raw_hex = hex::encode(raw);
+        let parsed = bsv::transaction::transaction::Transaction::from_hex(&raw_hex).map_err(|e| anyhow::anyhow!("invalid scan transaction: {e}"))?;
+        if parsed.id().map_err(|e| anyhow::anyhow!("invalid scan transaction ID: {e}"))? != crate::core::address::hash_to_hex_str(hash)
+            || parsed.to_hex().map_err(|e| anyhow::anyhow!("invalid scan transaction: {e}"))? != raw_hex {
+            anyhow::bail!("scan transaction ID or encoding mismatch");
+        }
+        parsed_by_hash.insert(*hash, parsed);
+    }
+    for snapshot in snapshots {
+        if tokio::time::Instant::now() >= deadline { anyhow::bail!("scan deadline exceeded before commit"); }
+        let expected_script = if snapshot.outputs.is_empty() { None } else {
+            use bsv::script::templates::{p2pkh::P2PKH, ScriptTemplateLock};
+            let (chain,index) = key_paths.get(&snapshot.key_id).ok_or_else(|| anyhow::anyhow!("invalid scan key"))?;
+            let public = account_key.derive(&format!("{chain}/{index}")).map_err(|_| anyhow::anyhow!("invalid scan key derivation"))?
+                .public_key().map_err(|_| anyhow::anyhow!("invalid scan key derivation"))?;
+            let address = crate::core::address::pubkey_to_p2pkh_address(&public);
+            Some(P2PKH::from_address(&address).map_err(|_| anyhow::anyhow!("invalid scan key address"))?
+                .lock().map_err(|_| anyhow::anyhow!("invalid scan key script"))?.to_binary())
+        };
+        for output in &snapshot.outputs {
+            let parsed = parsed_by_hash.get(output.hash.as_slice()).ok_or_else(|| anyhow::anyhow!("missing scan transaction"))?;
+            let index = usize::try_from(output.index).map_err(|_| anyhow::anyhow!("invalid output index"))?;
+            let actual = parsed.outputs.get(index).ok_or_else(|| anyhow::anyhow!("scan output index out of range"))?;
+            if Some(actual.locking_script.to_binary()) != expected_script { anyhow::bail!("scan output does not belong to key"); }
+            if i64::try_from(actual.satoshis.ok_or_else(|| anyhow::anyhow!("missing output value"))?).ok() != Some(output.value)
+                || !hex::encode(actual.locking_script.to_binary()).eq_ignore_ascii_case(&output.script_pubkey) {
+                anyhow::bail!("scan output does not match raw transaction");
+            }
+            let coinbase = parsed.inputs.len() == 1 && parsed.inputs[0].source_output_index == u32::MAX
+                && parsed.inputs[0].source_txid.as_deref().is_some_and(|id| id.len() == 64 && id.bytes().all(|b| b == b'0'));
+            if output.coinbase != coinbase { anyhow::bail!("scan output coinbase mismatch"); }
+        }
+    }
+    let tx = tokio::time::timeout_at(deadline, async {
+    let mut tx = pool.begin().await?;
+    if source.account_id != account_id { anyhow::bail!("scan derivation source changed"); }
+    let master: Option<MasterKeyRow> = sqlx::query_as("SELECT m.* FROM Accounts a JOIN MasterKeys m ON m.masterkey_id=a.default_masterkey_id WHERE a.account_id=?")
+        .bind(account_id).fetch_optional(&mut *tx).await?;
+    if !master.as_ref().is_some_and(|m| m.masterkey_id == source.master.masterkey_id &&
+        m.parent_masterkey_id == source.master.parent_masterkey_id && m.derivation_type == source.master.derivation_type &&
+        m.derivation_data == source.master.derivation_data && m.date_created == source.master.date_created && m.date_updated == source.master.date_updated) {
+        anyhow::bail!("scan derivation source changed");
+    }
+    let current = sqlx::query_as::<_, KeyInstanceRow>("SELECT * FROM KeyInstances WHERE account_id=? ORDER BY keyinstance_id LIMIT 100001")
+        .bind(account_id).fetch_all(&mut *tx).await?;
+    if current.len() != expected_keys.len() || current.iter().zip(expected_keys).any(|(a,b)|
+        a.keyinstance_id != b.keyinstance_id || a.account_id != b.account_id || a.masterkey_id != b.masterkey_id ||
+        a.derivation_type != b.derivation_type || a.derivation_data != b.derivation_data || a.script_type != b.script_type ||
+        a.flags != b.flags || a.description != b.description || a.date_created != b.date_created || a.date_updated != b.date_updated) {
+        anyhow::bail!("account keys changed during scan");
+    }
+    let now = chrono::Utc::now().timestamp();
+    let mut new_ids = Vec::new();
+    if !discovered.is_empty() {
+        let master: (i64,) = sqlx::query_as("SELECT default_masterkey_id FROM Accounts WHERE account_id=? AND default_masterkey_id IS NOT NULL")
+            .bind(account_id).fetch_one(&mut *tx).await?;
+        for (chain, index) in discovered {
+            let data = serde_json::json!({"subpath":[chain,index]}).to_string().into_bytes();
+            let inserted = sqlx::query("INSERT INTO KeyInstances (account_id,masterkey_id,derivation_type,derivation_data,script_type,flags,description,date_created,date_updated) VALUES (?,?,?,?,?,0,NULL,?,?)")
+                .bind(account_id).bind(master.0).bind(derivation_type::BIP32).bind(data).bind(script_type::P2PKH).bind(now).bind(now).execute(&mut *tx).await?;
+            new_ids.push(inserted.last_insert_rowid());
+        }
+    }
+    #[cfg(test)]
+    if let Some(barrier) = barrier {
+        let _ = barrier.started.send(());
+        let _ = barrier.resume.await;
+    }
+    let resolve = |key: SyncKeyRef| -> anyhow::Result<i64> {
+        match key { SyncKeyRef::Existing(id) => Ok(id), SyncKeyRef::Discovered(index) => new_ids.get(index).copied().ok_or_else(|| anyhow::anyhow!("invalid discovered key")) }
+    };
+    for snapshot in snapshots {
+        let id = resolve(snapshot.key_id)?;
+        let incoming_outputs: HashSet<(&[u8], i64)> = snapshot.outputs.iter().map(|o| (o.hash.as_slice(),o.index)).collect();
+        let stored_outputs: Vec<(Vec<u8>, i64, i32)> = sqlx::query_as("SELECT tx_hash,tx_index,flags FROM TransactionOutputs WHERE keyinstance_id=?")
+            .bind(id).fetch_all(&mut *tx).await?;
+        for (hash, index, flags) in stored_outputs {
+            if flags & txo_flags::IS_SPENT == 0 && !incoming_outputs.contains(&(hash.as_slice(), index)) {
+                anyhow::bail!("scan conflict: existing unspent output is missing");
+            }
+        }
+        let incoming_history: HashSet<&[u8]> = snapshot.transactions.iter().map(|item| item.hash.as_slice()).collect();
+        let stored_history: Vec<(Vec<u8>,)> = sqlx::query_as("SELECT tx_hash FROM TransactionDeltas WHERE keyinstance_id=?")
+            .bind(id).fetch_all(&mut *tx).await?;
+        if stored_history.iter().any(|(hash,)| !incoming_history.contains(hash.as_slice())) {
+            anyhow::bail!("scan conflict: existing history owner is missing");
+        }
+        for output in &snapshot.outputs {
+            let old: Option<(i64,i64,i32,Option<String>)> = sqlx::query_as("SELECT keyinstance_id,value,flags,script_pubkey FROM TransactionOutputs WHERE tx_hash=? AND tx_index=?")
+                .bind(&output.hash).bind(output.index).fetch_optional(&mut *tx).await?;
+            if let Some((owner,value,flags,script)) = old {
+                if owner != id || value != output.value || flags & txo_flags::IS_SPENT != 0 ||
+                    script.as_deref().filter(|s| !s.is_empty()).is_some_and(|s| !s.eq_ignore_ascii_case(&output.script_pubkey)) {
+                    anyhow::bail!("scan conflict: existing output differs or is spent");
+                }
+            }
+        }
+        for item in &snapshot.transactions {
+            let old_raw: Option<(Option<Vec<u8>>,)> = sqlx::query_as("SELECT tx_data FROM Transactions WHERE tx_hash=?")
+                .bind(&item.hash).fetch_optional(&mut *tx).await?;
+            if old_raw.and_then(|row| row.0).filter(|raw| !raw.is_empty()).is_some_and(|raw| raw.as_slice() != item.raw.as_ref()) {
+                anyhow::bail!("scan conflict: existing transaction bytes differ");
+            }
+            let old_delta: Option<(i64,i64)> = sqlx::query_as("SELECT value_delta,value_known FROM TransactionDeltas WHERE keyinstance_id=? AND tx_hash=?")
+                .bind(id).bind(&item.hash).fetch_optional(&mut *tx).await?;
+            if let Some((value, known)) = old_delta {
+                if known != 0 && item.delta.is_some_and(|delta| delta != value) { anyhow::bail!("scan conflict: existing known delta differs"); }
+            }
+        }
+    }
+    for snapshot in snapshots {
+        let id = resolve(snapshot.key_id)?;
+        for item in &snapshot.transactions {
+            let flags = if item.height.is_none() { tx_flags::IS_UNCONFIRMED } else { 0 };
+            sqlx::query("INSERT INTO Transactions (tx_hash,tx_data,block_height,flags,date_created,date_updated) VALUES (?,?,?,?,?,?) ON CONFLICT(tx_hash) DO UPDATE SET tx_data=CASE WHEN Transactions.tx_data IS NULL OR length(Transactions.tx_data)=0 THEN excluded.tx_data ELSE Transactions.tx_data END")
+                .bind(&item.hash).bind(item.raw.as_ref()).bind(item.height).bind(flags).bind(now).bind(now).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO TransactionDeltas (keyinstance_id,tx_hash,value_delta,date_created,date_updated,value_known) VALUES (?,?,?,?,?,?) ON CONFLICT(keyinstance_id,tx_hash) DO UPDATE SET value_delta=CASE WHEN TransactionDeltas.value_known=0 AND excluded.value_known=1 THEN excluded.value_delta ELSE TransactionDeltas.value_delta END,value_known=CASE WHEN TransactionDeltas.value_known=0 AND excluded.value_known=1 THEN 1 ELSE TransactionDeltas.value_known END")
+                .bind(id).bind(&item.hash).bind(item.delta.unwrap_or(0)).bind(now).bind(now).bind(i32::from(item.delta.is_some())).execute(&mut *tx).await?;
+        }
+        for output in &snapshot.outputs {
+            let flags = if output.coinbase { txo_flags::IS_COINBASE } else { 0 };
+            sqlx::query("INSERT INTO TransactionOutputs (tx_hash,tx_index,value,keyinstance_id,flags,script_pubkey,date_created,date_updated) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(tx_hash,tx_index) DO UPDATE SET script_pubkey=CASE WHEN TransactionOutputs.script_pubkey IS NULL OR TransactionOutputs.script_pubkey='' THEN excluded.script_pubkey ELSE TransactionOutputs.script_pubkey END")
+                .bind(&output.hash).bind(output.index).bind(output.value).bind(id).bind(flags).bind(&output.script_pubkey).bind(now).bind(now).execute(&mut *tx).await?;
+        }
+    }
+    Ok::<_, anyhow::Error>(tx)
+    }).await.map_err(|_| anyhow::anyhow!("scan deadline exceeded before commit"))??;
+    if tokio::time::Instant::now() >= deadline { anyhow::bail!("scan deadline exceeded before commit"); }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1421,6 +1666,19 @@ mod tests {
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn scan_test_master_record() -> Vec<u8> {
+        let key = bsv::compat::bip32::ExtendedKey::from_seed(&[7;64]).unwrap();
+        serde_json::json!({"xpub":key.to_public().unwrap().to_base58()}).to_string().into_bytes()
+    }
+
+    fn scan_test_script(chain: u32, index: u32) -> String {
+        use bsv::script::templates::{p2pkh::P2PKH,ScriptTemplateLock};
+        let key = bsv::compat::bip32::ExtendedKey::from_seed(&[7;64]).unwrap();
+        let public = key.derive(&format!("{chain}/{index}")).unwrap().public_key().unwrap();
+        let address = crate::core::address::pubkey_to_p2pkh_address(&public);
+        hex::encode(P2PKH::from_address(&address).unwrap().lock().unwrap().to_binary())
+    }
+
     async fn sync_db_snapshot(pool: &SqlitePool) -> Vec<Vec<String>> {
         let queries = [
             "SELECT quote(keyinstance_id)||','||quote(account_id)||','||quote(masterkey_id)||','||quote(derivation_type)||','||quote(derivation_data)||','||quote(script_type)||','||quote(flags)||','||quote(description)||','||quote(date_created)||','||quote(date_updated) FROM KeyInstances ORDER BY keyinstance_id",
@@ -1428,6 +1686,8 @@ mod tests {
             "SELECT quote(tx_hash)||','||quote(tx_data)||','||quote(proof_data)||','||quote(block_height)||','||quote(block_position)||','||quote(fee_value)||','||quote(flags)||','||quote(description)||','||quote(date_created)||','||quote(date_updated) FROM Transactions ORDER BY tx_hash",
             "SELECT quote(tx_hash)||','||quote(tx_index)||','||quote(value)||','||quote(keyinstance_id)||','||quote(flags)||','||quote(script_pubkey)||','||quote(date_created)||','||quote(date_updated) FROM TransactionOutputs ORDER BY tx_hash,tx_index",
             "SELECT quote(keyinstance_id)||','||quote(tx_hash)||','||quote(value_delta)||','||quote(value_known)||','||quote(date_created)||','||quote(date_updated) FROM TransactionDeltas ORDER BY keyinstance_id,tx_hash",
+                "SELECT quote(account_id)||','||quote(default_masterkey_id)||','||quote(default_script_type)||','||quote(account_name)||','||quote(date_created)||','||quote(date_updated) FROM Accounts ORDER BY account_id",
+                "SELECT quote(masterkey_id)||','||quote(parent_masterkey_id)||','||quote(derivation_type)||','||quote(derivation_data)||','||quote(date_created)||','||quote(date_updated) FROM MasterKeys ORDER BY masterkey_id",
         ];
         let mut all = Vec::new();
         for query in queries {
@@ -1435,6 +1695,253 @@ mod tests {
             all.push(rows.into_iter().map(|row| row.0).collect());
         }
         all
+    }
+
+    async fn explicit_scan_fixture() -> (SqlitePool, i64, Vec<KeyInstanceRow>, Vec<u8>, Vec<u8>) {
+        use bsv::script::locking_script::LockingScript;
+        use bsv::transaction::{transaction::Transaction, transaction_input::TransactionInput, transaction_output::TransactionOutput};
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        for migration in [include_str!("../../migrations/0022_create_database.sql"), include_str!("../../migrations/0031_txo_script_pubkey.sql"), include_str!("../../migrations/0032_transaction_delta_known.sql")] {
+            sqlx::query(migration).execute(&pool).await.unwrap();
+        }
+        let master = insert_master_key(&pool, None, derivation_type::BIP32, &scan_test_master_record()).await.unwrap();
+        let account = insert_account(&pool, Some(master), script_type::P2PKH, "synthetic").await.unwrap();
+        sqlx::query("INSERT INTO KeyInstances (keyinstance_id,account_id,masterkey_id,derivation_type,derivation_data,script_type,flags,date_created,date_updated) VALUES (-1,?,?,?,?,?,0,1,1)")
+            .bind(account).bind(master).bind(derivation_type::BIP32).bind(br#"{"subpath":[0,0]}"#.as_slice()).bind(script_type::P2PKH).execute(&pool).await.unwrap();
+        let mut tx = Transaction::new();
+        tx.inputs.push(TransactionInput { source_txid: Some("00".repeat(32)), source_output_index: u32::MAX, ..Default::default() });
+        let script = scan_test_script(0,0);
+        tx.outputs.push(TransactionOutput { satoshis: Some(50), locking_script: LockingScript::from_binary(&hex::decode(&script).unwrap()), change: false });
+        let hash = crate::core::address::hex_str_to_hash(&tx.id().unwrap()).unwrap();
+        let raw = hex::decode(tx.to_hex().unwrap()).unwrap();
+        upsert_transaction(&pool, &hash, Some(9), Some(&raw)).await.unwrap();
+        upsert_transaction_output(&pool, &hash, 0, 50, -1, txo_flags::IS_COINBASE, Some(&script)).await.unwrap();
+        upsert_transaction_delta(&pool, -1, &hash, 50).await.unwrap();
+        sqlx::query("UPDATE Transactions SET description='keep', proof_data=x'0102', flags=7 WHERE tx_hash=?").bind(&hash).execute(&pool).await.unwrap();
+        let keys = get_keyinstances_for_account(&pool, account).await.unwrap();
+        (pool, account, keys, hash, raw)
+    }
+
+    #[tokio::test]
+    async fn explicit_scan_rejects_changed_account_or_master_for_empty_account() {
+        for case in ["account", "master"] {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+            for migration in [include_str!("../../migrations/0022_create_database.sql"), include_str!("../../migrations/0031_txo_script_pubkey.sql"), include_str!("../../migrations/0032_transaction_delta_known.sql")] {
+                sqlx::query(migration).execute(&pool).await.unwrap();
+            }
+            let first = insert_master_key(&pool,None,derivation_type::BIP32,&scan_test_master_record()).await.unwrap();
+            let second = insert_master_key(&pool,None,derivation_type::BIP32,b"second").await.unwrap();
+            let account = insert_account(&pool,Some(first),script_type::P2PKH,"synthetic").await.unwrap();
+            let source = load_scan_derivation_source(&pool,account).await.unwrap();
+            if case == "account" { sqlx::query("UPDATE Accounts SET default_masterkey_id=? WHERE account_id=?").bind(second).bind(account).execute(&pool).await.unwrap(); }
+            else { sqlx::query("UPDATE MasterKeys SET derivation_data=? WHERE masterkey_id=?").bind(b"changed".as_slice()).bind(first).execute(&pool).await.unwrap(); }
+            let before = sync_db_snapshot(&pool).await;
+            let snapshots = [SyncKeySnapshot { key_id:SyncKeyRef::Discovered(0), transactions:vec![], outputs:vec![] }];
+            let error = merge_explicit_scan_snapshot(&pool,account,&[],&source,&[(1,25)],&snapshots,26,tokio::time::Instant::now()+std::time::Duration::from_secs(5)).await.unwrap_err();
+            assert!(error.to_string().contains("derivation source changed"));
+            assert_eq!(sync_db_snapshot(&pool).await,before);
+            pool.close().await;
+        }
+    }
+
+    fn explicit_scan_snapshot(hash: &[u8], raw: &[u8], delta: Option<i64>, output: bool) -> Vec<SyncKeySnapshot> {
+        vec![SyncKeySnapshot { key_id: SyncKeyRef::Existing(-1),
+            transactions: vec![SyncTransaction { hash: hash.to_vec(), height: Some(123), raw: raw.to_vec().into(), delta }],
+            outputs: if output { vec![SyncOutput { hash: hash.to_vec(), height: Some(123), index: 0, value: 50, coinbase: true, script_pubkey: scan_test_script(0,0) }] } else { vec![] },
+        }]
+    }
+
+    #[tokio::test]
+    async fn explicit_scan_rejects_unsupported_inventory_and_paths_without_writes() {
+        for case in ["missing_master","foreign_master","script_type","derivation_type","branch","hardened","extra_path","duplicate_existing","duplicate_discovered","duplicate_discovered_pair","invalid_discovered_branch","discovered_at_end"] {
+            let (pool, account, _keys, _hash, _raw) = explicit_scan_fixture().await;
+            let source = load_scan_derivation_source(&pool,account).await.unwrap();
+            match case {
+                "missing_master" => { sqlx::query("UPDATE KeyInstances SET masterkey_id=NULL WHERE keyinstance_id=-1").execute(&pool).await.unwrap(); }
+                "foreign_master" => { let other = insert_master_key(&pool,None,derivation_type::BIP32,&scan_test_master_record()).await.unwrap(); sqlx::query("UPDATE KeyInstances SET masterkey_id=? WHERE keyinstance_id=-1").bind(other).execute(&pool).await.unwrap(); }
+                "script_type" => { sqlx::query("UPDATE KeyInstances SET script_type=999 WHERE keyinstance_id=-1").execute(&pool).await.unwrap(); }
+                "derivation_type" => { sqlx::query("UPDATE KeyInstances SET derivation_type=999 WHERE keyinstance_id=-1").execute(&pool).await.unwrap(); }
+                "branch" => { sqlx::query("UPDATE KeyInstances SET derivation_data=? WHERE keyinstance_id=-1").bind(br#"{"subpath":[2,0]}"#.as_slice()).execute(&pool).await.unwrap(); }
+                "hardened" => { sqlx::query("UPDATE KeyInstances SET derivation_data=? WHERE keyinstance_id=-1").bind(br#"{"subpath":[0,2147483648]}"#.as_slice()).execute(&pool).await.unwrap(); }
+                "extra_path" => { sqlx::query("UPDATE KeyInstances SET derivation_data=? WHERE keyinstance_id=-1").bind(br#"{"subpath":[0,0],"extra":1}"#.as_slice()).execute(&pool).await.unwrap(); }
+                "duplicate_existing" => { insert_keyinstance(&pool,account,Some(source.master.masterkey_id),derivation_type::BIP32,br#"{"subpath":[0,0]}"#,script_type::P2PKH,0,None).await.unwrap(); }
+                _ => {}
+            }
+            let keys = get_keyinstances_for_account(&pool,account).await.unwrap();
+            let mut snapshots = keys.iter().map(|key| SyncKeySnapshot { key_id:SyncKeyRef::Existing(key.keyinstance_id), transactions:vec![], outputs:vec![] }).collect::<Vec<_>>();
+            let discovered = match case { "duplicate_discovered" => vec![(0,0)], "duplicate_discovered_pair" => vec![(1,25),(1,25)], "invalid_discovered_branch" => vec![(2,0)], "discovered_at_end" => vec![(0,26)], _ => vec![] };
+            for index in 0..discovered.len() { snapshots.push(SyncKeySnapshot { key_id:SyncKeyRef::Discovered(index), transactions:vec![], outputs:vec![] }); }
+            let before = sync_db_snapshot(&pool).await;
+            let error = merge_explicit_scan_snapshot(&pool,account,&keys,&source,&discovered,&snapshots,26,tokio::time::Instant::now()+std::time::Duration::from_secs(5)).await.unwrap_err();
+            assert!(error.to_string().contains("unsupported"), "{case}: {error}");
+            assert_eq!(sync_db_snapshot(&pool).await,before,"{case}");
+            pool.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_scan_rejects_valid_foreign_script_for_existing_and_discovered() {
+        use bsv::script::locking_script::LockingScript;
+        for discovered in [false,true] {
+            let (pool,account,keys,hash,raw) = explicit_scan_fixture().await;
+            let source = load_scan_derivation_source(&pool,account).await.unwrap();
+            let mut foreign = bsv::transaction::transaction::Transaction::from_hex(&hex::encode(&raw)).unwrap();
+            foreign.outputs[0].locking_script = LockingScript::from_binary(&hex::decode(scan_test_script(0,2)).unwrap());
+            let foreign_hash = crate::core::address::hex_str_to_hash(&foreign.id().unwrap()).unwrap();
+            let foreign_raw = hex::decode(foreign.to_hex().unwrap()).unwrap();
+            let foreign_snapshot = SyncKeySnapshot { key_id:if discovered { SyncKeyRef::Discovered(0) } else { SyncKeyRef::Existing(-1) },
+                transactions:vec![SyncTransaction { hash:foreign_hash.clone(), height:Some(1), raw:foreign_raw.into(), delta:Some(50) }],
+                outputs:vec![SyncOutput { hash:foreign_hash, height:Some(1), index:0, value:50, coinbase:true, script_pubkey:scan_test_script(0,2) }],
+            };
+            let mut snapshots = if discovered { explicit_scan_snapshot(&hash,&raw,Some(50),true) } else { vec![] };
+            snapshots.push(foreign_snapshot);
+            let paths = if discovered { vec![(1,25)] } else { vec![] };
+            let before = sync_db_snapshot(&pool).await;
+            let error = merge_explicit_scan_snapshot(&pool,account,&keys,&source,&paths,&snapshots,26,tokio::time::Instant::now()+std::time::Duration::from_secs(5)).await.unwrap_err();
+            assert!(error.to_string().contains("does not belong to key"));
+            assert_eq!(sync_db_snapshot(&pool).await,before);
+            pool.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_scan_conflicts_leave_all_tables_unchanged() {
+        for case in ["missing_unspent", "revive_spent", "wrong_value", "wrong_script", "wrong_raw", "missing_history", "wrong_delta", "cross_owner", "stale_key", "deadline"] {
+            let (pool, account, keys, hash, raw) = explicit_scan_fixture().await;
+            let source = load_scan_derivation_source(&pool, account).await.unwrap();
+            if case == "revive_spent" || case == "missing_history" {
+                sqlx::query("UPDATE TransactionOutputs SET flags=flags|? WHERE tx_hash=?").bind(txo_flags::IS_SPENT).bind(&hash).execute(&pool).await.unwrap();
+            }
+            if case == "wrong_value" { sqlx::query("UPDATE TransactionOutputs SET value=49 WHERE tx_hash=?").bind(&hash).execute(&pool).await.unwrap(); }
+            if case == "wrong_script" { sqlx::query("UPDATE TransactionOutputs SET script_pubkey='52' WHERE tx_hash=?").bind(&hash).execute(&pool).await.unwrap(); }
+            if case == "wrong_raw" { sqlx::query("UPDATE Transactions SET tx_data=x'01' WHERE tx_hash=?").bind(&hash).execute(&pool).await.unwrap(); }
+            if case == "stale_key" { sqlx::query("UPDATE KeyInstances SET flags=1 WHERE keyinstance_id=-1").execute(&pool).await.unwrap(); }
+            if case == "cross_owner" {
+                let master: (i64,) = sqlx::query_as("SELECT default_masterkey_id FROM Accounts WHERE account_id=?").bind(account).fetch_one(&pool).await.unwrap();
+                let other = insert_account(&pool, Some(master.0), script_type::P2PKH, "other").await.unwrap();
+                let other_key = insert_keyinstance(&pool, other, Some(master.0), derivation_type::BIP32, br#"{"subpath":[0,3]}"#, script_type::P2PKH, 0, None).await.unwrap();
+                sqlx::query("UPDATE TransactionOutputs SET keyinstance_id=? WHERE tx_hash=?").bind(other_key).bind(&hash).execute(&pool).await.unwrap();
+            }
+            let mut snapshots = explicit_scan_snapshot(&hash, &raw, if case == "wrong_delta" { Some(51) } else { Some(50) }, case != "missing_unspent" && case != "missing_history");
+            if case == "missing_history" { snapshots[0].transactions.clear(); }
+            let before = sync_db_snapshot(&pool).await;
+            let deadline = if case == "deadline" { tokio::time::Instant::now() } else { tokio::time::Instant::now() + std::time::Duration::from_secs(5) };
+            let result = merge_explicit_scan_snapshot(&pool, account, &keys, &source, &[], &snapshots, 26, deadline).await;
+            assert!(result.is_err(), "{case}");
+            assert_eq!(sync_db_snapshot(&pool).await, before, "{case}");
+            pool.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_scan_preserves_spent_marker_status_and_enriches_only_missing_data() {
+        for marker in [false,true] {
+            let (pool, account, keys, hash, raw) = explicit_scan_fixture().await;
+            let source = load_scan_derivation_source(&pool, account).await.unwrap();
+            if marker { sqlx::query("INSERT INTO WalletData(key,value,date_created,date_updated) VALUES (?,?,1,1)").bind(format!("address_discovery_v1_{account}")).bind("done").execute(&pool).await.unwrap(); }
+            sqlx::query("UPDATE Transactions SET tx_data=NULL WHERE tx_hash=?").bind(&hash).execute(&pool).await.unwrap();
+            sqlx::query("UPDATE TransactionOutputs SET script_pubkey=NULL WHERE tx_hash=?").bind(&hash).execute(&pool).await.unwrap();
+            sqlx::query("UPDATE TransactionDeltas SET value_known=0,value_delta=0 WHERE tx_hash=?").bind(&hash).execute(&pool).await.unwrap();
+            let snapshots = explicit_scan_snapshot(&hash, &raw, Some(50), true);
+            merge_explicit_scan_snapshot(&pool, account, &keys, &source, &[], &snapshots, 26, tokio::time::Instant::now()+std::time::Duration::from_secs(5)).await.unwrap();
+            let stored: (Vec<u8>,Option<i64>,i32,Option<String>,Option<Vec<u8>>) = sqlx::query_as("SELECT tx_data,block_height,flags,description,proof_data FROM Transactions WHERE tx_hash=?").bind(&hash).fetch_one(&pool).await.unwrap();
+            assert_eq!(stored, (raw.clone(),Some(9),7,Some("keep".into()),Some(vec![1,2])));
+            let output: (Option<String>,) = sqlx::query_as("SELECT script_pubkey FROM TransactionOutputs WHERE tx_hash=?").bind(&hash).fetch_one(&pool).await.unwrap();
+            assert_eq!(output.0.as_deref(), Some(scan_test_script(0,0).as_str()));
+            let delta: (i64,i64) = sqlx::query_as("SELECT value_delta,value_known FROM TransactionDeltas WHERE tx_hash=?").bind(&hash).fetch_one(&pool).await.unwrap();
+            assert_eq!(delta,(50,1));
+            assert_eq!(get_wallet_data(&pool, &format!("address_discovery_v1_{account}")).await.unwrap().as_deref(), marker.then_some("done"));
+            let before = sync_db_snapshot(&pool).await;
+            let unknown = explicit_scan_snapshot(&hash, &raw, None, true);
+            merge_explicit_scan_snapshot(&pool, account, &keys, &source, &[], &unknown, 26, tokio::time::Instant::now()+std::time::Duration::from_secs(5)).await.unwrap();
+            assert_eq!(sync_db_snapshot(&pool).await, before);
+            sqlx::query("UPDATE TransactionOutputs SET flags=flags|? WHERE tx_hash=?").bind(txo_flags::IS_SPENT).bind(&hash).execute(&pool).await.unwrap();
+            let before = sync_db_snapshot(&pool).await;
+            let missing_spent = explicit_scan_snapshot(&hash, &raw, Some(50), false);
+            merge_explicit_scan_snapshot(&pool, account, &keys, &source, &[], &missing_spent, 26, tokio::time::Instant::now()+std::time::Duration::from_secs(5)).await.unwrap();
+            assert_eq!(sync_db_snapshot(&pool).await, before);
+            pool.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_scan_rolls_back_inserted_key_on_sql_failure_and_cancel() {
+        use std::{future::Future, task::Poll};
+        let (pool, account, keys, hash, raw) = explicit_scan_fixture().await;
+            let source = load_scan_derivation_source(&pool, account).await.unwrap();
+        let mut snapshots = explicit_scan_snapshot(&hash, &raw, Some(50), true);
+        snapshots.push(SyncKeySnapshot { key_id: SyncKeyRef::Discovered(0), transactions: vec![], outputs: vec![] });
+        let before = sync_db_snapshot(&pool).await;
+        sqlx::query("CREATE TRIGGER fail_scan BEFORE INSERT ON TransactionOutputs BEGIN SELECT RAISE(ABORT, 'synthetic scan failure'); END").execute(&pool).await.unwrap();
+        let error = merge_explicit_scan_snapshot(&pool, account, &keys, &source, &[(1,25)], &snapshots, 26, tokio::time::Instant::now()+std::time::Duration::from_secs(5)).await.unwrap_err();
+        assert!(format!("{error:#}").contains("synthetic scan failure"));
+        assert_eq!(sync_db_snapshot(&pool).await, before);
+        sqlx::query("DROP TRIGGER fail_scan").execute(&pool).await.unwrap();
+        let hold = pool.begin().await.unwrap();
+        let mut pending = Box::pin(merge_explicit_scan_snapshot(&pool, account, &keys, &source, &[(1,25)], &snapshots, 26, tokio::time::Instant::now()+std::time::Duration::from_secs(5)));
+        assert!(std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx).is_pending())).await);
+        drop(pending);
+        hold.rollback().await.unwrap();
+        assert_eq!(sync_db_snapshot(&pool).await, before);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let timeout_pool = pool.clone();
+        let timeout_keys = keys.clone();
+        let timeout_source = source.clone();
+        let timeout_snapshots = explicit_scan_snapshot(&hash, &raw, Some(50), true);
+        let mut timeout_snapshots = timeout_snapshots;
+        timeout_snapshots.push(SyncKeySnapshot { key_id: SyncKeyRef::Discovered(0), transactions: vec![], outputs: vec![] });
+        let timeout_task = tokio::spawn(async move {
+            merge_explicit_scan_impl(&timeout_pool, account, &timeout_keys, &timeout_source, &[(1,25)], &timeout_snapshots,
+                26, tokio::time::Instant::now()+std::time::Duration::from_millis(100),
+                Some(ScanTestBarrier { started: started_tx, resume: resume_rx })).await
+        });
+        started_rx.await.unwrap();
+        let error = timeout_task.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        drop(resume_tx);
+        assert_eq!(sync_db_snapshot(&pool).await, before);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let task_pool = pool.clone();
+        let task = tokio::spawn(async move {
+            merge_explicit_scan_impl(&task_pool, account, &keys, &source, &[(1,25)], &snapshots,
+                26, tokio::time::Instant::now()+std::time::Duration::from_secs(5),
+                Some(ScanTestBarrier { started: started_tx, resume: resume_rx })).await
+        });
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(resume_tx);
+        assert_eq!(sync_db_snapshot(&pool).await, before);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_scan_adds_discovered_key_without_touching_marker() {
+        for marker in [false, true] {
+            let (pool, account, keys, hash, raw) = explicit_scan_fixture().await;
+            let source = load_scan_derivation_source(&pool, account).await.unwrap();
+            if marker { sqlx::query("INSERT INTO WalletData(key,value,date_created,date_updated) VALUES (?,?,1,1)").bind(format!("address_discovery_v1_{account}")).bind("done").execute(&pool).await.unwrap(); }
+            let mut discovered_tx = bsv::transaction::transaction::Transaction::from_hex(&hex::encode(&raw)).unwrap();
+            discovered_tx.outputs[0].satoshis = Some(60);
+            discovered_tx.outputs[0].locking_script = bsv::script::locking_script::LockingScript::from_binary(&hex::decode(scan_test_script(1,25)).unwrap());
+            let new_hash = crate::core::address::hex_str_to_hash(&discovered_tx.id().unwrap()).unwrap();
+            let new_raw = hex::decode(discovered_tx.to_hex().unwrap()).unwrap();
+            let mut snapshots = explicit_scan_snapshot(&hash, &raw, Some(50), true);
+            snapshots.push(SyncKeySnapshot { key_id: SyncKeyRef::Discovered(0),
+                transactions: vec![SyncTransaction { hash: new_hash.clone(), height: Some(11), raw: new_raw.into(), delta: Some(60) }],
+                outputs: vec![SyncOutput { hash: new_hash, height: Some(11), index: 0, value: 60, coinbase: true, script_pubkey: scan_test_script(1,25) }],
+            });
+            merge_explicit_scan_snapshot(&pool, account, &keys, &source, &[(1,25)], &snapshots, 26, tokio::time::Instant::now()+std::time::Duration::from_secs(5)).await.unwrap();
+            let actual = get_keyinstances_for_account(&pool, account).await.unwrap();
+            assert_eq!(actual.len(), 2);
+            let discovered = actual.iter().find(|key| key.keyinstance_id != -1).unwrap();
+            let outputs = get_utxos_for_account(&pool, account).await.unwrap();
+            assert_eq!(outputs.iter().find(|out| out.value == 60).unwrap().keyinstance_id, discovered.keyinstance_id);
+            assert_eq!(get_wallet_data(&pool, &format!("address_discovery_v1_{account}")).await.unwrap().as_deref(), marker.then_some("done"));
+            pool.close().await;
+        }
     }
 
 

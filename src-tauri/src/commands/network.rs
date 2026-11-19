@@ -16,7 +16,7 @@
 use crate::core::address;
 use crate::db::repositories;
 use crate::network::backend::{BackendType, NetworkBackend, NetworkError, ScriptHash};
-use crate::network::electrumx::ElectrumXClient;
+use crate::network::electrumx::{ElectrumXClient, ScanResponseBudget};
 use crate::network::header_store::{HeaderStore, ParsedHeader};
 use crate::network::server_list::{ServerStatus, ServerStatusInfo};
 use crate::state::AppState;
@@ -327,14 +327,25 @@ const MAX_SYNC_TX_REQUESTS: usize = 4096;
 const MAX_SYNC_HISTORY_ENTRIES: usize = 100_000;
 const MAX_SYNC_RAW_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SYNC_TX_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SCAN_OUTPUTS: usize = 100_000;
+const SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn bounded<F, T>(deadline: Option<tokio::time::Instant>, future: F) -> Result<T, String>
+where F: std::future::Future<Output = Result<T, String>> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future).await.map_err(|_| "scan deadline exceeded".to_string())?,
+        None => future.await,
+    }
+}
 
 // Check wire lengths before the SDK allocates vectors from untrusted varints.
 pub(crate) use crate::core::transaction::validate_transaction_wire;
 
-async fn fetch_sync_transaction(client: &ElectrumXClient, txid: &str, cache: &mut RawTransactionCache, total_bytes: &mut usize, optional: bool)
+async fn fetch_sync_transaction(client: &ElectrumXClient, txid: &str, cache: &mut RawTransactionCache, total_bytes: &mut usize, optional: bool, budget: Option<&std::sync::Arc<ScanResponseBudget>>)
     -> Result<Option<(Vec<u8>, bsv::transaction::transaction::Transaction)>, String> {
     fetch_sync_transaction_with(txid, cache, total_bytes, optional, |key| async move {
-        client.call("blockchain.transaction.get", serde_json::json!([key, false])).await
+        client.call_with_budget("blockchain.transaction.get", serde_json::json!([key, false]), budget.cloned()).await
     }).await
 }
 
@@ -491,6 +502,86 @@ async fn discover_used_keys(client: &ElectrumXClient, pool: &sqlx::SqlitePool, a
     Ok(Some(found))
 }
 
+async fn discover_explicit_range(client: &ElectrumXClient, account_key: &ExtendedKey, keys: &[repositories::KeyInstanceRow], end: u32, deadline: tokio::time::Instant, budget: &std::sync::Arc<ScanResponseBudget>) -> Result<(Vec<(u64,u64)>, usize), String> {
+    discover_explicit_range_with(account_key, keys, end, Some(deadline), |target| async move {
+        client.get_history_with_budget(&target, Some(budget)).await.map_err(|e| format!("address discovery failed: {e}"))
+    }).await
+}
+
+async fn discover_explicit_range_with<F, Fut>(account_key: &ExtendedKey, keys: &[repositories::KeyInstanceRow], end: u32, deadline: Option<tokio::time::Instant>, mut fetch: F) -> Result<(Vec<(u64,u64)>, usize), String>
+where F: FnMut(ScriptHash) -> Fut, Fut: std::future::Future<Output = Result<Vec<crate::network::backend::TxHistoryEntry>, String>> {
+    if !(1..=1000).contains(&end) { return Err("end_index_exclusive must be between 1 and 1000".into()); }
+    let mut known = std::collections::HashSet::new();
+    for key in keys {
+        if key.derivation_type != repositories::derivation_type::BIP32 { return Err("imported keys are not supported in synchronization".into()); }
+        let value: serde_json::Value = serde_json::from_slice(&key.derivation_data).map_err(|e| e.to_string())?;
+        let path = value.get("subpath").and_then(|v| v.as_array()).ok_or("invalid key path")?;
+        let chain = path.first().and_then(|v| v.as_u64()).ok_or("invalid chain")?;
+        let index = path.get(1).and_then(|v| v.as_u64()).ok_or("invalid index")?;
+        if !known.insert((chain,index)) { return Err("duplicate existing derivation path".into()); }
+    }
+    let mut found = Vec::new();
+    let mut history_count = 0usize;
+    for chain in 0..=1u64 {
+        for index in 0..u64::from(end) {
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) { return Err("scan deadline exceeded".into()); }
+            let child = account_key.derive(&format!("{chain}/{index}")).map_err(|e| e.to_string())?;
+            let public = child.public_key().map_err(|e| e.to_string())?;
+            let address = address::pubkey_to_p2pkh_address(&public);
+            let hash = crate::network::backend::scripthash_from_address(&address).map_err(|e| e.to_string())?;
+            let target = ScriptHash::try_from(hash.as_str()).map_err(|e| e.to_string())?;
+            let history = fetch(target).await?;
+            history_count = history_count.checked_add(history.len()).ok_or("scan history count overflow")?;
+            if history_count > MAX_SYNC_HISTORY_ENTRIES { return Err("scan history entry limit exceeded".into()); }
+            if !history.is_empty() && !known.contains(&(chain,index)) { found.push((chain,index)); }
+        }
+    }
+    Ok((found,history_count))
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ExplicitScanResult {
+    pub start_index: u32,
+    pub end_index_exclusive: u32,
+    pub new_keys: usize,
+    pub server_host: String,
+}
+
+fn require_scan_wallet_session(state: &AppState, instance: &std::sync::Arc<()>, account_id: i64, token: Option<&str>) -> Result<(), String> {
+    let active = state.active_wallet.lock().unwrap();
+    if !active.as_ref().is_some_and(|wallet| std::sync::Arc::ptr_eq(&wallet.instance_id, instance)
+        && wallet.account_id == account_id && token.is_none_or(|token| token == wallet.instance_token)) {
+        return Err("active wallet changed during synchronization".into());
+    }
+    Ok(())
+}
+
+fn require_matching_scan_source(account_key: &ExtendedKey, source: &repositories::ScanDerivationSource) -> Result<(), String> {
+    let record: serde_json::Value = serde_json::from_slice(&source.master.derivation_data).map_err(|_| "invalid scan derivation source")?;
+    let xpub = account_key.to_public().map_err(|_| "invalid scan derivation source")?.to_base58();
+    if source.master.derivation_type != repositories::derivation_type::BIP32 || record.get("xpub").and_then(|v| v.as_str()) != Some(xpub.as_str()) {
+        return Err("scan derivation source does not match active wallet".into());
+    }
+    Ok(())
+}
+
+pub async fn scan_address_range_inner(state: &AppState, account_id: i64, wallet_instance_token: &str, end_index_exclusive: u32) -> Result<ExplicitScanResult, String> {
+    if !(1..=1000).contains(&end_index_exclusive) { return Err("end_index_exclusive must be between 1 and 1000".into()); }
+    let deadline = tokio::time::Instant::now() + SCAN_TIMEOUT;
+    let (result, new_keys) = sync_wallet_impl(state, Some(account_id), Some((wallet_instance_token, end_index_exclusive, deadline))).await?;
+    Ok(ExplicitScanResult { start_index: 0, end_index_exclusive, new_keys, server_host: result.server_host })
+}
+
+#[tauri::command]
+pub async fn scan_address_range(
+    state: State<'_, AppState>,
+    account_id: i64,
+    wallet_instance_token: String,
+    end_index_exclusive: u32,
+) -> Result<ExplicitScanResult, String> {
+    scan_address_range_inner(&state, account_id, &wallet_instance_token, end_index_exclusive).await
+}
+
 #[tauri::command]
 pub async fn sync_wallet(
     state: State<'_, AppState>,
@@ -500,9 +591,15 @@ pub async fn sync_wallet(
 }
 
 pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Result<SyncResult, String> {
+    Ok(sync_wallet_impl(state, account_id, None).await?.0)
+}
+
+async fn sync_wallet_impl(state: &AppState, account_id: Option<i64>, scan: Option<(&str,u32,tokio::time::Instant)>) -> Result<(SyncResult,usize), String> {
     // Serialize synchronization across wallets; no state mutex is held over network I/O.
-    static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _sync_guard = SYNC_LOCK.lock().await;
+    let deadline = scan.map(|(_,_,deadline)| deadline);
+    let response_budget = scan.map(|_| std::sync::Arc::new(ScanResponseBudget::new(64 * 1024 * 1024)));
+    let _sync_guard = bounded(deadline, async { Ok(SYNC_LOCK.lock().await) }).await?;
+    let context_guard = if scan.is_some() { Some(bounded(deadline, async { Ok(state.wallet_operation.lock().await) }).await?) } else { None };
     // 1. Extract client from network state (without holding lock across awaits)
     let client = {
         let net = state.network.lock().unwrap();
@@ -518,6 +615,7 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
     let (pool, default_acct_id, xprv_opt, wallet_path, wallet_instance) = {
         let guard = state.active_wallet.lock().unwrap();
         let active = guard.as_ref().ok_or("no wallet is currently open")?;
+        if scan.is_some_and(|(token,_,_)| token != active.instance_token) { return Err("active wallet token changed".into()); }
         (
             active.db_pool.clone(),
             active.account_id,
@@ -532,13 +630,34 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
     let xprv_str =
         xprv_opt.ok_or("wallet is locked — unlock first to derive public keys for sync")?;
 
-    log::info!("sync_wallet: account {} — starting full sync", acct_id);
+    if scan.is_none() { log::info!("sync_wallet: account {} — starting full sync", acct_id); }
+    else { log::info!("explicit address scan: account {acct_id}"); }
 
     if acct_id != default_acct_id { return Err("only the active account can be synchronized".into()); }
     let account_key = ExtendedKey::from_string(&xprv_str).map_err(|e| format!("invalid xprv: {e}"))?;
-    let expected_keys = repositories::get_keyinstances_for_account(&pool, acct_id)
-        .await.map_err(|e| format!("failed to load keyinstances: {e}"))?;
-    let discovered = discover_used_keys(&client, &pool, acct_id, &account_key, &expected_keys).await?;
+    let source = if scan.is_some() {
+        let source = bounded(deadline, async { repositories::load_scan_derivation_source(&pool, acct_id).await.map_err(|_| "scan derivation source unavailable".to_string()) }).await?;
+        require_matching_scan_source(&account_key, &source)?;
+        Some(source)
+    } else { None };
+    drop(context_guard);
+    let expected_keys = bounded(deadline, async {
+        let result = if scan.is_some() { repositories::get_keyinstances_for_account_bounded(&pool, acct_id, 100_000).await }
+            else { repositories::get_keyinstances_for_account(&pool, acct_id).await };
+        result.map_err(|e| format!("failed to load keyinstances: {e}"))
+    }).await?;
+    if let Some((_,end,scan_deadline)) = scan {
+        repositories::validate_scan_inventory(source.as_ref().ok_or("missing scan derivation source")?, &expected_keys, &[], end, scan_deadline)
+            .map_err(|e| format!("unsupported scan inventory: {e}"))?;
+    }
+    let (discovered, discovery_history_count) = if let Some((_, end, scan_deadline)) = scan {
+        let budget = response_budget.as_ref().ok_or("missing scan response budget")?;
+        let (found,count) = bounded(deadline, discover_explicit_range(&client, &account_key, &expected_keys, end, scan_deadline, budget)).await?;
+        (Some(found),count)
+    } else {
+        (discover_used_keys(&client, &pool, acct_id, &account_key, &expected_keys).await?,0)
+    };
+    let new_keys = discovered.as_ref().map_or(0, Vec::len);
     let mut key_instances: Vec<(SyncKeyRef, Vec<u8>)> = expected_keys.iter()
         .map(|key| (SyncKeyRef::Existing(key.keyinstance_id), key.derivation_data.clone())).collect();
     if let Some(paths) = &discovered {
@@ -548,20 +667,20 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
         }
     }
 
-    if key_instances.is_empty() {
+    if key_instances.is_empty() && scan.is_none() {
         log::warn!("sync_wallet: no keyinstances found for account {} — generating initial receiving addresses", acct_id);
-        return Ok(SyncResult {
+        return Ok((SyncResult {
             server_host: client.server_host(),
             account_id: acct_id,
             synced: false,
             message: "no keyinstances found — generate receive addresses first".to_string(),
-        });
+        },new_keys));
     }
 
     // 4. For each KeyInstance: derive pubkey → compute scripthash → fetch from server
     let mut total_balance_confirmed: u64 = 0;
     let mut total_balance_unconfirmed: i64 = 0;
-    let mut total_tx_count: usize = 0;
+    let mut total_tx_count: usize = discovery_history_count;
     let mut total_utxo_count: usize = 0;
     let mut synced_keys: usize = 0;
     let mut snapshots = Vec::new();
@@ -641,7 +760,7 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
         );
 
         // Fetch balance from server
-        let balance = match client.get_balance(&target).await {
+        let balance = match bounded(deadline, async { client.get_balance_with_budget(&target, response_budget.as_ref()).await.map_err(|e| e.to_string()) }).await {
             Ok(b) => b,
             Err(e) => return Err(format!("keyinstance {:?}: balance error: {e}", key_ref)),
         };
@@ -650,7 +769,7 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
         total_balance_unconfirmed = total_balance_unconfirmed.checked_add(balance.unconfirmed).ok_or("unconfirmed balance overflow")?;
 
         // Fetch history from server
-        let history = match client.get_history(&target).await {
+        let history = match bounded(deadline, async { client.get_history_with_budget(&target, response_budget.as_ref()).await.map_err(|e| e.to_string()) }).await {
             Ok(h) => h,
             Err(e) => return Err(format!("keyinstance {:?}: history error: {e}", key_ref)),
         };
@@ -663,15 +782,17 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
         }
 
         // Fetch UTXOs from server
-        let utxos = match client.get_utxos(&target).await {
+        let utxos = match bounded(deadline, async { client.get_utxos_with_budget(&target, response_budget.as_ref()).await.map_err(|e| e.to_string()) }).await {
             Ok(u) => u,
             Err(e) => return Err(format!("keyinstance {:?}: utxos error: {e}", key_ref)),
         };
+        total_utxo_count = total_utxo_count.checked_add(utxos.len()).ok_or("output count overflow")?;
+        if scan.is_some() && total_utxo_count > MAX_SCAN_OUTPUTS { return Err("scan output limit exceeded".into()); }
 
         let mut coinbase_txids = std::collections::HashSet::new();
         let mut output_scripts = Vec::with_capacity(utxos.len());
         for utxo in &utxos {
-            let (_, parsed) = fetch_sync_transaction(&client, &utxo.tx_hash, &mut tx_cache, &mut raw_bytes, false)
+            let (_, parsed) = bounded(deadline, fetch_sync_transaction(&client, &utxo.tx_hash, &mut tx_cache, &mut raw_bytes, false, response_budget.as_ref()))
                 .await?.ok_or("UTXO transaction unavailable")?;
             let output = parsed.outputs.get(utxo.tx_pos as usize).ok_or("UTXO output index out of range")?;
             if output.satoshis != Some(utxo.value) || utxo.value > i64::MAX as u64 { return Err("UTXO amount mismatch".into()); }
@@ -684,7 +805,6 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
                 coinbase_txids.insert(utxo.tx_hash.clone());
             }
         }
-        total_utxo_count += utxos.len();
 
         let mut transactions = Vec::new();
         for item in &history {
@@ -715,30 +835,31 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
 
         // 6. Subscribe to scripthash updates for push notifications
         // Best-effort — don't fail the sync if subscription fails
-        if let Err(e) = client.subscribe_scripthash(&target).await {
+        if scan.is_none() { if let Err(e) = client.subscribe_scripthash(&target).await {
             log::warn!(
                 "sync_wallet: subscribe_scripthash failed for keyinstance {:?}: {e}",
                 key_ref
             );
-        }
+        } }
 
         synced_keys += 1;
     }
 
-    resolve_sync_history(&mut snapshots, &wallet_scripts, &mut tx_cache, &mut raw_bytes, |key| {
+    bounded(deadline, resolve_sync_history(&mut snapshots, &wallet_scripts, &mut tx_cache, &mut raw_bytes, |key| {
         let client = &client;
-        async move { client.call("blockchain.transaction.get", serde_json::json!([key, false])).await }
-    }).await?;
+        let budget = response_budget.clone();
+        async move { client.call_with_budget("blockchain.transaction.get", serde_json::json!([key, false]), budget).await }
+    })).await?;
 
-    let _wallet_guard = state.wallet_operation.lock().await;
-    {
-        let active = state.active_wallet.lock().unwrap();
-        if !active.as_ref().is_some_and(|wallet| std::sync::Arc::ptr_eq(&wallet.instance_id, &wallet_instance) && wallet.account_id == acct_id) {
-            return Err("active wallet changed during synchronization".into());
-        }
+    let _wallet_guard = bounded(deadline, async { Ok(state.wallet_operation.lock().await) }).await?;
+    require_scan_wallet_session(state, &wallet_instance, acct_id, scan.map(|(token,_,_)| token))?;
+    if let Some((_,end,deadline)) = scan {
+        repositories::merge_explicit_scan_snapshot(&pool, acct_id, &expected_keys, source.as_ref().ok_or("missing scan derivation source")?, discovered.as_deref().unwrap_or(&[]), &snapshots, end, deadline)
+            .await.map_err(|e| format!("failed to merge scan snapshot: {e}"))?;
+    } else {
+        repositories::replace_sync_snapshot(&pool, acct_id, &expected_keys, discovered.as_deref(), &snapshots)
+            .await.map_err(|e| format!("failed to store sync snapshot: {e}"))?;
     }
-    repositories::replace_sync_snapshot(&pool, acct_id, &expected_keys, discovered.as_deref(), &snapshots)
-        .await.map_err(|e| format!("failed to store sync snapshot: {e}"))?;
     {
         let active = state.active_wallet.lock().unwrap();
         if !active.as_ref().is_some_and(|wallet| std::sync::Arc::ptr_eq(&wallet.instance_id, &wallet_instance) && wallet.account_id == acct_id) {
@@ -748,14 +869,15 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
     let message = format!("synced wallet {}: {} keys, {} txs, {} utxos, balance {} confirmed + {} unconfirmed",
         wallet_path, synced_keys, total_tx_count, total_utxo_count, total_balance_confirmed, total_balance_unconfirmed);
 
-    log::info!("sync_wallet: account {} — {}", acct_id, message);
+    if scan.is_none() { log::info!("sync_wallet: account {} — {}", acct_id, message); }
+    else { log::info!("explicit address scan completed for account {acct_id}: {new_keys} new keys"); }
 
-    Ok(SyncResult {
+    Ok((SyncResult {
         server_host: client.server_host(),
         account_id: acct_id,
         synced: synced_keys > 0,
         message,
-    })
+    },new_keys))
 }
 
 /// Result of a wallet sync operation.
@@ -1061,6 +1183,83 @@ pub struct VerifyProofResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_scan_source_must_match_the_active_private_key() {
+        use super::*;
+        let key = ExtendedKey::from_seed(&[7; 64]).unwrap();
+        let other = ExtendedKey::from_seed(&[8; 64]).unwrap();
+        let mut source = repositories::ScanDerivationSource { account_id: 1, master: repositories::MasterKeyRow {
+            masterkey_id:1, parent_masterkey_id:None, derivation_type:repositories::derivation_type::BIP32,
+            derivation_data:serde_json::json!({"xpub":key.to_public().unwrap().to_base58()}).to_string().into_bytes(), date_created:1, date_updated:1,
+        } };
+        assert!(require_matching_scan_source(&key,&source).is_ok());
+        assert!(require_matching_scan_source(&other,&source).is_err());
+        source.master.derivation_type = -1;
+        assert!(require_matching_scan_source(&key,&source).is_err());
+    }
+    #[tokio::test]
+    async fn explicit_scan_wallet_session_rejects_close_reopen_and_wrong_token() {
+        let dir = std::env::temp_dir().join(format!("electrumsv-scan-session-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = crate::state::AppState::new();
+        state.data_dir = dir.to_str().unwrap().into();
+        let created = crate::services::wallet_service::create_wallet(&state, "synthetic", "pw", Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), Some("")).await.unwrap();
+        let (old_instance, old_token) = {
+            let active = state.active_wallet.lock().unwrap();
+            let wallet = active.as_ref().unwrap();
+            (wallet.instance_id.clone(), wallet.instance_token.clone())
+        };
+        assert!(super::require_scan_wallet_session(&state, &old_instance, created.account_id, Some(&old_token)).is_ok());
+        assert!(super::require_scan_wallet_session(&state, &old_instance, created.account_id, Some("wrong")).is_err());
+        crate::services::wallet_service::close_wallet(&state).await.unwrap();
+        assert!(super::require_scan_wallet_session(&state, &old_instance, created.account_id, Some(&old_token)).is_err());
+        crate::services::wallet_service::open_wallet(&state, &created.wallet_path).await.unwrap();
+        let (new_instance, new_token) = {
+            let active = state.active_wallet.lock().unwrap();
+            let wallet = active.as_ref().unwrap();
+            (wallet.instance_id.clone(), wallet.instance_token.clone())
+        };
+        assert!(super::require_scan_wallet_session(&state, &old_instance, created.account_id, Some(&new_token)).is_err());
+        assert!(super::require_scan_wallet_session(&state, &new_instance, created.account_id, Some(&old_token)).is_err());
+        assert!(super::require_scan_wallet_session(&state, &new_instance, created.account_id, Some(&new_token)).is_ok());
+        crate::services::wallet_service::close_wallet(&state).await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn explicit_range_scans_both_branches_past_gap_and_checks_bounds() {
+        use super::*;
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let account = ExtendedKey::from_seed(&[7; 64]).unwrap();
+        let mut targets = std::collections::HashSet::new();
+        for chain in 0..=1 {
+            let public = account.derive(&format!("{chain}/25")).unwrap().public_key().unwrap();
+            let address = address::pubkey_to_p2pkh_address(&public);
+            targets.insert(crate::network::backend::scripthash_from_address(&address).unwrap());
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let (found, histories) = discover_explicit_range_with(&account, &[], 26, None, |target| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let hit = targets.contains(target.as_str());
+            async move { Ok(if hit { vec![crate::network::backend::TxHistoryEntry { tx_hash: "aa".into(), height: 1, verified: false }] } else { vec![] }) }
+        }).await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 52);
+        assert_eq!(histories, 2);
+        assert_eq!(found, [(0,25),(1,25)]);
+        let overflow = discover_explicit_range_with(&account, &[], 1, None, |_| async {
+            Ok(vec![crate::network::backend::TxHistoryEntry { tx_hash: "aa".into(), height: 1, verified: false }; 50_001])
+        }).await.unwrap_err();
+        assert!(overflow.contains("history entry limit"));
+        for end in [0,1001] {
+            assert!(discover_explicit_range_with(&account, &[], end, None, |_| async { panic!("invalid range must not query") }).await.is_err());
+        }
+        let count = Arc::new(AtomicUsize::new(0));
+        let (found, _) = discover_explicit_range_with(&account, &[], 1000, None, |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            async { Ok(vec![]) }
+        }).await.unwrap();
+        assert!(found.is_empty());
+        assert_eq!(count.load(Ordering::SeqCst), 2000);
+    }
     #[tokio::test]
     async fn stale_connection_and_disconnect_cannot_replace_newer_connection() {
         let state = crate::state::AppState::new();

@@ -66,6 +66,22 @@ const CLIENT_VERSION: &str = "ElectrumSV-Mc 0.1.0";
 struct PendingRequest {
     tx: oneshot::Sender<Result<Value, NetworkError>>,
     generation: u64,
+    response_budget: Option<Arc<ScanResponseBudget>>,
+}
+
+pub(crate) struct ScanResponseBudget {
+    used: AtomicU64,
+    limit: u64,
+}
+
+impl ScanResponseBudget {
+    pub(crate) fn new(limit: u64) -> Self { Self { used: AtomicU64::new(0), limit } }
+
+    fn charge(&self, bytes: usize) -> Result<(), NetworkError> {
+        let bytes = u64::try_from(bytes).map_err(|_| NetworkError::Validation("scan response byte limit exceeded".into()))?;
+        self.used.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| used.checked_add(bytes).filter(|next| *next <= self.limit))
+            .map(|_| ()).map_err(|_| NetworkError::Validation("scan response byte limit exceeded".into()))
+    }
 }
 
 struct Inner {
@@ -204,6 +220,103 @@ impl Drop for ConnectGuard {
     }
 }
 
+impl ElectrumXClient {
+    pub(crate) async fn get_balance_with_budget(&self, scripthash: &ScriptHash, budget: Option<&Arc<ScanResponseBudget>>) -> Result<BackendBalance, NetworkError> {
+        let scripthash = scripthash.as_str();
+        let result = self
+            .call_with_budget("blockchain.scripthash.get_balance", json!([scripthash]), budget.cloned())
+            .await?;
+
+        let confirmed = result
+            .get("confirmed")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| NetworkError::Protocol("get_balance: missing confirmed".into()))?;
+
+        let unconfirmed = result
+            .get("unconfirmed")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| NetworkError::Protocol("get_balance: missing unconfirmed".into()))?;
+
+        BackendBalance::new(confirmed, unconfirmed)
+    }
+
+    pub(crate) async fn get_history_with_budget(&self, scripthash: &ScriptHash, budget: Option<&Arc<ScanResponseBudget>>) -> Result<Vec<TxHistoryEntry>, NetworkError> {
+        let scripthash = scripthash.as_str();
+        let result = self
+            .call_with_budget("blockchain.scripthash.get_history", json!([scripthash]), budget.cloned())
+            .await?;
+
+        let arr = result
+            .as_array()
+            .ok_or_else(|| NetworkError::Protocol("get_history: expected array".into()))?;
+
+        let mut entries = Vec::with_capacity(arr.len());
+        for item in arr {
+            let tx_hash = item
+                .get("tx_hash")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| NetworkError::Protocol("get_history: missing tx_hash".into()))?
+                .to_string();
+
+            let height = item
+                .get("height")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| NetworkError::Protocol("get_history: missing height".into()))?;
+
+            entries.push(TxHistoryEntry {
+                tx_hash,
+                height,
+                verified: false,
+            });
+        }
+
+        Ok(entries)
+    }
+
+    pub(crate) async fn get_utxos_with_budget(&self, scripthash: &ScriptHash, budget: Option<&Arc<ScanResponseBudget>>) -> Result<Vec<UtxoEntry>, NetworkError> {
+        let scripthash = scripthash.as_str();
+        let result = self
+            .call_with_budget("blockchain.scripthash.listunspent", json!([scripthash]), budget.cloned())
+            .await?;
+
+        let arr = result
+            .as_array()
+            .ok_or_else(|| NetworkError::Protocol("listunspent: expected array".into()))?;
+
+        let mut entries = Vec::with_capacity(arr.len());
+        for item in arr {
+            let tx_hash = item
+                .get("tx_hash")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| NetworkError::Protocol("listunspent: missing tx_hash".into()))?
+                .to_string();
+
+            let tx_pos = item
+                .get("tx_pos")
+                .and_then(|v| v.as_u64())
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| NetworkError::Protocol("listunspent: invalid tx_pos".into()))?;
+
+            let value = item
+                .get("value")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| NetworkError::Protocol("listunspent: missing value".into()))?;
+
+            let height = item.get("height").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            entries.push(UtxoEntry {
+                tx_hash,
+                tx_pos,
+                value,
+                height,
+            });
+        }
+
+        Ok(entries)
+    }
+
+}
+
 fn client_tls_config(roots: rustls::RootCertStore) -> Result<rustls::ClientConfig, NetworkError> {
     Ok(rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
         .with_safe_default_protocol_versions()
@@ -317,6 +430,10 @@ impl ElectrumXClient {
 
     /// Send a JSON-RPC request and wait for the response.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, NetworkError> {
+        self.call_with_budget(method, params, None).await
+    }
+
+    pub(crate) async fn call_with_budget(&self, method: &str, params: Value, response_budget: Option<Arc<ScanResponseBudget>>) -> Result<Value, NetworkError> {
         let generation = {
             let lifecycle = self.inner.lifecycle.lock().unwrap();
             if !self.inner.connected.load(Ordering::SeqCst) { return Err(NetworkError::NotConnected); }
@@ -340,7 +457,7 @@ impl ElectrumXClient {
             if *lifecycle != generation || !self.inner.connected.load(Ordering::SeqCst) {
                 return Err(NetworkError::NotConnected);
             }
-            pending.insert(id, PendingRequest { tx, generation });
+            pending.insert(id, PendingRequest { tx, generation, response_budget });
         }
         let _pending_guard = PendingGuard { inner: self.inner.clone(), id, generation };
 
@@ -624,6 +741,12 @@ async fn read_loop_with_limit<R: AsyncRead + Unpin>(inner: Arc<Inner>, reader: R
                 drop(lifecycle);
                 drop(pending);
                 if let Some(req) = req {
+                    if let Some(budget) = &req.response_budget {
+                        if let Err(error) = budget.charge(line.len()) {
+                            let _ = req.tx.send(Err(error));
+                            continue;
+                        }
+                    }
                     // Accept legacy result/error:null envelopes without treating a missing result as null.
                     match (msg.get("result"), msg.get("error")) {
                         (Some(result), None | Some(Value::Null)) => { let _ = req.tx.send(Ok(result.clone())); }
@@ -779,97 +902,15 @@ impl NetworkBackend for ElectrumXClient {
     }
 
     async fn get_balance(&self, scripthash: &ScriptHash) -> Result<BackendBalance, NetworkError> {
-        let scripthash = scripthash.as_str();
-        let result = self
-            .call_array("blockchain.scripthash.get_balance", &[json!(scripthash)])
-            .await?;
-
-        let confirmed = result
-            .get("confirmed")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| NetworkError::Protocol("get_balance: missing confirmed".into()))?;
-
-        let unconfirmed = result
-            .get("unconfirmed")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| NetworkError::Protocol("get_balance: missing unconfirmed".into()))?;
-
-        BackendBalance::new(confirmed, unconfirmed)
+        self.get_balance_with_budget(scripthash, None).await
     }
 
     async fn get_history(&self, scripthash: &ScriptHash) -> Result<Vec<TxHistoryEntry>, NetworkError> {
-        let scripthash = scripthash.as_str();
-        let result = self
-            .call_array("blockchain.scripthash.get_history", &[json!(scripthash)])
-            .await?;
-
-        let arr = result
-            .as_array()
-            .ok_or_else(|| NetworkError::Protocol("get_history: expected array".into()))?;
-
-        let mut entries = Vec::with_capacity(arr.len());
-        for item in arr {
-            let tx_hash = item
-                .get("tx_hash")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| NetworkError::Protocol("get_history: missing tx_hash".into()))?
-                .to_string();
-
-            let height = item
-                .get("height")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| NetworkError::Protocol("get_history: missing height".into()))?;
-
-            entries.push(TxHistoryEntry {
-                tx_hash,
-                height,
-                verified: false,
-            });
-        }
-
-        Ok(entries)
+        self.get_history_with_budget(scripthash, None).await
     }
 
     async fn get_utxos(&self, scripthash: &ScriptHash) -> Result<Vec<UtxoEntry>, NetworkError> {
-        let scripthash = scripthash.as_str();
-        let result = self
-            .call_array("blockchain.scripthash.listunspent", &[json!(scripthash)])
-            .await?;
-
-        let arr = result
-            .as_array()
-            .ok_or_else(|| NetworkError::Protocol("listunspent: expected array".into()))?;
-
-        let mut entries = Vec::with_capacity(arr.len());
-        for item in arr {
-            let tx_hash = item
-                .get("tx_hash")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| NetworkError::Protocol("listunspent: missing tx_hash".into()))?
-                .to_string();
-
-            let tx_pos = item
-                .get("tx_pos")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| NetworkError::Protocol("listunspent: missing tx_pos".into()))?
-                as u32;
-
-            let value = item
-                .get("value")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| NetworkError::Protocol("listunspent: missing value".into()))?;
-
-            let height = item.get("height").and_then(|v| v.as_i64()).unwrap_or(0);
-
-            entries.push(UtxoEntry {
-                tx_hash,
-                tx_pos,
-                value,
-                height,
-            });
-        }
-
-        Ok(entries)
+        self.get_utxos_with_budget(scripthash, None).await
     }
 
     async fn broadcast_tx(&self, raw_tx: &[u8]) -> Result<BroadcastResult, NetworkError> {
@@ -1001,6 +1042,123 @@ fn parse_merkle_response(tx_hash: &str, block_height: u64, result: &serde_json::
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn listunspent_rejects_out_of_range_or_noninteger_output_indices() {
+        use super::*;
+        let client = ElectrumXClient::new(ServerEntry::new("example.com", 50002));
+        client.inner.connected.store(true, Ordering::SeqCst);
+        let (client_io,peer) = tokio::io::duplex(4096);
+        let (reader,writer) = tokio::io::split(client_io);
+        *client.inner.writer.lock().await = Some(Box::new(writer));
+        let reader_task = tokio::spawn(read_loop(client.inner.clone(),reader,0));
+        let server = tokio::spawn(async move {
+            let (reader,mut writer) = tokio::io::split(peer);
+            let mut lines = BufReader::new(reader).lines();
+            for pos in [json!(0),json!(u32::MAX),json!(u64::from(u32::MAX)+1),json!(-1),json!(1.5)] {
+                let request: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                assert_eq!(request["method"],"blockchain.scripthash.listunspent");
+                let response = json!({"id":request["id"],"result":[{"tx_hash":"aa","tx_pos":pos,"value":1,"height":0}]});
+                writer.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+            }
+        });
+        let target = ScriptHash::try_from("ab".repeat(32).as_str()).unwrap();
+        assert_eq!(client.get_utxos(&target).await.unwrap()[0].tx_pos,0);
+        assert_eq!(client.get_utxos(&target).await.unwrap()[0].tx_pos,u32::MAX);
+        for _ in 0..3 { assert!(matches!(client.get_utxos(&target).await,Err(NetworkError::Protocol(_)))); }
+        server.await.unwrap();
+        reader_task.await.unwrap();
+    }
+    #[tokio::test]
+    async fn response_budget_counts_frames_per_request_and_isolates_other_calls() {
+        use super::*;
+        let client = ElectrumXClient::new(ServerEntry::new("example.com", 50002));
+        client.inner.connected.store(true, Ordering::SeqCst);
+        let first = format!("{{\"id\":1,\"result\":[],\"unused\":\"{}\"}}\n", "x".repeat(256));
+        let second = "{\"id\":2,\"result\":[]}\n";
+        let excess = "{\"id\":3,\"result\":[]}\n";
+        let other = "{\"id\":4,\"result\":[]}\n";
+        let normal = "{\"id\":5,\"result\":[]}\n";
+        let a = Arc::new(ScanResponseBudget::new((first.len()+second.len()) as u64));
+        let b = Arc::new(ScanResponseBudget::new(other.len() as u64));
+        let mut receivers = Vec::new();
+        for (id,budget) in [(1,Some(a.clone())),(2,Some(a.clone())),(3,Some(a.clone())),(4,Some(b.clone())),(5,None)] {
+            let (tx,rx) = oneshot::channel();
+            client.inner.pending.lock().await.insert(id, PendingRequest { tx, generation: 0, response_budget: budget });
+            receivers.push(rx);
+        }
+        let (mut writer, reader) = tokio::io::duplex(2048);
+        let reader_task = tokio::spawn(read_loop(client.inner.clone(),reader,0));
+        for frame in [&first[..],second,excess,other,normal] { writer.write_all(frame.as_bytes()).await.unwrap(); }
+        drop(writer);
+        reader_task.await.unwrap();
+        let mut results = receivers.into_iter();
+        assert!(results.next().unwrap().await.unwrap().is_ok());
+        assert!(results.next().unwrap().await.unwrap().is_ok());
+        assert!(matches!(results.next().unwrap().await.unwrap(), Err(NetworkError::Validation(_))));
+        assert!(results.next().unwrap().await.unwrap().is_ok());
+        assert!(results.next().unwrap().await.unwrap().is_ok());
+        assert_eq!(a.used.load(Ordering::SeqCst), (first.len()+second.len()) as u64);
+        assert_eq!(b.used.load(Ordering::SeqCst), other.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn budgeted_history_rejects_unknown_fields_before_parser_discards_them() {
+        use super::*;
+        let client = ElectrumXClient::new(ServerEntry::new("example.com", 50002));
+        client.inner.connected.store(true, Ordering::SeqCst);
+        let (client_io, peer) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client_io);
+        *client.inner.writer.lock().await = Some(Box::new(writer));
+        let reader_task = tokio::spawn(read_loop(client.inner.clone(), reader, 0));
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(peer);
+            let mut lines = BufReader::new(reader).lines();
+            let request: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let response = json!({"id":request["id"], "result":[], "unknown":"x".repeat(512)});
+            writer.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+        });
+        let hash = ScriptHash::try_from("ab".repeat(32).as_str()).unwrap();
+        let budget = Arc::new(ScanResponseBudget::new(100));
+        assert!(matches!(client.get_history_with_budget(&hash, Some(&budget)).await, Err(NetworkError::Validation(_))));
+        server.await.unwrap();
+        reader_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn parallel_budgeted_calls_do_not_charge_other_requests() {
+        use super::*;
+        let client = ElectrumXClient::new(ServerEntry::new("example.com", 50002));
+        client.inner.connected.store(true, Ordering::SeqCst);
+        let (client_io,peer) = tokio::io::duplex(8192);
+        let (reader,writer) = tokio::io::split(client_io);
+        *client.inner.writer.lock().await = Some(Box::new(writer));
+        let reader_task = tokio::spawn(read_loop(client.inner.clone(),reader,0));
+        let server = tokio::spawn(async move {
+            let (reader,mut writer) = tokio::io::split(peer);
+            let mut lines = BufReader::new(reader).lines();
+            for _ in 0..3 {
+                let request: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                let method = request["method"].as_str().unwrap();
+                let padding = if method == "small" { 0 } else { 256 };
+                let response = json!({"id":request["id"],"result":method,"extra":"x".repeat(padding)});
+                writer.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+            }
+        });
+        let a = Arc::new(ScanResponseBudget::new(30));
+        let b = Arc::new(ScanResponseBudget::new(100));
+        let (over, small, normal) = tokio::join!(
+            client.call_with_budget("large", json!([]), Some(a.clone())),
+            client.call_with_budget("small", json!([]), Some(b.clone())),
+            client.call("normal", json!([])),
+        );
+        assert!(matches!(over, Err(NetworkError::Validation(_))));
+        assert_eq!(small.unwrap(), json!("small"));
+        assert_eq!(normal.unwrap(), json!("normal"));
+        assert_eq!(a.used.load(Ordering::SeqCst),0);
+        assert!(b.used.load(Ordering::SeqCst) > 0);
+        server.await.unwrap();
+        reader_task.await.unwrap();
+    }
     #[tokio::test]
     async fn balance_response_rejects_positive_overflow() {
         use super::*;
@@ -1136,7 +1294,7 @@ mod tests {
         client.inner.connected.store(true, Ordering::SeqCst);
         let gate = client.inner.io_lifecycle.lock().await;
         let (tx, rx) = oneshot::channel();
-        client.inner.pending.lock().await.insert(1, PendingRequest { tx, generation: 0 });
+        client.inner.pending.lock().await.insert(1, PendingRequest { tx, generation: 0, response_budget: None });
         let disconnecting = {
             let client = client.clone();
             tokio::spawn(async move { client.disconnect().await })
@@ -1159,7 +1317,7 @@ mod tests {
         };
         stopped.changed().await.unwrap();
         let (tx, rx) = oneshot::channel();
-        client.inner.pending.lock().await.insert(7, PendingRequest { tx, generation: 0 });
+        client.inner.pending.lock().await.insert(7, PendingRequest { tx, generation: 0, response_budget: None });
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(!client.is_connected());
@@ -1196,7 +1354,7 @@ mod tests {
             client.inner.stopped.send_replace(false);
         }
         let (tx, mut rx) = oneshot::channel();
-        client.inner.pending.lock().await.insert(7, PendingRequest { tx, generation: 0 });
+        client.inner.pending.lock().await.insert(7, PendingRequest { tx, generation: 0, response_budget: None });
         drop(gate);
         old.await.unwrap();
         assert!(client.is_connected());
@@ -1222,7 +1380,7 @@ mod tests {
             client.inner.stopped.send_replace(false);
         }
         let (tx, mut rx) = oneshot::channel();
-        client.inner.pending.lock().await.insert(7, PendingRequest { tx, generation: 0 });
+        client.inner.pending.lock().await.insert(7, PendingRequest { tx, generation: 0, response_budget: None });
         drop(writer_lock);
         old.await.unwrap();
         assert!(client.is_connected());
@@ -1236,7 +1394,7 @@ mod tests {
         let client = ElectrumXClient::new(ServerEntry::new("example.com", 50002));
         client.inner.connected.store(true, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
-        client.inner.pending.lock().await.insert(7, PendingRequest { tx, generation: 0 });
+        client.inner.pending.lock().await.insert(7, PendingRequest { tx, generation: 0, response_budget: None });
         let (mut writer, reader) = tokio::io::duplex(128);
         let task = tokio::spawn(read_loop(client.inner.clone(), reader, 0));
         assert!(client.connect_with_test_roots(rustls::RootCertStore::empty()).await.is_err());
@@ -1299,7 +1457,7 @@ mod tests {
             *generation
         };
         let (tx, mut rx) = oneshot::channel();
-        pending.insert(999, PendingRequest { tx, generation: new_generation });
+        pending.insert(999, PendingRequest { tx, generation: new_generation, response_budget: None });
         drop(pending);
         assert!(call.await.is_err());
         assert!(client.is_connected());
@@ -1436,8 +1594,8 @@ mod tests {
         let (tx2, rx2) = oneshot::channel();
         {
             let mut pending = client.inner.pending.lock().await;
-            pending.insert(1, PendingRequest { tx: tx1, generation: 0 });
-            pending.insert(2, PendingRequest { tx: tx2, generation: 0 });
+            pending.insert(1, PendingRequest { tx: tx1, generation: 0, response_budget: None });
+            pending.insert(2, PendingRequest { tx: tx2, generation: 0, response_budget: None });
         }
         let (mut writer, reader) = tokio::io::duplex(128);
         let task = tokio::spawn(read_loop_with_limit(client.inner.clone(), reader, 16, 0));
@@ -1457,7 +1615,7 @@ mod tests {
         let mut receivers = Vec::new();
         for id in 1..=8 {
             let (tx, rx) = oneshot::channel();
-            client.inner.pending.lock().await.insert(id, PendingRequest { tx, generation: 0 });
+            client.inner.pending.lock().await.insert(id, PendingRequest { tx, generation: 0, response_budget: None });
             receivers.push(rx);
         }
         let (mut writer, reader) = tokio::io::duplex(1024);
@@ -1494,9 +1652,9 @@ mod tests {
         let (tx3, rx3) = oneshot::channel();
         {
             let mut pending = client.inner.pending.lock().await;
-            pending.insert(1, PendingRequest { tx: tx1, generation: 0 });
-            pending.insert(2, PendingRequest { tx: tx2, generation: 0 });
-            pending.insert(3, PendingRequest { tx: tx3, generation: 0 });
+            pending.insert(1, PendingRequest { tx: tx1, generation: 0, response_budget: None });
+            pending.insert(2, PendingRequest { tx: tx2, generation: 0, response_budget: None });
+            pending.insert(3, PendingRequest { tx: tx3, generation: 0, response_budget: None });
         }
         let (mut writer, reader) = tokio::io::duplex(256);
         let task = tokio::spawn(read_loop_with_limit(client.inner.clone(), reader, 128, 0));

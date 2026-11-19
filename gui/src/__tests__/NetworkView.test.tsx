@@ -1,18 +1,59 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { NetworkView } from '../views/NetworkView';
+import { useStore } from '../store';
 
 vi.mock('../api', () => ({ api: {
-  getNetworkInfo: vi.fn(), getServers: vi.fn(), listNetworks: vi.fn(), getHeaderStoreInfo: vi.fn(), syncHeaders: vi.fn(),
+  getNetworkInfo: vi.fn(), getServers: vi.fn(), listNetworks: vi.fn(), getHeaderStoreInfo: vi.fn(), syncHeaders: vi.fn(), scanAddressRange: vi.fn(),
 } }));
 import { api } from '../api';
 
 beforeEach(() => {
   vi.resetAllMocks();
+  useStore.getState().resetToLanding();
   vi.mocked(api.getNetworkInfo).mockResolvedValue({ connected: false } as any);
   vi.mocked(api.getServers).mockResolvedValue([]);
   vi.mocked(api.listNetworks).mockResolvedValue([]);
   vi.mocked(api.getHeaderStoreInfo).mockResolvedValue({ header_count: 3, tip_height: 2 });
+});
+
+describe('explicit address discovery', () => {
+  beforeEach(() => {
+    useStore.setState({ activeWalletPath: '/wallet', walletInstanceToken: 'instance', activeAccountId: 3 });
+    vi.mocked(api.getNetworkInfo).mockResolvedValue({ connected: true } as any);
+  });
+
+  it('requires an explicit scan and refreshes the active wallet on success', async () => {
+    vi.mocked(api.scanAddressRange).mockResolvedValue({ start_index: 0, end_index_exclusive: 26, new_keys: 2, server_host: 'test-server' });
+    render(<NetworkView />);
+    await screen.findByText(/Connected —/);
+    expect(api.scanAddressRange).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText(/End index/), { target: { value: '26' } });
+    fireEvent.click(screen.getByText('Scan addresses'));
+    await screen.findByText(/2 new keys found/);
+    expect(api.scanAddressRange).toHaveBeenCalledWith(3, 'instance', 26);
+    expect(useStore.getState().historyRefreshKey).toBe(1);
+    expect(useStore.getState().balanceRefreshKey).toBe(1);
+    expect(screen.getByText(/server sees the queried address script hashes/)).toBeInTheDocument();
+  });
+
+  it('rejects invalid ranges and ignores an old wallet result', async () => {
+    let finish!: (value: any) => void;
+    vi.mocked(api.scanAddressRange).mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    render(<NetworkView />);
+    await screen.findByText(/Connected —/);
+    fireEvent.change(screen.getByLabelText(/End index/), { target: { value: '1001' } });
+    fireEvent.click(screen.getByText('Scan addresses'));
+    expect(screen.getByText(/whole number from 1 to 1000/)).toBeInTheDocument();
+    expect(api.scanAddressRange).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText(/End index/), { target: { value: '26' } });
+    fireEvent.click(screen.getByText('Scan addresses'));
+    act(() => useStore.setState({ walletInstanceToken: 'new-instance' }));
+    await act(async () => finish({ start_index: 0, end_index_exclusive: 26, new_keys: 2, server_host: 'test-server' }));
+    expect(screen.queryByText(/2 new keys found/)).not.toBeInTheDocument();
+    expect(useStore.getState().historyRefreshKey).toBe(0);
+    expect(useStore.getState().balanceRefreshKey).toBe(0);
+  });
 });
 
 describe('header synchronization status', () => {

@@ -1,6 +1,6 @@
 # ElectrumSV-MC – Work Handoff
 
-Status: 2026-11-19. The user requested the architecture stage after the earlier pause. This document records the state; it does not authorize further work.
+Status: 2026-11-20. This document records the state; it does not authorize further work.
 
 ## Objective and locations
 
@@ -8,7 +8,7 @@ Develop a functional BSV wallet with an optionally enabled agent interface. Proj
 
 The project worktree is on `main` at `bab27657a1465b99f0f027901a13d117136a19dd` and contains many uncommitted changes and new files. Its `origin` points to the older Minenclown repository. Do not reset or broadly clean this worktree; `.dh/` is excluded from the published wallet snapshot.
 
-The separate publishing snapshot is at `../.electrumsv-publish-snapshot/`. The prior confirmed checkpoint before final architecture integration is commit `06348ef66e8b344f84b1fc863ea5839de3cc1dfb` on branch `development/wallet-teststand-2026-11-19` in `SteveCo-AI/ElectrumSV-MC`; later commits contain subsequent development work including the unaccepted U1 work in progress. The snapshot's local `origin/*` tracking ref may be stale; verify the actual GitHub branch before another push. This checkpoint is not a change to `main` or a 1.0 release.
+The separate publishing snapshot is at `../.electrumsv-publish-snapshot/` on branch `development/wallet-teststand-2026-11-19` in `SteveCo-AI/ElectrumSV-MC`. Verify the actual GitHub branch before another push; local tracking refs may be stale. This checkpoint is not a change to `main` or a 1.0 release.
 
 ## Previously accepted stage
 
@@ -31,7 +31,11 @@ Files and SHA-256 hashes at the pause:
 
 U1.1 removed an unnecessarily strict nonnegative check on the read-only backend ID. Two synthetic negative-ID cases failed before the fix; 38/38 focused and 175/175 GUI tests passed afterward, along with a GUI build. No real negative-ID legacy wallet has been identified. U1.2 addresses the separate ambiguity between stored negative IDs and temporary discovery sentinels; the scoped package is accepted after the documented tests and source review. The current release binary predates the latest U1.1 source change.
 
-The next planned work is R4, an explicit bounded recovery search and conservative merge; it is not yet implemented. Keep database changes atomic and protect existing wallet data. Save subsequent changes to the designated GitHub branch; do not publish user data or test secrets.
+## Current work: R4
+
+The explicit bounded recovery search and conservative merge are implemented and reviewed for the synthetic R4.1 scope. Tauri and agent entry points and a GUI action are implemented, but R4 remains open pending a full GUI-to-Tauri-to-local-TLS scan test and any resulting corrections. The scan uses the active unlocked account and selected ElectrumX connection, checks both branches for indices 0 through `end_index_exclusive - 1` (1–1000), and preserves the ordinary discovery marker. It rejects unsupported key inventories and inconsistent data. A server can omit activity; the scan does not establish completeness or consensus. The 120-second deadline does not guarantee the outcome if the process or reply is lost around SQLite commit. The accepted matched-response budget is 64 MiB; an additional rejecting frame can already have been read. See [network contract](network-contract.md).
+
+The backend source compiled offline. Focused results: 7 explicit-merge, 25 network-command, 49 ElectrumX, 5 sync regression and 1 ledger test passed. Three local TLS tests passed, including the agent network capability gate, range validation, discovered outputs beyond the gap, reopen/resync, session replacement and out-of-range output rejection. The GUI build and 9 focused NetworkView tests passed. These are synthetic results; the release binary above predates R4. Preserve the working tree, never publish user data or test secrets, and save reviewed progress on the designated branch.
 
 ## Architecture stage
 

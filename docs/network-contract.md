@@ -25,6 +25,12 @@ Server-supplied heights, history, and balances are claims. Backend history retur
 
 Server balance totals use checked positive addition in the two provider paths and return an error on overflow. Negative totals retain the existing clamp to zero. `BackendBalance` has public fields and can be constructed or deserialized without this constructor, so that check is not a universal type invariant.
 
+## Explicit extended address discovery (R4, in progress)
+
+The opt-in scan queries the connected ElectrumX server for both P2PKH derivation branches from index zero to the exclusive end supplied by the user (1–1000). The server sees script hashes and may link related queries. Responses are server claims and do not establish completeness or consensus. The scan is bound to the active wallet instance and account; its conservative transaction rejects unsupported key inventory, changed derivation rows, conflicting stored data and invalid output ownership. It does not change the ordinary discovery marker. A full GUI/Tauri/local-TLS integration test remains open.
+
+The scan has a 120-second deadline before commit and a 64 MiB accepted matched JSON-RPC response-frame budget. One rejecting frame may already have been read, and notification and transport overhead are outside that budget. Cancellation, process failure or a lost response around commit can leave the caller uncertain whether the operation committed. Inspect the wallet before retrying; do not automatically retry.
+
 ## Rust API compatibility
 
 This stage changes the public Rust API: `NetworkBackend` now requires `QueryTarget`, query and subscription arguments use typed targets, `NetworkError` adds `Unsupported`, and `BackendBalance::new` returns `Result`. External Rust callers and trait implementers may need changes; compatibility with downstream crates has not been verified. The wallet's Tauri and agent JSON contracts were not intentionally changed by this stage.
