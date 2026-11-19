@@ -10,7 +10,7 @@
 // API format, allowing us to verify the client's deserialization, error
 // handling, and AUD-006 txid validation logic without a live network.
 
-use electrumsv_mc_lib::network::backend::{NetworkBackend, BackendType};
+use electrumsv_mc_lib::network::backend::{NetworkBackend, BackendType, MainnetAddress};
 use electrumsv_mc_lib::network::whatsonchain::WhatsOnChainClient;
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -143,6 +143,7 @@ async fn test_e2e_network_woc_flow() {
 
     // Create a WoC client pointing at the mock server
     let client = WhatsOnChainClient::with_base_url(&base_url);
+    let address = MainnetAddress::try_from("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa").unwrap();
 
     // Step 1: get_tip_height (connect)
     let height = client
@@ -154,7 +155,7 @@ async fn test_e2e_network_woc_flow() {
 
     // Step 2: get_balance
     let balance = client
-        .get_balance("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+        .get_balance(&address)
         .await
         .expect("get_balance should succeed");
     assert_eq!(balance.confirmed, 50000, "mock balance confirmed should be 50000");
@@ -162,20 +163,20 @@ async fn test_e2e_network_woc_flow() {
 
     // Step 3: get_history
     let history = client
-        .get_history("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+        .get_history(&address)
         .await
         .expect("get_history should succeed");
     assert_eq!(history.len(), 2, "mock history should have 2 entries");
     assert_eq!(history[0].tx_hash, "abc123", "first history entry tx_hash");
     assert_eq!(history[0].height, 799999, "first history entry height");
-    assert!(history[0].verified, "confirmed entry should be verified");
+    assert!(!history[0].verified, "server-reported height does not verify a transaction");
     assert_eq!(history[1].tx_hash, "def456", "second history entry tx_hash");
     assert_eq!(history[1].height, 0, "unconfirmed entry height is 0");
     assert!(!history[1].verified, "unconfirmed entry should not be verified");
 
     // Step 4: get_utxos
     let utxos = client
-        .get_utxos("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")
+        .get_utxos(&address)
         .await
         .expect("get_utxos should succeed");
     assert_eq!(utxos.len(), 1, "mock should have 1 UTXO");
@@ -214,10 +215,8 @@ async fn test_e2e_network_woc_error_handling() {
     let base_url = MockServer::new().start();
     let client = WhatsOnChainClient::with_base_url(&base_url);
 
-    // Request a non-existent endpoint — should get a NotFound error
-    let _result = client.get_balance("nonexistent_address_xyz").await;
-    // The mock server returns 200 with balance JSON for any address/*/balance path,
-    // so this should actually succeed. Let's test a real 404 path instead.
+    // Invalid addresses are rejected before sending a request.
+    assert!(MainnetAddress::try_from("nonexistent_address_xyz").is_err());
     let result = client.get_tip_height().await;
     assert!(result.is_ok(), "get_tip_height should succeed against mock");
 }

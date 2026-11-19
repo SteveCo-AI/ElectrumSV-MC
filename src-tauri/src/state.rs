@@ -134,6 +134,7 @@ impl Drop for ActiveWallet {
 /// a tokio task handle and TLS stream. Instead, connection state is managed
 /// at a higher level. This struct holds the server list and metadata.
 pub struct NetworkState {
+    pub(crate) lifecycle_generation: u64,
     /// List of known servers with health tracking.
     pub server_list: ServerList,
     /// Whether a backend is currently connected.
@@ -157,6 +158,7 @@ pub struct NetworkState {
 impl NetworkState {
     pub fn new() -> Self {
         Self {
+            lifecycle_generation: 0,
             server_list: ServerList::with_defaults(),
             connected: false,
             client: None,

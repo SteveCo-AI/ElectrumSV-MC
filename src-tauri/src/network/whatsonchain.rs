@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 
 use super::backend::{
     BackendType, BackendBalance, BlockHeader, BroadcastResult, MerkleProof, NetworkBackend,
-    NetworkError, TxHistoryEntry, UtxoEntry,
+    MainnetAddress, NetworkError, ScriptHash, TxHistoryEntry, UtxoEntry,
 };
 
 // ---------------------------------------------------------------------------
@@ -56,6 +56,10 @@ struct AddressBalance {
     value: Option<u64>,
 }
 
+fn balance_from_response(balance: AddressBalance) -> Result<BackendBalance, NetworkError> {
+    BackendBalance::new(balance.confirmed, balance.unconfirmed)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AddressHistoryEntry {
@@ -64,6 +68,14 @@ struct AddressHistoryEntry {
     block_height: Option<i64>,
     // Some endpoints return "height" instead
     height: Option<i64>,
+}
+
+fn history_entry(entry: AddressHistoryEntry) -> TxHistoryEntry {
+    TxHistoryEntry {
+        tx_hash: entry.tx_hash,
+        height: entry.block_height.or(entry.height).unwrap_or(0),
+        verified: false,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,7 +124,7 @@ struct BroadcastResponse {
 ///
 /// `Clone` is cheap (Arc inside), allowing use across Tauri commands.
 /// This backend does NOT support push notifications — all data must be polled.
-/// `subscribe_scripthash` and `unsubscribe_scripthash` are no-ops.
+/// Scripthash subscriptions return an unsupported-operation error.
 #[derive(Clone)]
 pub struct WhatsOnChainClient {
     inner: Arc<Inner>,
@@ -239,6 +251,7 @@ impl Default for WhatsOnChainClient {
 
 #[async_trait]
 impl NetworkBackend for WhatsOnChainClient {
+    type QueryTarget = MainnetAddress;
     fn backend_type(&self) -> BackendType {
         BackendType::WhatsOnChain
     }
@@ -253,36 +266,23 @@ impl NetworkBackend for WhatsOnChainClient {
         Ok(info.blocks)
     }
 
-    async fn get_balance(&self, scripthash: &str) -> Result<BackendBalance, NetworkError> {
-        // WhatsOnChain uses addresses, not scripthashes.
-        // The caller must pass a BSV address, not a scripthash.
-        // For the WoC backend, we treat "scripthash" as an address.
-        let endpoint = format!("address/{scripthash}/balance");
+    async fn get_balance(&self, address: &MainnetAddress) -> Result<BackendBalance, NetworkError> {
+        let endpoint = format!("address/{}/balance", address.as_str());
         let bal: AddressBalance = self.get(&endpoint).await?;
         self.mark_connected();
-        Ok(BackendBalance::new(bal.confirmed, bal.unconfirmed))
+        balance_from_response(bal)
     }
 
-    async fn get_history(&self, scripthash: &str) -> Result<Vec<TxHistoryEntry>, NetworkError> {
-        let endpoint = format!("address/{scripthash}/history");
+    async fn get_history(&self, address: &MainnetAddress) -> Result<Vec<TxHistoryEntry>, NetworkError> {
+        let endpoint = format!("address/{}/history", address.as_str());
         let entries: Vec<AddressHistoryEntry> = self.get(&endpoint).await?;
         self.mark_connected();
 
-        let mut result = Vec::with_capacity(entries.len());
-        for e in entries {
-            let height = e.block_height.or(e.height).unwrap_or(0);
-            let verified = height > 0;
-            result.push(TxHistoryEntry {
-                tx_hash: e.tx_hash,
-                height,
-                verified,
-            });
-        }
-        Ok(result)
+        Ok(entries.into_iter().map(history_entry).collect())
     }
 
-    async fn get_utxos(&self, scripthash: &str) -> Result<Vec<UtxoEntry>, NetworkError> {
-        let endpoint = format!("address/{scripthash}/unspent");
+    async fn get_utxos(&self, address: &MainnetAddress) -> Result<Vec<UtxoEntry>, NetworkError> {
+        let endpoint = format!("address/{}/unspent", address.as_str());
         let entries: Vec<AddressUtxoEntry> = self.get(&endpoint).await?;
         self.mark_connected();
 
@@ -487,15 +487,12 @@ impl NetworkBackend for WhatsOnChainClient {
         })
     }
 
-    async fn subscribe_scripthash(&self, _scripthash: &str) -> Result<(), NetworkError> {
-        // WhatsOnChain is a REST API — no push notifications.
-        // Subscriptions are no-ops; the frontend must poll.
-        Ok(())
+    async fn subscribe_scripthash(&self, _scripthash: &ScriptHash) -> Result<(), NetworkError> {
+        Err(NetworkError::Unsupported("WhatsOnChain scripthash subscriptions"))
     }
 
-    async fn unsubscribe_scripthash(&self, _scripthash: &str) -> Result<(), NetworkError> {
-        // No-op for REST backend.
-        Ok(())
+    async fn unsubscribe_scripthash(&self, _scripthash: &ScriptHash) -> Result<(), NetworkError> {
+        Err(NetworkError::Unsupported("WhatsOnChain scripthash subscriptions"))
     }
 
     async fn ping(&self) -> Result<(), NetworkError> {
@@ -538,6 +535,27 @@ impl WhatsOnChainClient {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn balance_response_rejects_positive_overflow() {
+        use super::*;
+        let response: AddressBalance = serde_json::from_str(r#"{"confirmed":18446744073709551615,"unconfirmed":1}"#).unwrap();
+        assert!(matches!(balance_from_response(response), Err(NetworkError::Validation(_))));
+        let response: AddressBalance = serde_json::from_str(r#"{"confirmed":10,"unconfirmed":-20}"#).unwrap();
+        assert_eq!(balance_from_response(response).unwrap().total, 0);
+    }
+    #[tokio::test]
+    async fn no_push_and_reported_history_is_unverified() {
+        use super::*;
+        let client = WhatsOnChainClient::new();
+        let hash = ScriptHash::try_from("ab".repeat(32).as_str()).unwrap();
+        assert!(matches!(client.subscribe_scripthash(&hash).await, Err(NetworkError::Unsupported(_))));
+        assert!(matches!(client.unsubscribe_scripthash(&hash).await, Err(NetworkError::Unsupported(_))));
+        let value = serde_json::json!({"txHash":"aa", "blockHeight":123});
+        let entry: AddressHistoryEntry = serde_json::from_value(value).unwrap();
+        let history = history_entry(entry);
+        assert_eq!(history.height, 123);
+        assert!(!history.verified);
+    }
     use super::*;
 
     #[test]

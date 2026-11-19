@@ -41,12 +41,19 @@ pub struct BalanceChangedEvent {
 /// Call this after a successful `connect_server`.
 pub fn start_notification_forwarder(app: AppHandle, client: ElectrumXClient) {
     let mut rx = client.subscribe_notifications();
+    let mut shutdown = client.subscribe_shutdown();
 
     tokio::spawn(async move {
         log::info!("ElectrumX notification forwarder started");
 
         loop {
-            match rx.recv().await {
+            if *shutdown.borrow() { break; }
+            let received = tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                received = rx.recv() => received,
+            };
+            match received {
                 Ok(notification) => {
                     let (event_name, payload) = match &notification {
                         ElectrumNotification::NewBlock { height, header_hex } => {

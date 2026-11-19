@@ -3,7 +3,6 @@ use crate::core::coinchooser::Strategy;
 use crate::core::signer::{LocalSigner, Signer};
 use crate::core::transaction::{PaymentOutput, SelectedUtxo, TransactionError, TxBuilder, TxPlan};
 use crate::db::repositories;
-use crate::network::backend::NetworkBackend;
 use crate::security::totp::TotpInstance;
 use crate::state::{self, AppState};
 use bsv::compat::bip32::ExtendedKey;
@@ -365,24 +364,17 @@ where F: FnOnce(Vec<u8>) -> Fut, Fut: std::future::Future<Output = Result<String
 }
 
 pub async fn broadcast_plan(state: &AppState, plan_id: &str, expected_txid: &str, retry_unknown: bool) -> Result<String, String> {
-    use crate::network::backend::BackendType;
-    let (connected, active, electrum, woc) = {
-        let net = state.network.lock().unwrap();
-        (net.connected, net.active_backend, net.client.clone(), net.woc_client.clone())
-    };
-    let status = get_spend_plan_status(state, plan_id).await?;
+    broadcast_plan_with_status(state, plan_id, expected_txid, retry_unknown, get_spend_plan_status(state, plan_id)).await
+}
+
+async fn broadcast_plan_with_status<F>(state: &AppState, plan_id: &str, expected_txid: &str, retry_unknown: bool, status: F) -> Result<String, String>
+where F: std::future::Future<Output = Result<SpendPlanStatus, String>> {
+    let backend = state.network.lock().unwrap().selected_backend_snapshot();
+    let status = status.await?;
     if status.state == "BROADCASTED" && status.txid.as_deref() == Some(expected_txid) { return Ok(expected_txid.to_string()); }
-    if !connected || !match active {
-        Some(BackendType::ElectrumX) => electrum.as_ref().is_some_and(|client| client.is_connected()),
-        Some(BackendType::WhatsOnChain) => woc.as_ref().is_some_and(|client| client.is_connected()),
-        _ => false,
-    } { return Err("not connected to a network backend".into()); }
+    let backend = backend.connected_backend().ok_or("not connected to a network backend")?;
     broadcast_plan_with(state, plan_id, expected_txid, retry_unknown, move |bytes| async move {
-        match active {
-            Some(BackendType::ElectrumX) => electrum.ok_or("no active ElectrumX client")?.broadcast_tx(&bytes).await.map(|r| r.txid).map_err(|e| e.to_string()),
-            Some(BackendType::WhatsOnChain) => woc.ok_or("no active WhatsOnChain client")?.broadcast_tx(&bytes).await.map(|r| r.txid).map_err(|e| e.to_string()),
-            _ => Err("no active network backend".into()),
-        }
+        backend.broadcast(&bytes).await.map_err(|e| e.to_string())
     }).await
 }
 
@@ -512,10 +504,63 @@ mod tests {
         }
         assert!(broadcast_plan(&state, &prep.plan_id, &signed.txid, false).await.is_err());
         assert_eq!(get_spend_plan_status(&state, &prep.plan_id).await.unwrap().state, "SIGNED");
+        let electrum = state.network.lock().unwrap().client.clone().unwrap();
+        electrum.mark_test_connected();
+        let (entered, wait) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let status = async {
+            entered.send(()).unwrap(); resumed.await.unwrap();
+            get_spend_plan_status(&state, &prep.plan_id).await
+        };
+        let (result, ()) = tokio::join!(
+            broadcast_plan_with_status(&state, &prep.plan_id, &signed.txid, false, status),
+            async { wait.await.unwrap(); electrum.disconnect().await.unwrap(); resume.send(()).unwrap(); }
+        );
+        assert_eq!(result.unwrap_err(), "not connected to a network backend");
+        assert_eq!(get_spend_plan_status(&state, &prep.plan_id).await.unwrap().state, "SIGNED");
+        state.network.lock().unwrap().connected = false;
+        let (entered, wait) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let status = async {
+            entered.send(()).unwrap(); resumed.await.unwrap();
+            get_spend_plan_status(&state, &prep.plan_id).await
+        };
+        let (result, ()) = tokio::join!(
+            broadcast_plan_with_status(&state, &prep.plan_id, &signed.txid, false, status),
+            async { wait.await.unwrap(); electrum.mark_test_connected(); state.network.lock().unwrap().connected = true; resume.send(()).unwrap(); }
+        );
+        assert_eq!(result.unwrap_err(), "not connected to a network backend");
+        assert_eq!(get_spend_plan_status(&state, &prep.plan_id).await.unwrap().state, "SIGNED");
+        assert!(electrum.is_connected());
+        electrum.disconnect().await.unwrap();
+        state.network.lock().unwrap().woc_client = Some(crate::network::WhatsOnChainClient::with_base_url("http://[invalid"));
+        let (entered, wait) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let status = async {
+            entered.send(()).unwrap(); resumed.await.unwrap();
+            get_spend_plan_status(&state, &prep.plan_id).await
+        };
+        let (result, ()) = tokio::join!(
+            broadcast_plan_with_status(&state, &prep.plan_id, &signed.txid, false, status),
+            async {
+                wait.await.unwrap(); electrum.mark_test_connected();
+                state.network.lock().unwrap().active_backend = Some(crate::network::BackendType::WhatsOnChain);
+                resume.send(()).unwrap();
+            }
+        );
+        assert_eq!(result.unwrap_err(), "no backend connected");
+        assert_eq!(get_spend_plan_status(&state, &prep.plan_id).await.unwrap().state, "BROADCAST_UNKNOWN");
+        state.network.lock().unwrap().active_backend = Some(crate::network::BackendType::ElectrumX);
+        let balance = account_service::get_balance(&state, None).await.unwrap();
+        assert_eq!((balance.reserved, balance.available), (100_000, 0));
+        electrum.mark_test_connected();
+        let retry_error = broadcast_plan(&state, &prep.plan_id, &signed.txid, false).await.unwrap_err();
+        assert_eq!(retry_error, "plan is BROADCAST_UNKNOWN; explicit retry required for unknown outcome");
+        assert!(electrum.is_connected(), "implicit retry must not enter transport");
         state.network.lock().unwrap().connected = false;
         assert!(broadcast_plan_with(&state, &prep.plan_id, &"ff".repeat(32), false, |_| async { panic!("bad txid broadcast") }).await.is_err());
         let calls = AtomicUsize::new(0);
-        let attempt = broadcast_plan_with(&state, &prep.plan_id, &signed.txid, false, |_| async { calls.fetch_add(1, Ordering::SeqCst); Err("timeout".to_string()) }).await;
+        let attempt = broadcast_plan_with(&state, &prep.plan_id, &signed.txid, true, |_| async { calls.fetch_add(1, Ordering::SeqCst); Err("timeout".to_string()) }).await;
         assert!(attempt.is_err());
         assert_eq!(get_spend_plan_status(&state, &prep.plan_id).await.unwrap().state, "BROADCAST_UNKNOWN");
         assert!(broadcast_plan_with(&state, &prep.plan_id, &signed.txid, false, |_| async { panic!("implicit retry") }).await.is_err());
@@ -525,10 +570,24 @@ mod tests {
         assert_eq!(get_spend_plan_status(&state, &prep.plan_id).await.unwrap().state, "BROADCAST_UNKNOWN");
         let balance = account_service::get_balance(&state, None).await.unwrap();
         assert_eq!((balance.reserved, balance.available), (100_000, 0));
+        let expected_bytes = hex::decode(&signed.signed_tx_hex).unwrap();
+        let expected_copy = expected_bytes.clone();
+        let wrong = broadcast_plan_with(&state, &prep.plan_id, &signed.txid, true, move |bytes| async move {
+            assert_eq!(bytes, expected_copy);
+            Ok("ff".repeat(32))
+        }).await.unwrap_err();
+        assert_eq!(wrong, "server returned different transaction id; broadcast outcome unknown");
+        assert_eq!(get_spend_plan_status(&state, &prep.plan_id).await.unwrap().state, "BROADCAST_UNKNOWN");
+        let balance = account_service::get_balance(&state, None).await.unwrap();
+        assert_eq!((balance.reserved, balance.available), (100_000, 0));
         let server_id = signed.txid.clone();
-        let result = broadcast_plan_with(&state, &prep.plan_id, &signed.txid, true, |_| async move { Ok(server_id) }).await.unwrap();
+        let result = broadcast_plan_with(&state, &prep.plan_id, &signed.txid, true, move |bytes| async move {
+            assert_eq!(bytes, expected_bytes);
+            Ok(server_id)
+        }).await.unwrap();
         assert_eq!(result, signed.txid);
         assert_eq!(get_spend_plan_status(&state, &prep.plan_id).await.unwrap().state, "BROADCASTED");
+        assert_eq!(broadcast_plan(&state, &prep.plan_id, &signed.txid, false).await.unwrap(), signed.txid);
         broadcast_plan_with(&state, &prep.plan_id, &signed.txid, false, |_| async { panic!("duplicate broadcast") }).await.unwrap();
         // Apply a synthetic server snapshot after acceptance, without any network access.
         let (pool, account, _, _) = get_wallet_data(&state).unwrap();

@@ -39,7 +39,7 @@ impl fmt::Display for BackendType {
 // Shared data types
 // ---------------------------------------------------------------------------
 
-/// Balance for a scripthash as reported by the backend (ElectrumX / WhatsOnChain).
+/// Balance reported for a provider-specific query target.
 ///
 /// Renamed from `BalanceInfo` to `BackendBalance` to avoid collision with
 /// `commands::account::BalanceInfo` (the API-facing balance type with i64
@@ -56,17 +56,19 @@ pub struct BackendBalance {
 }
 
 impl BackendBalance {
-    pub fn new(confirmed: u64, unconfirmed: i64) -> Self {
+    /// Reject positive overflow; negative totals are clamped to zero.
+    pub fn new(confirmed: u64, unconfirmed: i64) -> Result<Self, NetworkError> {
         let total = if unconfirmed < 0 {
             confirmed.saturating_sub(unconfirmed.unsigned_abs())
         } else {
-            confirmed + unconfirmed as u64
+            confirmed.checked_add(unconfirmed as u64)
+                .ok_or_else(|| NetworkError::Validation("balance total overflow".into()))?
         };
-        Self {
+        Ok(Self {
             confirmed,
             unconfirmed,
             total,
-        }
+        })
     }
 
     /// Returns true when the balance is zero and there is no unconfirmed activity.
@@ -77,18 +79,18 @@ impl BackendBalance {
 
 impl Default for BackendBalance {
     fn default() -> Self {
-        Self::new(0, 0)
+        Self { confirmed: 0, unconfirmed: 0, total: 0 }
     }
 }
 
-/// A single history entry for a scripthash from the server.
+/// A single history entry reported by a server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxHistoryEntry {
     /// Transaction hash in display (reversed) hex.
     pub tx_hash: String,
-    /// Block height if confirmed, 0 or -1 if unconfirmed.
+    /// Server-reported height, 0 or -1 for unconfirmed entries.
     pub height: i64,
-    /// Whether the transaction is verified (has merkle proof).
+    /// Whether the transaction has been independently verified; backend history alone is unverified.
     pub verified: bool,
 }
 
@@ -181,6 +183,9 @@ pub enum NetworkError {
     #[error("no backend connected")]
     NotConnected,
 
+    #[error("unsupported operation: {0}")]
+    Unsupported(&'static str),
+
     /// Generic I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -194,9 +199,87 @@ pub enum NetworkError {
 // Scripthash helper
 // ---------------------------------------------------------------------------
 
+/// An ElectrumX script hash encoded as exactly 64 ASCII hexadecimal characters.
+///
+/// ```compile_fail
+/// use electrumsv_mc_lib::network::backend::ScriptHash;
+/// let _ = ScriptHash("00".repeat(32));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ScriptHash(String);
+
+impl TryFrom<&str> for ScriptHash {
+    type Error = NetworkError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(NetworkError::Protocol("invalid scripthash".into()));
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl ScriptHash {
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+/// A Base58Check mainnet P2PKH or P2SH address.
+///
+/// Other address forms formerly passed through to WhatsOnChain are rejected.
+/// ```compile_fail
+/// use electrumsv_mc_lib::network::backend::MainnetAddress;
+/// let _ = MainnetAddress("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".to_owned());
+/// ```
+/// ```no_run
+/// use electrumsv_mc_lib::network::backend::{MainnetAddress, NetworkBackend, ScriptHash};
+/// use electrumsv_mc_lib::network::{electrumx::ElectrumXClient, whatsonchain::WhatsOnChainClient};
+/// async fn correct(electrum: &ElectrumXClient, woc: &WhatsOnChainClient) {
+///     let hash = ScriptHash::try_from("00".repeat(32).as_str()).unwrap();
+///     let address = MainnetAddress::try_from("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa").unwrap();
+///     let _ = electrum.get_history(&hash).await;
+///     let _ = woc.get_history(&address).await;
+/// }
+/// ```
+/// ```compile_fail
+/// use electrumsv_mc_lib::network::backend::{MainnetAddress, NetworkBackend};
+/// use electrumsv_mc_lib::network::electrumx::ElectrumXClient;
+/// async fn wrong(client: &ElectrumXClient, address: &MainnetAddress) {
+///     let _ = client.get_balance(address).await;
+/// }
+/// ```
+/// ```compile_fail
+/// use electrumsv_mc_lib::network::backend::{NetworkBackend, ScriptHash};
+/// use electrumsv_mc_lib::network::whatsonchain::WhatsOnChainClient;
+/// async fn wrong(client: &WhatsOnChainClient, hash: &ScriptHash) {
+///     let _ = client.get_history(hash).await;
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MainnetAddress(String);
+
+impl TryFrom<&str> for MainnetAddress {
+    type Error = NetworkError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        use sha2::{Digest, Sha256};
+        if value.len() > 35 { return Err(NetworkError::Protocol("invalid mainnet address length".into())); }
+        let decoded = bs58::decode(value).into_vec().map_err(|_| NetworkError::Protocol("invalid mainnet address".into()))?;
+        if decoded.len() != 25 || !matches!(decoded[0], 0 | 5) {
+            return Err(NetworkError::Protocol("expected a mainnet P2PKH or P2SH address".into()));
+        }
+        let checksum = Sha256::digest(Sha256::digest(&decoded[..21]));
+        if decoded[21..] != checksum[..4] {
+            return Err(NetworkError::Protocol("invalid address checksum".into()));
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl MainnetAddress {
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
 /// Compute the ElectrumX scripthash for a P2PKH address.
 ///
-/// ElectrumX uses hash256(script) in reverse byte order as the "scripthash".
+/// ElectrumX uses SHA256(script) in reverse byte order as the "scripthash".
 /// For a P2PKH address, the script is: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
 ///
 /// Returns the scripthash as a hex string (display/reversed form, matching ElectrumX protocol).
@@ -244,10 +327,12 @@ pub fn scripthash_from_script(script_hex: &str) -> Result<String, NetworkError> 
 ///
 /// AUDIT REQUIREMENTS:
 /// - `broadcast_tx` MUST validate the returned txid (AUD-006).
-/// - All server responses MUST be cryptographically validated (AUD-Fund #6).
+/// - Server history, balances, and heights are unverified claims unless separately checked.
 /// - TLS MUST use full certificate + hostname verification (no permissive verifier).
 #[async_trait::async_trait]
 pub trait NetworkBackend: Send + Sync {
+    /// The provider-specific target for balance, history, and UTXO queries.
+    type QueryTarget: Send + Sync;
     /// The backend type identifier.
     fn backend_type(&self) -> BackendType;
 
@@ -257,14 +342,14 @@ pub trait NetworkBackend: Send + Sync {
     /// Get the current best block height (chain tip).
     async fn get_tip_height(&self) -> Result<u64, NetworkError>;
 
-    /// Get the balance for a scripthash.
-    async fn get_balance(&self, scripthash: &str) -> Result<BackendBalance, NetworkError>;
+    /// Get the balance for this provider's query target.
+    async fn get_balance(&self, target: &Self::QueryTarget) -> Result<BackendBalance, NetworkError>;
 
-    /// Get the transaction history for a scripthash.
-    async fn get_history(&self, scripthash: &str) -> Result<Vec<TxHistoryEntry>, NetworkError>;
+    /// Get the transaction history for this provider's query target.
+    async fn get_history(&self, target: &Self::QueryTarget) -> Result<Vec<TxHistoryEntry>, NetworkError>;
 
-    /// Get the unspent outputs for a scripthash.
-    async fn get_utxos(&self, scripthash: &str) -> Result<Vec<UtxoEntry>, NetworkError>;
+    /// Get the unspent outputs for this provider's query target.
+    async fn get_utxos(&self, target: &Self::QueryTarget) -> Result<Vec<UtxoEntry>, NetworkError>;
 
     /// Broadcast a raw transaction.
     ///
@@ -288,12 +373,12 @@ pub trait NetworkBackend: Send + Sync {
         block_height: u64,
     ) -> Result<MerkleProof, NetworkError>;
 
-    /// Subscribe to status updates for a scripthash.
-    /// Returns immediately; updates arrive via the notification channel.
-    async fn subscribe_scripthash(&self, scripthash: &str) -> Result<(), NetworkError>;
+    /// Subscribe to scripthash updates, or return `Unsupported` when unavailable.
+    /// Updates arrive via the notification channel.
+    async fn subscribe_scripthash(&self, scripthash: &ScriptHash) -> Result<(), NetworkError>;
 
     /// Unsubscribe from status updates for a scripthash.
-    async fn unsubscribe_scripthash(&self, scripthash: &str) -> Result<(), NetworkError>;
+    async fn unsubscribe_scripthash(&self, scripthash: &ScriptHash) -> Result<(), NetworkError>;
 
     /// Ping the server to check liveness.
     async fn ping(&self) -> Result<(), NetworkError>;
@@ -311,6 +396,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn server_balance_overflow_reproduction() {
+        assert!(matches!(BackendBalance::new(u64::MAX, 1), Err(NetworkError::Validation(_))));
+        assert_eq!(BackendBalance::new(u64::MAX, 0).unwrap().total, u64::MAX);
+        assert_eq!(BackendBalance::new(u64::MAX - 1, 1).unwrap().total, u64::MAX);
+        assert_eq!(BackendBalance::new(0, i64::MIN).unwrap().total, 0);
+        assert_eq!(BackendBalance::new(u64::MAX, i64::MIN).unwrap().total, i64::MAX as u64);
+    }
+
+    #[test]
+    fn query_targets_validate_format_checksum_and_mainnet() {
+        let lower = "ab".repeat(32);
+        let upper = lower.to_ascii_uppercase();
+        assert_eq!(ScriptHash::try_from(lower.as_str()).unwrap().as_str(), lower);
+        assert_eq!(ScriptHash::try_from(upper.as_str()).unwrap().as_str(), upper);
+        for value in ["", "0", &"0".repeat(63), &"0".repeat(65), &format!("{}g", "0".repeat(63)), &"é".repeat(32)] {
+            assert!(ScriptHash::try_from(value).is_err());
+        }
+        for value in ["1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy"] {
+            assert_eq!(MainnetAddress::try_from(value).unwrap().as_str(), value);
+        }
+        for value in ["", "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb", "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn", "not_an_address"] {
+            assert!(MainnetAddress::try_from(value).is_err());
+        }
+    }
+
+    #[test]
     fn test_backend_type_display() {
         assert_eq!(BackendType::ElectrumX.to_string(), "electrumx");
         assert_eq!(BackendType::WhatsOnChain.to_string(), "whatsonchain");
@@ -326,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_balance_info_new() {
-        let b = BackendBalance::new(1000, 500);
+        let b = BackendBalance::new(1000, 500).unwrap();
         assert_eq!(b.confirmed, 1000);
         assert_eq!(b.unconfirmed, 500);
         assert_eq!(b.total, 1500);
@@ -335,7 +446,7 @@ mod tests {
 
     #[test]
     fn test_balance_info_negative_unconfirmed() {
-        let b = BackendBalance::new(1000, -300);
+        let b = BackendBalance::new(1000, -300).unwrap();
         assert_eq!(b.confirmed, 1000);
         assert_eq!(b.unconfirmed, -300);
         assert_eq!(b.total, 700);
@@ -352,7 +463,7 @@ mod tests {
     #[test]
     fn test_balance_info_saturating_sub() {
         // If unconfirmed is more negative than confirmed, total clamps to 0
-        let b = BackendBalance::new(100, -200);
+        let b = BackendBalance::new(100, -200).unwrap();
         assert_eq!(b.total, 0);
     }
 

@@ -1,5 +1,7 @@
 # ElectrumSV-MC — lokale Testfassung
 
+> **Latest test build (2026-11-19):** The current Linux artifact is `src-tauri/target/release/electrumsv-mc` (SHA-256 `0e64770557616e19c9ef8762b281ce74efce462b3bba9c1625affe853f08cf5d`). It includes the still-unaccepted UTXO view. Only an isolated empty-wallet agent startup/capability smoke has been run on this release binary; the synthetic Wry payment test used a separate test host. Earlier artifact descriptions below are historical. See [work handoff](docs/HANDOFF.md) and [network contract](docs/network-contract.md) for current status and limitations.
+
 Dieser Stand wurde anhand von Commit `bab27657a1465b99f0f027901a13d117136a19dd` neu aufgebaut. Der verlorene Patch konnte nicht bytegenau wiederhergestellt werden. Die Quellen enthalten die vorgenommenen Änderungen; das ursprüngliche Archiv enthielt kein kompiliertes Programm und keine echten Wallet-Dateien. Ein Linux-Release-Artefakt für die TLS- und History-Erweiterung wurde erstellt.
 
 **Nicht für echte Guthaben oder reale Seeds verwenden.** Zu den offenen Punkten gehören fehlende unabhängige Chainvalidierung, Klartextspeicherung des TOTP-Geheimnisses in Legacy-Wallets, unsichere Altdatenpfade sowie nicht vollständig geprüfte Wiederherstellung. `KNOWN_ISSUES.md` enthält die konkreten Grenzen. Import privater Schlüssel und der alte Legacy-Seed-Sweep sind gesperrt. Eine ausdrückliche Schema-33-zu-34-Migration ist für unterstützte Wallets implementiert und mit synthetischen Daten geprüft.

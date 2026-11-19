@@ -8,7 +8,7 @@ Develop a functional BSV wallet with an optionally enabled agent interface. Proj
 
 The project worktree is on `main` at `bab27657a1465b99f0f027901a13d117136a19dd` and contains many uncommitted changes and new files. Its `origin` points to the older Minenclown repository. Do not reset or broadly clean this worktree; `.dh/` is excluded from the published wallet snapshot.
 
-The separate publishing snapshot is at `../.electrumsv-publish-snapshot/`. The previously confirmed checkpoint is commit `b40fdd3f4cbb3f6674d00bae66676fad08b7f9b1` on branch `development/wallet-teststand-2026-11-19` in `SteveCo-AI/ElectrumSV-MC`; later commits on that branch may contain the unaccepted U1 work in progress. The snapshot's local `origin/*` tracking ref may be stale; verify the actual GitHub branch before another push. This checkpoint is not a change to `main` or a 1.0 release.
+The separate publishing snapshot is at `../.electrumsv-publish-snapshot/`. The prior confirmed checkpoint before final architecture integration is commit `06348ef66e8b344f84b1fc863ea5839de3cc1dfb` on branch `development/wallet-teststand-2026-11-19` in `SteveCo-AI/ElectrumSV-MC`; later commits contain subsequent development work including the unaccepted U1 work in progress. The snapshot's local `origin/*` tracking ref may be stale; verify the actual GitHub branch before another push. This checkpoint is not a change to `main` or a 1.0 release.
 
 ## Previously accepted stage
 
@@ -16,7 +16,7 @@ The separate publishing snapshot is at `../.electrumsv-publish-snapshot/`. The p
 
 The isolated payment test used a real Wry/Tauri send view with synthetic wallet state and a local TLS mock. It covered sync, incorrect and correct TOTP, signing, connection loss with an unknown outcome, and an explicit retry using identical transaction bytes. The mock checked the script VM and actual fee. It did not establish GUI login, GUI connection setup, persistent TOTP policy, live broadcast, or consensus. See the [roadmap](roadmap.md), [KNOWN_ISSUES.md](../KNOWN_ISSUES.md), and [test host](../tools/wry-payment/README.md) for details and boundaries.
 
-The last built Linux test artifact is `src-tauri/target/release/electrumsv-mc`, SHA-256 `18e1b1cdf19bc5abc90591f5f33acfd9edca7673240ab29e02139a126ce449d7`. It does **not** include the later UTXO-view changes. Earlier checks and their source versions are described in [START_HIER_DE.md](../START_HIER_DE.md).
+The current Linux test artifact is `src-tauri/target/release/electrumsv-mc`, SHA-256 `0e64770557616e19c9ef8762b281ce74efce462b3bba9c1625affe853f08cf5d`. It includes the still-unaccepted U1 UTXO-view changes. A separate isolated agent smoke checked startup, an empty wallet status, and disabled-by-default capabilities; it did not exercise a release-binary payment. The prior artifact is retained as `src-tauri/target/release/electrumsv-mc-18e1b1cd-teststand`, SHA-256 `18e1b1cdf19bc5abc90591f5f33acfd9edca7673240ab29e02139a126ce449d7`. Earlier checks and their source versions are described in [START_HIER_DE.md](../START_HIER_DE.md).
 
 ## Current local state: U1
 
@@ -33,9 +33,11 @@ The implementer reported three failures reproduced before the fix, followed by 2
 
 On resumption, first inspect the current diff and these hashes, complete the independent review including the compatibility point, and address any substantiated findings. Only after successful review should U1 be accepted in the [roadmap](roadmap.md) and a new release artifact considered. Save subsequent changes to the designated GitHub branch; do not publish user data or test secrets.
 
-## Architecture stage in progress
+## Architecture stage
 
-The user approved wallet-specific domain-boundary rules and implementation based on the architecture audit. `AGENTS.md` now records those rules. A2 centralizes the existing coin-selection names and mappings in a typed catalog; focused offline checks and review are complete. A3 network lifecycle and payment-backend boundaries are still in progress, with concurrency, cancellation and cleanup under investigation. See [roadmap](roadmap.md) for acceptance status; do not treat an unfinished A3 as verified.
+The user approved wallet-specific domain-boundary rules and implementation based on the architecture audit. `AGENTS.md` records the rules. A2 centralizes existing coin-selection identifiers and mappings. A3 adds a bound payment-backend snapshot, lifecycle and request-generation safeguards, typed provider query targets, truthful history verification flags, and explicit balance-overflow errors. The scoped A1–A3 work was accepted after review and risk-based tests; this is not a claim of full consensus or release readiness. Public Rust API changes, address-format restrictions and runtime-cleanup limits are in [network-contract.md](network-contract.md).
+
+On the final source snapshot, the Rust library suite passed 643 tests with 7 ignored; isolated network/command tests passed 175/175, local WoC integration 2/2 and agent TLS/sync 1/1. Rustdoc passed 5 with 1 ignored; the separate Wry/Tauri synthetic payment flow also passed. These are distinct overlapping runs, not an additive unique-test count. The Wry test used a test host and local mock, not the release binary or a real broadcast.
 
 ## Remaining limitations
 

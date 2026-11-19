@@ -7,7 +7,7 @@
 // AUDIT REQUIREMENTS (must be enforced in all implementations):
 // - AUD-006: broadcast_tx must return a validated txid, never None.
 // - AUD-Fund #6: Full TLS certificate + hostname verification, no permissive
-//   verifier. Server responses must be cryptographically validated.
+//   verifier. Server claims require separate verification where applicable.
 // - AUD-007: TOTP protection is not bypassable (enforced at command layer).
 
 pub mod backend;
@@ -15,6 +15,7 @@ pub mod electrumx;
 pub mod header_store;
 pub mod networks;
 pub mod server_list;
+pub mod service;
 pub mod whatsonchain;
 
 // Re-export key types for convenience.

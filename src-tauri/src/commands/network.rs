@@ -15,7 +15,7 @@
 
 use crate::core::address;
 use crate::db::repositories;
-use crate::network::backend::{BackendType, NetworkBackend, NetworkError};
+use crate::network::backend::{BackendType, NetworkBackend, NetworkError, ScriptHash};
 use crate::network::electrumx::ElectrumXClient;
 use crate::network::header_store::{HeaderStore, ParsedHeader};
 use crate::network::server_list::{ServerStatus, ServerStatusInfo};
@@ -112,14 +112,12 @@ fn get_network_snapshot(state: &AppState) -> (Vec<ServerStatusInfo>, bool, usize
 /// Does not require an open wallet. Returns metadata about the network layer.
 #[tauri::command]
 pub async fn get_network_info(state: State<'_, AppState>) -> Result<NetworkInfo, String> {
-    let (_servers, connected, connected_count, banned_count, total) = get_network_snapshot(&state);
-
-    // Find active server and backend type
-    let (active_server, backend_type) = {
+    let (connected, connected_count, banned_count, total, active_server, backend_type) = {
         let net = state.network.lock().unwrap();
+        let counts = net.server_list.count_by_status();
         let host = net.server_list.active().map(|s| s.host.clone());
         let bt = net.active_backend.map(|b| b.to_string());
-        (host, bt)
+        (net.connected && net.active_backend_snapshot().is_some(), counts.connected, counts.banned, net.server_list.len(), host, bt)
     };
 
     Ok(NetworkInfo {
@@ -201,13 +199,14 @@ pub async fn connect_explicit_server(
     log::info!("Connecting to ElectrumX server: {}", server.host);
 
     // Create client and connect
+    let generation = state.network.lock().unwrap().begin_network_operation();
     let client = ElectrumXClient::new(server.clone());
     client
         .connect()
         .await
         .map_err(|e| format!("connection failed: {e}"))?;
 
-    register_connected_server(state, &server, &client);
+    register_connected_server(state, &server, &client, generation)?;
     Ok(client)
 }
 
@@ -215,22 +214,31 @@ pub async fn connect_explicit_server(
 pub(crate) async fn connect_explicit_server_with_test_roots(
     state: &AppState, server: crate::network::server_list::ServerEntry, roots: rustls::RootCertStore,
 ) -> Result<ElectrumXClient, String> {
+    let generation = state.network.lock().unwrap().begin_network_operation();
     let client = ElectrumXClient::new(server.clone());
     client.connect_with_test_roots(roots).await.map_err(|e| format!("connection failed: {e}"))?;
-    register_connected_server(state, &server, &client);
+    register_connected_server(state, &server, &client, generation)?;
     Ok(client)
 }
 
-fn register_connected_server(state: &AppState, server: &crate::network::server_list::ServerEntry, client: &ElectrumXClient) {
-    {
+fn register_connected_server(state: &AppState, server: &crate::network::server_list::ServerEntry, client: &ElectrumXClient, generation: u64) -> Result<(), String> {
+    let old = {
         let mut net = state.network.lock().unwrap();
+        if !net.is_current_network_operation(generation) || net.server_list.status(&server.host) == ServerStatus::Banned || !client.is_connected() {
+            crate::network::service::cleanup((Some(client.clone()), None));
+            return Err("connection superseded, banned or closed".into());
+        }
+        let old = net.take_active_network();
         net.server_list.record_success(&server.host, 0);
         net.connected = true;
         net.client = Some(client.clone());
         net.active_backend = Some(BackendType::ElectrumX);
-    }
+        old
+    };
+    crate::network::service::cleanup(old);
 
     log::info!("Connected to {}", server.host);
+    Ok(())
 }
 
 /// Disconnect from the current server.
@@ -240,35 +248,11 @@ pub async fn disconnect_server(state: State<'_, AppState>) -> Result<(), String>
 }
 
 pub async fn disconnect_server_inner(state: &AppState) -> Result<(), String> {
-    // Extract client, WoC client, and host without holding lock across await
-    let (client_opt, woc_opt, host) = {
+    let old = {
         let mut net = state.network.lock().unwrap();
-        let h = net.server_list.active().map(|s| s.host.clone());
-        (net.client.take(), net.woc_client.take(), h)
+        net.clear_active_network()
     };
-
-    if let Some(client) = client_opt {
-        if let Some(ref h) = host {
-            log::info!("Disconnecting from {h}");
-        }
-        // Graceful disconnect (async, no lock held)
-        let _ = client.disconnect().await;
-    }
-
-    if let Some(woc) = woc_opt {
-        let _ = woc.disconnect().await;
-    }
-
-    // Update state
-    {
-        let mut net = state.network.lock().unwrap();
-        if let Some(ref h) = host {
-            net.server_list.disconnect(h);
-        }
-        net.connected = false;
-        net.active_backend = None;
-    }
-
+    crate::network::service::cleanup(old);
     Ok(())
 }
 
@@ -287,15 +271,19 @@ pub async fn set_network_backend(
     match backend_type.as_str() {
         "electrumx" => {
             let mut net = state.network.lock().unwrap();
-            if net.woc_client.is_some() {
-                net.woc_client = None;
+            net.begin_network_operation();
+            if net.active_backend == Some(BackendType::ElectrumX) && net.client.is_some() {
+                return Ok(());
             }
-            // Don't change client — it's managed by connect_server/disconnect_server
+            let old = net.take_active_network();
             net.active_backend = Some(BackendType::ElectrumX);
+            drop(net);
+            crate::network::service::cleanup(old);
             log::info!("Network backend set to ElectrumX");
             Ok(())
         }
         "whatsonchain" => {
+            let generation = state.network.lock().unwrap().begin_network_operation();
             let woc = crate::network::whatsonchain::WhatsOnChainClient::new();
             // Ping to verify connectivity
             woc.ping()
@@ -303,15 +291,16 @@ pub async fn set_network_backend(
                 .map_err(|e| format!("WhatsOnChain backend connection failed: {e}"))?;
 
             let mut net = state.network.lock().unwrap();
+            if !net.is_current_network_operation(generation) {
+                return Err("backend selection superseded".into());
+            }
+            let old = net.take_active_network();
             net.woc_client = Some(woc);
             net.active_backend = Some(BackendType::WhatsOnChain);
             // If an ElectrumX client is active, disconnect it
-            if let Some(client) = net.client.take() {
-                // Drop the client — graceful disconnect in background
-                // (can't await while holding the lock)
-                drop(client);
-            }
             net.connected = true;
+            drop(net);
+            crate::network::service::cleanup(old);
             log::info!("Network backend set to WhatsOnChain");
             Ok(())
         }
@@ -490,7 +479,8 @@ async fn discover_used_keys(client: &ElectrumXClient, pool: &sqlx::SqlitePool, a
             let public = child.public_key().map_err(|e| e.to_string())?;
             let addr = address::pubkey_to_p2pkh_address(&public);
             let hash = crate::network::backend::scripthash_from_address(&addr).map_err(|e| e.to_string())?;
-            let used = !client.get_history(&hash).await.map_err(|e| format!("address discovery failed: {e}"))?.is_empty();
+            let target = ScriptHash::try_from(hash.as_str()).map_err(|e| e.to_string())?;
+            let used = !client.get_history(&target).await.map_err(|e| format!("address discovery failed: {e}"))?.is_empty();
             if used && !known.contains(&(chain, index)) { found.push((chain, index)); }
             if used || known.contains(&(chain, index)) { gap = 0; } else { gap += 1; }
             if gap >= 20 && known_max.is_none_or(|max| index > max) { completed = true; break; }
@@ -641,6 +631,7 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
                 )
             })?;
 
+        let target = ScriptHash::try_from(scripthash.as_str()).map_err(|e| e.to_string())?;
         if wallet_scripts.insert(scripthash.clone(), ki.keyinstance_id).is_some() {
             return Err("duplicate wallet script".into());
         }
@@ -653,7 +644,7 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
         );
 
         // Fetch balance from server
-        let balance = match client.get_balance(&scripthash).await {
+        let balance = match client.get_balance(&target).await {
             Ok(b) => b,
             Err(e) => return Err(format!("keyinstance {}: balance error: {e}", ki.keyinstance_id)),
         };
@@ -662,7 +653,7 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
         total_balance_unconfirmed = total_balance_unconfirmed.checked_add(balance.unconfirmed).ok_or("unconfirmed balance overflow")?;
 
         // Fetch history from server
-        let history = match client.get_history(&scripthash).await {
+        let history = match client.get_history(&target).await {
             Ok(h) => h,
             Err(e) => return Err(format!("keyinstance {}: history error: {e}", ki.keyinstance_id)),
         };
@@ -675,7 +666,7 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
         }
 
         // Fetch UTXOs from server
-        let utxos = match client.get_utxos(&scripthash).await {
+        let utxos = match client.get_utxos(&target).await {
             Ok(u) => u,
             Err(e) => return Err(format!("keyinstance {}: utxos error: {e}", ki.keyinstance_id)),
         };
@@ -727,7 +718,7 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
 
         // 6. Subscribe to scripthash updates for push notifications
         // Best-effort — don't fail the sync if subscription fails
-        if let Err(e) = client.subscribe_scripthash(&scripthash).await {
+        if let Err(e) = client.subscribe_scripthash(&target).await {
             log::warn!(
                 "sync_wallet: subscribe_scripthash failed for keyinstance {}: {e}",
                 ki.keyinstance_id
@@ -788,10 +779,13 @@ pub struct SyncResult {
 pub async fn ban_server(state: State<'_, AppState>, host: String) -> Result<(), String> {
     log::warn!("Banning server: {host}");
     let mut net = state.network.lock().unwrap();
+    net.begin_network_operation();
+    let is_active = net.active_backend == Some(BackendType::ElectrumX)
+        && net.client.as_ref().is_some_and(|client| client.server_host() == host);
     net.server_list.ban(&host);
-    if net.server_list.active().is_none() {
-        net.connected = false;
-    }
+    let old = if is_active { Some(net.take_active_network()) } else { None };
+    drop(net);
+    if let Some(old) = old { crate::network::service::cleanup(old); }
     Ok(())
 }
 
@@ -1070,6 +1064,28 @@ pub struct VerifyProofResult {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn stale_connection_and_disconnect_cannot_replace_newer_connection() {
+        let state = crate::state::AppState::new();
+        let (server, first, second) = {
+            let mut net = state.network.lock().unwrap();
+            let server = net.server_list.all()[0].clone();
+            let first = net.begin_network_operation();
+            let second = net.begin_network_operation();
+            (server, first, second)
+        };
+        let stale = crate::network::ElectrumXClient::new(server.clone());
+        stale.mark_test_connected();
+        let current = crate::network::ElectrumXClient::new(server.clone());
+        current.mark_test_connected();
+        super::register_connected_server(&state, &server, &current, second).unwrap();
+        assert!(super::register_connected_server(&state, &server, &stale, first).is_err());
+        assert!(!stale.is_connected());
+        assert!(state.network.lock().unwrap().active_backend_snapshot().is_some());
+        super::disconnect_server_inner(&state).await.unwrap();
+        assert!(!current.is_connected());
+        assert!(state.network.lock().unwrap().active_backend_snapshot().is_none());
+    }
     #[tokio::test]
     async fn cancelled_header_sync_keeps_same_store_and_unblocks_parallel_info() {
         use std::sync::Arc;
