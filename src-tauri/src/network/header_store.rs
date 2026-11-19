@@ -224,12 +224,25 @@ pub fn check_pow(raw: &[u8]) -> bool {
 /// `expected_root` is the merkle root from the block header, in display (reversed) hex.
 ///
 /// Returns true if the proof is valid (the transaction is included in the block).
+pub(crate) fn valid_hash32(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn valid_merkle_position(depth: usize, pos: u64) -> bool {
+    depth <= 64 && (depth == 64 || (pos >> depth) == 0)
+}
+
 pub fn verify_merkle_proof(
     tx_hash: &str,
     branch: &[String],
     pos: u64,
     expected_root: &str,
 ) -> bool {
+    if !valid_hash32(tx_hash) || !valid_hash32(expected_root)
+        || !valid_merkle_position(branch.len(), pos)
+        || branch.iter().any(|hash| !valid_hash32(hash)) {
+        return false;
+    }
     // Convert tx_hash from display hex to internal (LE) bytes
     let mut current = match hex::decode(tx_hash) {
         Ok(bytes) => reverse_bytes(&bytes), // display → internal LE
@@ -427,27 +440,14 @@ impl HeaderStore {
                     return Ok(ConnectResult::Connected { height });
                 }
 
-                // Header already stored at this height?
-                if let Ok(Some(existing)) = self.get_header(height).await {
+                // A competing chain needs explicit resolution; never replace a stored prefix.
+                if let Some(existing) = self.get_header(height).await? {
                     if existing == header_hex {
                         return Ok(ConnectResult::AlreadyExists { height });
                     }
-                }
-
-                // Check if this header connects to a previous header (reorg)
-                if height > 0 {
-                    if let Ok(Some(prev_hex)) = self.get_header(height - 1).await {
-                        let prev_parsed = ParsedHeader::from_hex(&prev_hex, height - 1)?;
-                        if parsed.prev_hash == prev_parsed.hash {
-                            // This header connects to height-1 but tip was different.
-                            // This is a reorg: the new chain forks at height-1.
-                            self.insert_header(height, header_hex).await?;
-                            return Ok(ConnectResult::Reorg {
-                                fork_point: height - 1,
-                                new_tip: height,
-                            });
-                        }
-                    }
+                    return Err(NetworkError::Validation(format!(
+                        "conflicting header at height {height}; fork remains unresolved"
+                    )));
                 }
 
                 // Header doesn't connect to anything
@@ -618,19 +618,30 @@ impl HeaderStore {
         merkle_branch: &[String],
         pos: u64,
     ) -> Result<bool, NetworkError> {
+        self.verify_spv_proof_with_root(tx_hash, block_height, merkle_branch, pos)
+            .await.map(|(valid, _)| valid)
+    }
+
+    pub async fn verify_spv_proof_with_root(
+        &self,
+        tx_hash: &str,
+        block_height: u64,
+        merkle_branch: &[String],
+        pos: u64,
+    ) -> Result<(bool, String), NetworkError> {
         let header_hex = self.get_header(block_height).await?.ok_or_else(|| {
             NetworkError::NotFound(format!("no header stored at height {block_height}"))
         })?;
 
         let parsed = ParsedHeader::from_hex(&header_hex, block_height)?;
-        let merkle_root = &parsed.merkle_root;
-
-        Ok(verify_merkle_proof(
+        let merkle_root = parsed.merkle_root;
+        let valid = verify_merkle_proof(
             tx_hash,
             merkle_branch,
             pos,
-            merkle_root,
-        ))
+            &merkle_root,
+        );
+        Ok((valid, merkle_root))
     }
 }
 
@@ -811,6 +822,26 @@ mod tests {
     // -- Merkle proof tests --
 
     #[test]
+    fn merkle_rejects_non_hash_lengths_and_out_of_range_position() {
+        let tx = "11".repeat(32);
+        assert!(!verify_merkle_proof("00", &[], 0, "00"));
+        assert!(!verify_merkle_proof(&tx, &[], 1, &tx));
+        let mut bytes = reverse_bytes(&hex::decode(&tx).unwrap());
+        bytes.push(0);
+        let root = hex::encode(reverse_bytes(&hash256(&bytes)));
+        assert!(!verify_merkle_proof(&tx, &["00".into()], 0, &root));
+    }
+
+    #[test]
+    fn merkle_rejects_oversized_branch_without_panicking() {
+        let tx = "11".repeat(32);
+        let branch = vec!["22".repeat(32); 65];
+        let result = std::panic::catch_unwind(|| verify_merkle_proof(&tx, &branch, 0, &tx));
+        assert!(result.is_ok(), "untrusted branch must not trigger a shift panic");
+        assert!(!result.unwrap());
+    }
+
+    #[test]
     fn test_merkle_proof_single_tx() {
         // For a block with a single transaction (like genesis),
         // the merkle root = txid (no branch needed).
@@ -876,6 +907,35 @@ mod tests {
     }
 
     // -- HeaderStore SQLite tests --
+
+    fn synthetic_child(parent_hex: &str, tag: u8) -> String {
+        let parent = ParsedHeader::from_hex(parent_hex, 0).unwrap();
+        let mut raw = vec![0u8; 80];
+        raw[..4].copy_from_slice(&1u32.to_le_bytes());
+        raw[4..36].copy_from_slice(&reverse_bytes(&hex::decode(parent.hash).unwrap()));
+        raw[36] = tag;
+        raw[72..76].copy_from_slice(&0x207fffffu32.to_le_bytes());
+        for nonce in 0u32..1000 {
+            raw[76..80].copy_from_slice(&nonce.to_le_bytes());
+            if check_pow(&raw) { return hex::encode(raw); }
+        }
+        panic!("synthetic header could not be mined");
+    }
+
+    #[tokio::test]
+    async fn competing_header_keeps_existing_chain_unchanged() {
+        let store = HeaderStore::in_memory().await.unwrap();
+        let genesis = BSV_GENESIS_HEADER_HEX;
+        store.connect_header(0, genesis).await.unwrap();
+        let a1 = synthetic_child(genesis, 1);
+        let a2 = synthetic_child(&a1, 2);
+        let b1 = synthetic_child(genesis, 3);
+        store.connect_header(1, &a1).await.unwrap();
+        store.connect_header(2, &a2).await.unwrap();
+        assert!(store.connect_header(1, &b1).await.is_err());
+        assert_eq!(store.get_header(1).await.unwrap().as_deref(), Some(a1.as_str()));
+        assert_eq!(store.get_tip().await.unwrap(), Some((2, a2)));
+    }
 
     #[tokio::test]
     async fn test_header_store_open_in_memory() {
@@ -1056,6 +1116,12 @@ mod tests {
 
         let valid = store.verify_spv_proof(tx_hash, 0, &[], 0).await.unwrap();
         assert!(valid);
+        let (valid, root) = store.verify_spv_proof_with_root(tx_hash, 0, &[], 0).await.unwrap();
+        assert!(valid);
+        assert_eq!(root, tx_hash);
+        let (valid, same_root) = store.verify_spv_proof_with_root(&"11".repeat(32), 0, &[], 0).await.unwrap();
+        assert!(!valid);
+        assert_eq!(same_root, root);
     }
 
     #[tokio::test]

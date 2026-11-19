@@ -740,39 +740,7 @@ impl NetworkBackend for ElectrumXClient {
             )
             .await?;
 
-        let rec_count = result
-            .get("count")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| NetworkError::Protocol("block.headers: missing count".into()))?;
-
-        let hex_str = result
-            .get("hex")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| NetworkError::Protocol("block.headers: missing hex".into()))?;
-
-        let raw = hex::decode(hex_str)
-            .map_err(|e| NetworkError::Protocol(format!("block.headers: bad hex: {e}")))?;
-
-        const HEADER_SIZE: usize = 80;
-        let expected = rec_count as usize * HEADER_SIZE;
-        if raw.len() != expected {
-            return Err(NetworkError::Protocol(format!(
-                "block.headers: expected {expected} bytes, got {}",
-                raw.len()
-            )));
-        }
-
-        let mut headers = Vec::with_capacity(rec_count as usize);
-        for i in 0..rec_count as usize {
-            let start = i * HEADER_SIZE;
-            let end = start + HEADER_SIZE;
-            headers.push(BlockHeader {
-                height: start_height + i as u64,
-                hex: hex::encode(&raw[start..end]),
-            });
-        }
-
-        Ok(headers)
+        parse_header_response(start_height, count, &result)
     }
 
     async fn get_merkle_proof(
@@ -787,16 +755,7 @@ impl NetworkBackend for ElectrumXClient {
             )
             .await?;
 
-        let branch_arr = result.get("merkle").and_then(|v| v.as_array())
-            .ok_or_else(|| NetworkError::Protocol("get_merkle: missing branch".into()))?;
-        let pos = result.get("pos").and_then(|v| v.as_u64())
-            .ok_or_else(|| NetworkError::Protocol("get_merkle: missing position".into()))?;
-        let mut branch = Vec::with_capacity(branch_arr.len());
-        for (i, item) in branch_arr.iter().enumerate() {
-            let hash = item.as_str().ok_or_else(|| NetworkError::Protocol("get_merkle: invalid branch".into()))?;
-            branch.push((hash.to_string(), i < 64 && ((pos >> i) & 1) == 0));
-        }
-        Ok(MerkleProof { tx_hash: tx_hash.to_string(), block_height, merkle_branch: branch, position: Some(pos), root: String::new() })
+        parse_merkle_response(tx_hash, block_height, &result)
     }
 
     async fn subscribe_scripthash(&self, scripthash: &str) -> Result<(), NetworkError> {
@@ -823,12 +782,70 @@ impl NetworkBackend for ElectrumXClient {
     }
 }
 
+fn parse_header_response(start_height: u64, requested: u64, result: &serde_json::Value) -> Result<Vec<BlockHeader>, NetworkError> {
+    let count = result.get("count").and_then(|v| v.as_u64())
+        .ok_or_else(|| NetworkError::Protocol("block.headers: missing count".into()))?;
+    if count == 0 || count > requested { return Err(NetworkError::Protocol("block.headers: invalid count".into())); }
+    let count_usize = usize::try_from(count).map_err(|_| NetworkError::Protocol("block.headers: count overflow".into()))?;
+    let expected_hex = count_usize.checked_mul(160).ok_or_else(|| NetworkError::Protocol("block.headers: length overflow".into()))?;
+    let hex_str = result.get("hex").and_then(|v| v.as_str())
+        .ok_or_else(|| NetworkError::Protocol("block.headers: missing hex".into()))?;
+    if hex_str.len() != expected_hex { return Err(NetworkError::Protocol("block.headers: count and hex length disagree".into())); }
+    let raw = hex::decode(hex_str).map_err(|e| NetworkError::Protocol(format!("block.headers: bad hex: {e}")))?;
+    let mut headers = Vec::with_capacity(count_usize);
+    for (index, chunk) in raw.chunks_exact(80).enumerate() {
+        let height = start_height.checked_add(index as u64).ok_or_else(|| NetworkError::Protocol("block.headers: height overflow".into()))?;
+        headers.push(BlockHeader { height, hex: hex::encode(chunk) });
+    }
+    Ok(headers)
+}
+
+fn parse_merkle_response(tx_hash: &str, block_height: u64, result: &serde_json::Value) -> Result<MerkleProof, NetworkError> {
+    let branch_arr = result.get("merkle").and_then(|v| v.as_array())
+        .ok_or_else(|| NetworkError::Protocol("get_merkle: missing branch".into()))?;
+    let pos = result.get("pos").and_then(|v| v.as_u64())
+        .ok_or_else(|| NetworkError::Protocol("get_merkle: missing position".into()))?;
+    if !crate::network::header_store::valid_hash32(tx_hash)
+        || !crate::network::header_store::valid_merkle_position(branch_arr.len(), pos) {
+        return Err(NetworkError::Protocol("get_merkle: invalid proof shape".into()));
+    }
+    let mut branch = Vec::with_capacity(branch_arr.len());
+    for (i, item) in branch_arr.iter().enumerate() {
+        let hash = item.as_str().ok_or_else(|| NetworkError::Protocol("get_merkle: invalid branch".into()))?;
+        if !crate::network::header_store::valid_hash32(hash) {
+            return Err(NetworkError::Protocol("get_merkle: invalid branch hash".into()));
+        }
+        branch.push((hash.to_string(), ((pos >> i) & 1) == 0));
+    }
+    Ok(MerkleProof { tx_hash: tx_hash.to_string(), block_height, merkle_branch: branch, position: Some(pos), root: String::new() })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn header_response_checks_count_and_accepts_valid_partial() {
+        let one = "00".repeat(80);
+        let parsed = super::parse_header_response(10, 2, &serde_json::json!({"count":1,"hex":one})).unwrap();
+        assert_eq!(parsed.len(), 1); assert_eq!(parsed[0].height, 10);
+        assert!(super::parse_header_response(10, 2, &serde_json::json!({"count":0,"hex":""})).is_err());
+        assert!(super::parse_header_response(10, 1, &serde_json::json!({"count":2,"hex":"00".repeat(160)})).is_err());
+        assert!(super::parse_header_response(10, 2, &serde_json::json!({"count":2,"hex":"00".repeat(80)})).is_err());
+        assert!(super::parse_header_response(u64::MAX, 2, &serde_json::json!({"count":2,"hex":"00".repeat(160)})).is_err());
+    }
+    #[test]
+    fn merkle_response_rejects_malformed_server_proofs() {
+        let tx = "11".repeat(32);
+        let sibling = "22".repeat(32);
+        assert!(super::parse_merkle_response(&tx, 5, &serde_json::json!({"merkle": [], "pos": 0})).is_ok());
+        assert!(super::parse_merkle_response(&tx, 5, &serde_json::json!({"merkle": [sibling], "pos": 1})).is_ok());
+        assert!(super::parse_merkle_response(&tx, 5, &serde_json::json!({"merkle": [], "pos": 1})).is_err());
+        assert!(super::parse_merkle_response(&tx, 5, &serde_json::json!({"merkle": ["00"], "pos": 0})).is_err());
+        assert!(super::parse_merkle_response(&tx, 5, &serde_json::json!({"merkle": vec!["22".repeat(32); 65], "pos": 0})).is_err());
+    }
     #[test]
     fn tls_config_uses_explicit_provider_without_network() {
         assert!(rustls::crypto::CryptoProvider::get_default().is_none());

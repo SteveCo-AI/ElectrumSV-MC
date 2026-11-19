@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BINARY = ROOT / 'src-tauri/target/release/electrumsv-mc'
-EXPECTED_SHA256 = '5db137b7ae3cd52dba60ff90fd088793603a53256593044bff8331c5bac76aab'
+EXPECTED_SHA256 = '18e1b1cdf19bc5abc90591f5f33acfd9edca7673240ab29e02139a126ce449d7'
 # Public BIP39 test vector: never use this wallet for funds.
 MNEMONIC = 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
 

@@ -199,6 +199,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_dispatches_all_three_registered_detectors_in_order() {
+        let ordinal = "0063036f72640a746578742f706c61696e0548656c6c6f68";
+        let mut stas = vec![0x6a, 4];
+        stas.extend_from_slice(b"STAS");
+        stas.push(4);
+        stas.extend_from_slice(b"TEST");
+        stas.push(32);
+        stas.extend_from_slice(&[0xab; 32]);
+        stas.push(8);
+        stas.extend_from_slice(&1000u64.to_le_bytes());
+        let outputs = vec![
+            DecodeOutputRequest { value: 1, script_pubkey: ordinal.into() },
+            make_op_return_b(),
+            DecodeOutputRequest { value: 1000, script_pubkey: hex::encode(stas) },
+        ];
+        let decoded = decode_tx_outputs(DecodeOutputsRequest { outputs }).await.unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert!(matches!(decoded[0].kind, features::DecodedKind::Ordinal(_)));
+        assert!(matches!(decoded[1].kind, features::DecodedKind::OpReturnProtocol(_)));
+        assert!(matches!(decoded[2].kind, features::DecodedKind::StasToken(_)));
+    }
+
+    #[tokio::test]
     async fn test_get_ordinals_filters() {
         // Mix of plain and ordinal outputs
         let plain = DecodeOutputRequest {

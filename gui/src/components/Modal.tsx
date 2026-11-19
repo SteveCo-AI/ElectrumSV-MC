@@ -1,5 +1,5 @@
 // Reusable modal dialog component
-import { ReactNode } from 'react';
+import { ReactNode, useId, useLayoutEffect, useRef } from 'react';
 
 interface ModalProps {
   title: string;
@@ -8,20 +8,46 @@ interface ModalProps {
   children: ReactNode;
   width?: string;
   disableClose?: boolean;
+  accessible?: boolean;
 }
 
-export function Modal({ title, open, onClose, children, width = 'max-w-md', disableClose = false }: ModalProps) {
+export function Modal({ title, open, onClose, children, width = 'max-w-md', disableClose = false, accessible = false }: ModalProps) {
+  const titleId = useId();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const previousFocus = useRef<HTMLElement | null>(null);
+  const focusInside = useRef(false);
+  useLayoutEffect(() => {
+    if (!open || !accessible) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    previousFocus.current = previous;
+    dialogRef.current?.focus();
+    return () => {
+      if (previous?.isConnected && (dialogRef.current?.contains(document.activeElement) || (focusInside.current && document.activeElement === document.body))) previous.focus();
+    };
+  }, [open, accessible]);
+  const close = () => {
+    if (disableClose) return;
+    if (accessible && previousFocus.current?.isConnected && dialogRef.current?.contains(document.activeElement)) previousFocus.current.focus();
+    onClose();
+  };
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={disableClose ? undefined : onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={disableClose ? undefined : close}>
       <div
+        ref={dialogRef}
+        role={accessible ? 'dialog' : undefined}
+        aria-labelledby={accessible ? titleId : undefined}
+        tabIndex={accessible ? -1 : undefined}
+        onFocusCapture={accessible ? () => { focusInside.current = true; } : undefined}
+        onBlurCapture={accessible ? (e) => { if (e.relatedTarget && !e.currentTarget.contains(e.relatedTarget)) focusInside.current = false; } : undefined}
+        onKeyDown={accessible ? (e) => { if (e.key === 'Escape' && !disableClose) { e.stopPropagation(); close(); } } : undefined}
         className={`bg-void-900 border border-void-700 rounded-xl shadow-2xl ${width} w-full mx-4`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-void-700">
-          <h3 className="text-sm font-semibold text-accent">{title}</h3>
+          <h3 id={accessible ? titleId : undefined} className="text-sm font-semibold text-accent">{title}</h3>
           <button
-            onClick={onClose}
+            onClick={close}
             disabled={disableClose}
             className="text-gray-400 hover:text-gray-100 text-lg leading-none"
           >
@@ -35,10 +61,10 @@ export function Modal({ title, open, onClose, children, width = 'max-w-md', disa
 }
 
 // Input field helper
-export function Field({ label, children }: { label: string; children: ReactNode }) {
+export function Field({ label, htmlFor, children }: { label: string; htmlFor?: string; children: ReactNode }) {
   return (
     <div className="mb-3">
-      <label className="text-sm text-gray-400 mb-1 block">{label}</label>
+      <label htmlFor={htmlFor} className="text-sm text-gray-400 mb-1 block">{label}</label>
       {children}
     </div>
   );

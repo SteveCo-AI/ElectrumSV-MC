@@ -1,6 +1,9 @@
 import { beforeEach, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { useState } from 'react';
 import { MenuBar } from '../components/MenuBar';
+import { BackupWalletDialog } from '../components/WalletDialogs';
 import { useStore } from '../store';
 
 const mock = vi.hoisted(() => ({ backup: vi.fn() }));
@@ -15,6 +18,63 @@ function fill(path = '/data/backup.sqlite', code = '') {
   fireEvent.change(screen.getByPlaceholderText('Wallet password'), { target: { value: 'pw-test' } });
   if (code) fireEvent.change(screen.getByPlaceholderText('TOTP code (if enabled)'), { target: { value: code } });
 }
+it('exposes a named dialog and operation-specific labels with keyboard focus', async () => {
+  const user = userEvent.setup();
+  render(<MenuBar />); openBackup();
+  const dialog = screen.getByRole('dialog', { name: 'Backup Wallet' });
+  expect(dialog).toHaveFocus();
+  expect(dialog).not.toHaveAttribute('aria-modal', 'true');
+  const path = within(dialog).getByLabelText('Backup file path');
+  expect(within(dialog).getByLabelText('Wallet password for backup')).toHaveAttribute('type', 'password');
+  expect(within(dialog).getByLabelText('TOTP code for backup (if enabled)')).toBeInTheDocument();
+  await user.tab();
+  expect(within(dialog).getByRole('button', { name: '×' })).toHaveFocus();
+  await user.tab();
+  expect(path).toHaveFocus();
+  await user.tab({ shift: true });
+  expect(within(dialog).getByRole('button', { name: '×' })).toHaveFocus();
+  await user.keyboard('{Escape}');
+  expect(screen.queryByRole('dialog', { name: 'Backup Wallet' })).not.toBeInTheDocument();
+});
+it('provides German backup labels and does not steal focus moved outside on unmount', () => {
+  localStorage.setItem('electrumsv-mc-language', 'de');
+  try {
+    const view = render(<><button>Outside</button><BackupWalletDialog open onClose={() => {}} identity={{ path: '/wallet', token: 'instance-a' }} /></>);
+    const dialog = screen.getByRole('dialog', { name: 'Wallet sichern' });
+    expect(within(dialog).getByLabelText('Pfad der Wallet-Sicherung')).toBeInTheDocument();
+    expect(within(dialog).getByLabelText('Wallet-Passwort für die Sicherung')).toHaveAttribute('type', 'password');
+    expect(within(dialog).getByLabelText('TOTP-Code für die Sicherung (falls aktiviert)')).toBeInTheDocument();
+    const outside = screen.getByRole('button', { name: 'Outside' });
+    outside.focus();
+    view.rerender(<><button>Outside</button><BackupWalletDialog open={false} onClose={() => {}} identity={{ path: '/wallet', token: 'instance-a' }} /></>);
+    expect(outside).toHaveFocus();
+  } finally { localStorage.removeItem('electrumsv-mc-language'); }
+});
+it.each(['Escape', 'Close'])('returns focus to a still-mounted opener after %s', async action => {
+  function Harness() {
+    const [open, setOpen] = useState(false);
+    return <><button onClick={() => setOpen(true)}>Open backup</button><BackupWalletDialog open={open} onClose={() => setOpen(false)} identity={{ path: '/wallet', token: 'instance-a' }} /></>;
+  }
+  const user = userEvent.setup();
+  render(<Harness />);
+  const opener = screen.getByRole('button', { name: 'Open backup' });
+  await user.click(opener);
+  expect(screen.getByRole('dialog', { name: 'Backup Wallet' })).toHaveFocus();
+  if (action === 'Escape') await user.keyboard('{Escape}');
+  else await user.click(screen.getByRole('button', { name: 'Close' }));
+  expect(opener).toHaveFocus();
+});
+it('does not claim a focus trap when tabbing beyond the backup dialog', async () => {
+  const user = userEvent.setup();
+  render(<><BackupWalletDialog open onClose={() => {}} identity={{ path: '/wallet', token: 'instance-a' }} /><button>After dialog</button></>);
+  const dialog = screen.getByRole('dialog', { name: 'Backup Wallet' });
+  expect(dialog).not.toHaveAttribute('aria-modal', 'true');
+  within(dialog).getByRole('button', { name: 'Close' }).focus();
+  await user.tab();
+  expect(screen.getByRole('button', { name: 'After dialog' })).toHaveFocus();
+  await user.tab({ shift: true });
+  expect(within(dialog).getByRole('button', { name: 'Close' })).toHaveFocus();
+});
 it('opens from the wallet menu and sends a password without a TOTP code', async () => {
   mock.backup.mockResolvedValue('/data/backup.sqlite');
   render(<MenuBar />); openBackup(); fill();
@@ -24,12 +84,18 @@ it('opens from the wallet menu and sends a password without a TOTP code', async 
   expect(screen.getByPlaceholderText('Wallet password')).toHaveValue('');
   expect(screen.getByRole('button', { name: 'Backup' })).toBeDisabled();
 });
-it('allows a known authentication error to be corrected and submits the TOTP code', async () => {
-  mock.backup.mockRejectedValueOnce('invalid TOTP code').mockResolvedValueOnce('/data/backup.sqlite');
-  render(<MenuBar />); openBackup(); fill('/data/backup.sqlite', '111111');
+it.each([
+  ['invalid TOTP code', '111111'],
+  ['TOTP code required', ''],
+])('allows %s to be corrected after credentials are cleared', async (error, initialCode) => {
+  mock.backup.mockRejectedValueOnce(error).mockResolvedValueOnce('/data/backup.sqlite');
+  render(<MenuBar />); openBackup(); fill('/data/backup.sqlite', initialCode);
   fireEvent.click(screen.getByRole('button', { name: 'Backup' }));
-  expect(await screen.findByRole('alert')).toHaveTextContent('invalid TOTP code');
+  expect(await screen.findByRole('alert')).toHaveTextContent(error);
   expect(screen.getByPlaceholderText('Wallet password')).toHaveValue('');
+  expect(screen.getByPlaceholderText('TOTP code (if enabled)')).toHaveValue('');
+  expect(screen.getByRole('button', { name: 'Backup' })).toBeDisabled();
+  expect(mock.backup).toHaveBeenNthCalledWith(1, '/data/backup.sqlite', 'pw-test', initialCode || undefined, 'instance-a');
   fill('/data/backup.sqlite', '222222');
   fireEvent.click(screen.getByRole('button', { name: 'Backup' }));
   await screen.findByRole('status');
@@ -58,7 +124,7 @@ it('blocks closing and duplicate submission while backup is pending', async () =
   fireEvent.click(screen.getByRole('button', { name: 'Close' }));
   fireEvent.click(screen.getByRole('button', { name: '×' }));
   fireEvent.click(container.querySelector('.fixed.inset-0.z-50')!);
-  fireEvent.keyDown(document, { key: 'Escape' });
+  fireEvent.keyDown(screen.getByRole('dialog', { name: 'Backup Wallet' }), { key: 'Escape' });
   fireEvent.click(screen.getByRole('button', { name: 'Backing up…' }));
   expect(mock.backup).toHaveBeenCalledTimes(1);
   expect(screen.getByText('Backup Wallet')).toBeInTheDocument();

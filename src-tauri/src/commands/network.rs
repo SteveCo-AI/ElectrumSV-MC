@@ -844,65 +844,59 @@ pub struct HeaderStoreInfo {
     pub tip_hash: Option<String>,
 }
 
-/// Ensure the header store is initialized in NetworkState.
-/// Uses the app data_dir for the SQLite database path.
-async fn ensure_header_store(state: &State<'_, AppState>) -> Result<(), String> {
-    let needs_init = {
-        let net = state.network.lock().unwrap();
-        net.header_store.is_none()
-    };
-    if needs_init {
-        let db_path = std::path::PathBuf::from(&state.data_dir)
-            .join("headers.sqlite")
-            .to_string_lossy()
-            .to_string();
-        let store = HeaderStore::open(&db_path)
-            .await
-            .map_err(|e| format!("failed to open header store: {e}"))?;
+// The operation gate is acquired before initialization and never while holding
+// the network mutex. The Arc remains in NetworkState when a future is cancelled.
+async fn with_header_store<F, Fut, T>(state: &AppState, operation: F) -> Result<T, String>
+where
+    F: FnOnce(std::sync::Arc<HeaderStore>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let gate = state.network.lock().unwrap().header_store_operation.clone();
+    let _operation = gate.lock().await;
+    let existing = state.network.lock().unwrap().header_store.clone();
+    let store = if let Some(store) = existing { store } else {
+        let db_path = std::path::PathBuf::from(&state.data_dir).join("headers.sqlite");
+        let store = std::sync::Arc::new(HeaderStore::open(&db_path.to_string_lossy()).await
+            .map_err(|e| format!("failed to open header store: {e}"))?);
+        store.ensure_genesis().await.map_err(|e| format!("failed to init genesis: {e}"))?;
+        state.network.lock().unwrap().header_store = Some(store.clone());
         store
-            .ensure_genesis()
-            .await
-            .map_err(|e| format!("failed to init genesis: {e}"))?;
-        // Acquire lock only for the final assignment (no await after this)
-        let mut net = state.network.lock().unwrap();
-        net.header_store = Some(store);
-    }
-    Ok(())
+    };
+    operation(store).await
 }
 
 /// Get header store status — number of stored headers, tip height/hash.
 #[tauri::command]
 pub async fn get_header_store_info(state: State<'_, AppState>) -> Result<HeaderStoreInfo, String> {
-    ensure_header_store(&state).await?;
+    header_store_info_inner(&state).await
+}
 
-    // Take header store out (in a non-async block to avoid holding MutexGuard across await)
-    let store_opt = {
-        let mut net = state.network.lock().unwrap();
-        net.header_store.take()
-    };
+async fn header_store_info_inner(state: &AppState) -> Result<HeaderStoreInfo, String> {
+    with_header_store(state, |store| async move {
+        let count = store.header_count().await.map_err(|e| e.to_string())?;
+        let tip = store.get_tip().await.map_err(|e| e.to_string())?;
+        let tip_height = tip.as_ref().map(|(height, _)| *height);
+        let tip_hash = match tip {
+            Some((height, hex)) => Some(ParsedHeader::from_hex(&hex, height).map_err(|e| e.to_string())?.hash),
+            None => None,
+        };
+        Ok(HeaderStoreInfo { initialized: true, header_count: count, tip_height, tip_hash })
+    }).await
+}
 
-    let (count, tip) = if let Some(store) = store_opt {
-        let count = store.header_count().await.unwrap_or(0);
-        let tip = store.get_tip().await.ok().flatten();
-        // Put store back
-        {
-            let mut net = state.network.lock().unwrap();
-            net.header_store = Some(store);
-        }
-        (count, tip)
-    } else {
-        (0, None)
-    };
+fn matching_server_tip(height: u64, local_hex: &str, headers: &[crate::network::backend::BlockHeader]) -> Result<(), String> {
+    if headers.len() != 1 || headers[0].height != height {
+        return Err("server did not provide exactly the requested tip header".into());
+    }
+    let local = ParsedHeader::from_hex(local_hex, height).map_err(|e| e.to_string())?;
+    let remote = ParsedHeader::from_hex(&headers[0].hex, height).map_err(|e| e.to_string())?;
+    if local.hash != remote.hash { return Err("server tip conflicts with stored header; fork remains unresolved".into()); }
+    Ok(())
+}
 
-    let tip_height = tip.as_ref().map(|(h, _)| *h);
-    let tip_hash = tip.and_then(|(_, hex)| ParsedHeader::from_hex(&hex, 0).ok().map(|p| p.hash));
-
-    Ok(HeaderStoreInfo {
-        initialized: true,
-        header_count: count,
-        tip_height,
-        tip_hash,
-    })
+fn server_tip_not_behind(current_tip: u64, server_tip: u64) -> Result<(), String> {
+    if server_tip < current_tip { Err("server tip is below local height; chain identity is unverified".into()) }
+    else { Ok(()) }
 }
 
 /// Sync block headers from the connected ElectrumX server.
@@ -912,110 +906,74 @@ pub async fn sync_headers(
     state: State<'_, AppState>,
     max_count: Option<u64>,
 ) -> Result<SyncHeadersResult, String> {
-    ensure_header_store(&state).await?;
-
-    // Get client
     let client = {
         let net = state.network.lock().unwrap();
-        if !net.connected {
-            return Err("not connected to any server".to_string());
-        }
-        net.client
-            .clone()
-            .ok_or_else(|| "no active client".to_string())?
+        if !net.connected { return Err("not connected to any server".into()); }
+        net.client.clone().ok_or_else(|| "no active client".to_string())?
     };
+    let server_tip = client.get_tip_height().await.map_err(|e| format!("failed to get server tip: {e}"))?;
+    sync_headers_with_fetch(&state, server_tip, max_count, move |start, count| {
+        let client = client.clone();
+        async move { client.get_block_headers(start, count).await.map_err(|e| e.to_string()) }
+    }).await
+}
 
-    // Take header store out of state temporarily
-    let store = {
-        let mut net = state.network.lock().unwrap();
-        net.header_store
-            .take()
-            .ok_or_else(|| "header store not initialized".to_string())?
-    };
+async fn sync_headers_with_fetch<F, Fut>(state: &AppState, server_tip: u64, max_count: Option<u64>, fetch: F) -> Result<SyncHeadersResult, String>
+where
+    F: FnMut(u64, u64) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<crate::network::backend::BlockHeader>, String>>,
+{
+    with_header_store(state, |store| async move {
+        sync_headers_from_server(&store, server_tip, max_count, fetch).await
+    }).await
+}
 
-    // Get current tip
-    let (current_tip, _) = store
-        .get_tip()
-        .await
-        .map_err(|e| format!("failed to get tip: {e}"))?
-        .unwrap_or((0, String::new()));
-
-    // Get server tip height
-    let server_tip = client
-        .get_tip_height()
-        .await
-        .map_err(|e| format!("failed to get server tip: {e}"))?;
-
-    if server_tip <= current_tip {
-        // Already up to date
-        let mut net = state.network.lock().unwrap();
-        net.header_store = Some(store);
-        return Ok(SyncHeadersResult {
-            synced: 0,
-            new_tip: current_tip,
-            server_tip,
-            message: "already up to date".to_string(),
-        });
+async fn sync_headers_from_server<F, Fut>(
+    store: &HeaderStore, server_tip: u64, max_count: Option<u64>, mut fetch: F,
+) -> Result<SyncHeadersResult, String>
+where
+    F: FnMut(u64, u64) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<crate::network::backend::BlockHeader>, String>>,
+{
+    if max_count == Some(0) { return Err("max_count must be positive".into()); }
+    let (current_tip, current_header) = store.get_tip().await
+        .map_err(|e| format!("failed to get tip: {e}"))?.unwrap_or((0, String::new()));
+    server_tip_not_behind(current_tip, server_tip)?;
+    if server_tip == current_tip {
+        let headers = fetch(server_tip, 1).await.map_err(|e| format!("failed to fetch server tip header: {e}"))?;
+        matching_server_tip(current_tip, &current_header, &headers)?;
+        return Ok(SyncHeadersResult { synced: 0, new_tip: current_tip, server_tip,
+            message: "server tip matches stored header; independent consensus is not established".into() });
     }
-
-    // Fetch headers: from current_tip+1 to server_tip
-    let start = current_tip + 1;
-    let count = max_count
-        .unwrap_or(server_tip - current_tip)
-        .min(server_tip - current_tip);
-
-    let headers = client
-        .get_block_headers(start, count)
-        .await
-        .map_err(|e| format!("failed to fetch headers: {e}"))?;
-
-    // Connect each header to the store
+    let start = current_tip.checked_add(1).ok_or("header height overflow")?;
+    let count = max_count.unwrap_or(server_tip - current_tip).min(server_tip - current_tip).min(2016);
+    let headers = fetch(start, count).await.map_err(|e| format!("failed to fetch headers: {e}"))?;
+    if headers.is_empty() || u64::try_from(headers.len()).map_or(true, |received| received > count)
+        || headers.iter().enumerate().any(|(index, header)| start.checked_add(index as u64) != Some(header.height)) {
+        return Err("server returned an empty, oversized or misordered header batch".into());
+    }
     let mut synced = 0u64;
     let mut new_tip = current_tip;
     let mut errors = Vec::new();
-
     for hdr in &headers {
         match store.connect_header(hdr.height, &hdr.hex).await {
-            Ok(crate::network::header_store::ConnectResult::Connected { height }) => {
-                synced += 1;
-                new_tip = height;
-            }
-            Ok(crate::network::header_store::ConnectResult::AlreadyExists { height }) => {
-                new_tip = new_tip.max(height);
-            }
-            Ok(crate::network::header_store::ConnectResult::Reorg { new_tip: nt, .. }) => {
-                synced += 1;
-                new_tip = nt;
-            }
-            Err(e) => {
-                errors.push(format!("height {}: {e}", hdr.height));
-                break; // Stop on first error — chain is broken
-            }
+            Ok(crate::network::header_store::ConnectResult::Connected { height }) => { synced += 1; new_tip = height; }
+            Ok(crate::network::header_store::ConnectResult::AlreadyExists { height }) => { new_tip = new_tip.max(height); }
+            Ok(crate::network::header_store::ConnectResult::Reorg { new_tip: nt, .. }) => { synced += 1; new_tip = nt; }
+            Err(e) => { errors.push(format!("height {}: {e}", hdr.height)); break; }
         }
     }
+    let message = header_sync_message(synced, new_tip, &errors)?;
+    let message = if new_tip < server_tip { format!("{message}; partial progress, server reported tip {server_tip}") } else { message };
+    Ok(SyncHeadersResult { synced, new_tip, server_tip, message })
+}
 
-    // Put store back
-    {
-        let mut net = state.network.lock().unwrap();
-        net.header_store = Some(store);
-    }
-
-    let message = if errors.is_empty() {
-        format!("synced {synced} headers, new tip: {new_tip}")
+fn header_sync_message(synced: u64, new_tip: u64, errors: &[String]) -> Result<String, String> {
+    if errors.is_empty() {
+        Ok(format!("synced {synced} headers, new tip: {new_tip}"))
     } else {
-        format!(
-            "synced {synced} headers with {} errors: {}",
-            errors.len(),
-            errors.join("; ")
-        )
-    };
-
-    Ok(SyncHeadersResult {
-        synced,
-        new_tip,
-        server_tip,
-        message,
-    })
+        Err(format!("header sync stopped after {synced} headers: {}", errors.join("; ")))
+    }
 }
 
 /// Result of a header sync operation.
@@ -1033,17 +991,14 @@ pub struct SyncHeadersResult {
 
 /// Verify a transaction's inclusion in a block via SPV merkle proof.
 ///
-/// Fetches the merkle proof from the ElectrumX server and verifies it
-/// against the stored block header. This is the trustless verification
-/// path — no trust in the server required, only in the PoW chain.
+/// Checks a server-provided merkle proof against the stored header.
+/// The header store does not independently establish chain consensus.
 #[tauri::command]
 pub async fn verify_transaction_proof(
     state: State<'_, AppState>,
     tx_hash: String,
     block_height: u64,
 ) -> Result<VerifyProofResult, String> {
-    ensure_header_store(&state).await?;
-
     // Get client
     let client = {
         let net = state.network.lock().unwrap();
@@ -1061,51 +1016,36 @@ pub async fn verify_transaction_proof(
         .await
         .map_err(|e| format!("failed to get merkle proof: {e}"))?;
 
-    // Take header store out temporarily
-    let store = {
-        let mut net = state.network.lock().unwrap();
-        net.header_store
-            .take()
-            .ok_or_else(|| "header store not initialized".to_string())?
-    };
+    let branch: Vec<String> = proof.merkle_branch.iter().map(|(hash, _)| hash.clone()).collect();
+    let position = proof.position.ok_or("merkle proof lacks transaction position")?;
+    let checked_hash = tx_hash.clone();
+    let verified = with_header_store(&state, |store| async move {
+        store.verify_spv_proof_with_root(&checked_hash, block_height, &branch, position)
+            .await.map_err(|error| format!("verification error: {error}"))
+    }).await;
+    let verified = verified.map_err(NetworkError::Protocol);
 
-    // Extract merkle branch hashes (display hex strings)
-    let branch: Vec<String> = proof.merkle_branch.iter().map(|(h, _)| h.clone()).collect();
+    proof_response(tx_hash, block_height, verified)
+}
 
-    let verified = match proof.position {
-        Some(position) => store.verify_spv_proof(&tx_hash, block_height, &branch, position).await,
-        None => Err(NetworkError::Protocol("merkle proof lacks transaction position".into())),
-    };
-
-    // Put store back
-    {
-        let mut net = state.network.lock().unwrap();
-        net.header_store = Some(store);
-    }
-
+fn proof_response(tx_hash: String, block_height: u64, verified: Result<(bool, String), NetworkError>) -> Result<VerifyProofResult, String> {
     match verified {
-        Ok(true) => Ok(VerifyProofResult {
+        Ok((true, merkle_root)) => Ok(VerifyProofResult {
             verified: true,
             tx_hash,
             block_height,
-            merkle_root: proof.root,
+            merkle_root,
             message: "merkle proof matches the stored header; independent consensus validation is not guaranteed".to_string(),
         }),
-        Ok(false) => Ok(VerifyProofResult {
+        Ok((false, merkle_root)) => Ok(VerifyProofResult {
             verified: false,
             tx_hash,
             block_height,
-            merkle_root: proof.root,
+            merkle_root,
             message: "merkle proof verification failed — proof does not match stored header"
                 .to_string(),
         }),
-        Err(e) => Ok(VerifyProofResult {
-            verified: false,
-            tx_hash,
-            block_height,
-            merkle_root: proof.root,
-            message: format!("verification error: {e}"),
-        }),
+        Err(e) => Err(format!("verification error: {e}")),
     }
 }
 
@@ -1130,6 +1070,141 @@ pub struct VerifyProofResult {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cancelled_header_sync_keeps_same_store_and_unblocks_parallel_info() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("wallet-header-cancel-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = crate::state::AppState::new(); state.data_dir = dir.to_string_lossy().into();
+        let state = Arc::new(state);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let sync_state = state.clone();
+        let sync = tokio::spawn(async move {
+            let mut ready = Some(ready_tx);
+            super::sync_headers_with_fetch(&sync_state, 1, None, move |_, _| {
+                let signal = ready.take();
+                async move {
+                    if let Some(signal) = signal { let _ = signal.send(()); }
+                    std::future::pending::<Result<Vec<crate::network::backend::BlockHeader>, String>>().await
+                }
+            }).await
+        });
+        tokio::time::timeout(Duration::from_secs(10), ready_rx).await.unwrap().unwrap();
+        let first = state.network.lock().unwrap().header_store.clone().unwrap();
+        let info_state = state.clone();
+        let mut info = tokio::spawn(async move { super::header_store_info_inner(&info_state).await });
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut info).await.is_err());
+        sync.abort(); assert!(sync.await.unwrap_err().is_cancelled());
+        let result = tokio::time::timeout(Duration::from_secs(10), info).await.unwrap().unwrap().unwrap();
+        assert!(result.initialized); assert_eq!(result.tip_height, Some(0));
+        let second = state.network.lock().unwrap().header_store.clone().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        drop(first); drop(second); drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn proof_response_reports_the_root_actually_checked() {
+        let store = crate::network::header_store::HeaderStore::in_memory().await.unwrap();
+        store.ensure_genesis().await.unwrap();
+        let root = crate::network::header_store::ParsedHeader::from_hex(&store.get_header(0).await.unwrap().unwrap(), 0).unwrap().merkle_root;
+        let checked = store.verify_spv_proof_with_root(&root, 0, &[], 0).await;
+        let response = super::proof_response(root.clone(), 0, checked).unwrap();
+        assert!(response.verified);
+        assert_eq!(response.merkle_root, root);
+        let wrong = "11".repeat(32);
+        let checked = store.verify_spv_proof_with_root(&wrong, 0, &[], 0).await;
+        let response = super::proof_response(wrong, 0, checked).unwrap();
+        assert!(!response.verified);
+        assert_eq!(response.merkle_root, root);
+        assert!(super::proof_response("00".into(), 1, Err(crate::network::backend::NetworkError::NotFound("header".into()))).is_err());
+    }
+    #[tokio::test]
+    async fn header_sync_rejects_empty_and_continues_short_valid_batches() {
+        let store = crate::network::header_store::HeaderStore::in_memory().await.unwrap();
+        store.ensure_genesis().await.unwrap();
+        let before = store.get_tip().await.unwrap();
+        let empty = super::sync_headers_from_server(&store, 2, None, |_, _| async { Ok(vec![]) }).await;
+        assert!(empty.is_err());
+        let parent = crate::network::header_store::ParsedHeader::from_hex(&before.as_ref().unwrap().1, 0).unwrap();
+        let mut raw = vec![0u8; 80];
+        let mut previous = hex::decode(parent.hash).unwrap(); previous.reverse();
+        raw[4..36].copy_from_slice(&previous);
+        raw[72..76].copy_from_slice(&0x207fffffu32.to_le_bytes());
+        let mut found = false;
+        for nonce in 0u32..1000 { raw[76..80].copy_from_slice(&nonce.to_le_bytes()); if crate::network::header_store::check_pow(&raw) { found = true; break; } }
+        assert!(found);
+        let first_hex = hex::encode(&raw);
+        let short = super::sync_headers_from_server(&store, 2, None, |start, count| {
+            assert_eq!((start, count), (1, 2));
+            let hex = hex::encode(&raw);
+            async move { Ok(vec![crate::network::backend::BlockHeader { height: start, hex }]) }
+        }).await.unwrap();
+        assert_eq!((short.synced, short.new_tip, short.server_tip), (1, 1, 2));
+        assert!(short.message.contains("partial"));
+        assert_eq!(store.get_tip().await.unwrap(), Some((1, first_hex.clone())));
+        let parent = crate::network::header_store::ParsedHeader::from_hex(&first_hex, 1).unwrap();
+        let mut previous = hex::decode(parent.hash).unwrap(); previous.reverse(); raw[4..36].copy_from_slice(&previous);
+        let mut found = false;
+        for nonce in 0u32..1000 { raw[76..80].copy_from_slice(&nonce.to_le_bytes()); if crate::network::header_store::check_pow(&raw) { found = true; break; } }
+        assert!(found);
+        let next = super::sync_headers_from_server(&store, 2, None, |start, count| {
+            assert_eq!((start, count), (2, 1)); let hex = hex::encode(&raw);
+            async move { Ok(vec![crate::network::backend::BlockHeader { height: start, hex }]) }
+        }).await.unwrap();
+        assert_eq!((next.synced, next.new_tip, next.server_tip), (1, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn header_sync_failure_keeps_committed_valid_prefix() {
+        let store = crate::network::header_store::HeaderStore::in_memory().await.unwrap();
+        store.ensure_genesis().await.unwrap();
+        let genesis = store.get_tip().await.unwrap().unwrap().1;
+        let parent = crate::network::header_store::ParsedHeader::from_hex(&genesis, 0).unwrap();
+        let mut raw = vec![0u8; 80];
+        let mut previous = hex::decode(parent.hash).unwrap(); previous.reverse();
+        raw[4..36].copy_from_slice(&previous); raw[72..76].copy_from_slice(&0x207fffffu32.to_le_bytes());
+        let mut found = false;
+        for nonce in 0u32..1000 { raw[76..80].copy_from_slice(&nonce.to_le_bytes()); if crate::network::header_store::check_pow(&raw) { found = true; break; } }
+        assert!(found);
+        let first = hex::encode(raw);
+        let result = super::sync_headers_from_server(&store, 2, None, |start, count| {
+            assert_eq!((start, count), (1, 2)); let hex = first.clone();
+            async move { Ok(vec![crate::network::backend::BlockHeader { height: 1, hex }, crate::network::backend::BlockHeader { height: 2, hex: "00".into() }]) }
+        }).await;
+        assert!(result.is_err());
+        assert_eq!(store.get_tip().await.unwrap(), Some((1, first)));
+    }
+
+    #[tokio::test]
+    async fn header_sync_rejects_zero_max_count_before_fetch() {
+        let store = crate::network::header_store::HeaderStore::in_memory().await.unwrap();
+        store.ensure_genesis().await.unwrap();
+        let result = super::sync_headers_from_server(&store, 1, Some(0), |_, _| async {
+            panic!("zero max_count must not issue a fetch");
+            #[allow(unreachable_code)] Ok(vec![])
+        }).await;
+        assert!(result.is_err());
+        let limited = super::sync_headers_from_server(&store, 5000, None, |start, count| async move {
+            assert_eq!((start, count), (1, 2016)); Ok(vec![])
+        }).await;
+        assert!(limited.is_err());
+    }
+    #[test]
+    fn equal_server_height_requires_matching_header() {
+        assert!(super::server_tip_not_behind(5, 4).is_err());
+        assert!(super::server_tip_not_behind(5, 5).is_ok());
+        assert!(super::server_tip_not_behind(5, 6).is_ok());
+        let header = "00".repeat(80);
+        let different = "01".repeat(80);
+        let matching = crate::network::backend::BlockHeader { height: 5, hex: header.clone() };
+        assert!(super::matching_server_tip(5, &header, &[matching]).is_ok());
+        let conflicting = crate::network::backend::BlockHeader { height: 5, hex: different };
+        assert!(super::matching_server_tip(5, &header, &[conflicting]).is_err());
+        assert!(super::matching_server_tip(5, &header, &[]).is_err());
+        assert!(super::header_sync_message(1, 6, &["fork remains unresolved".into()]).is_err());
+        assert!(super::header_sync_message(1, 6, &[]).is_ok());
+    }
     #[tokio::test]
     async fn resolver_fetch_snapshot_history_detail_integration() {
         use bsv::transaction::{transaction::Transaction, transaction_input::TransactionInput, transaction_output::TransactionOutput};

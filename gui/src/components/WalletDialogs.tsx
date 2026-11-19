@@ -1,8 +1,9 @@
 // Wallet dialog components — Export Seed, Change Password, Sign/Verify Message, Delete Wallet
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { api } from '../api';
 import { useStore } from '../store';
 import { Modal, Field, inputClass, btnPrimary, btnSecondary } from './Modal';
+import { useTranslation } from '../i18n';
 
 // ─── Export Seed Dialog ───
 export function ExportSeedDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -332,6 +333,8 @@ export function DeleteWalletDialog({ open, onClose, walletPath, walletName, onDe
 
 // ─── Backup Wallet Dialog ───
 export function BackupWalletDialog({ open, onClose, identity }: { open: boolean; onClose: () => void; identity: { path: string; token: string } | null }) {
+  const fieldId = useId();
+  const { t } = useTranslation();
   const { activeWalletPath, walletInstanceToken } = useStore();
   const walletPath = identity?.path ?? null;
   const token = identity?.token ?? null;
@@ -388,16 +391,16 @@ export function BackupWalletDialog({ open, onClose, identity }: { open: boolean;
   };
 
   return (
-    <Modal title="Backup Wallet" open={open} onClose={handleClose} disableClose={busy}>
+    <Modal title={t.menu.backupDialogTitle} open={open} onClose={handleClose} disableClose={busy} accessible>
       <p className="text-sm text-gray-400 mb-3">
         Choose a new file inside the wallet data directory. Existing files are not overwritten. The backup contains wallet secrets.
       </p>
-      <Field label="Backup file path">
-        <input type="text" value={backupPath} onChange={(e) => setBackupPath(e.target.value)}
+      <Field label={t.menu.backupPathLabel} htmlFor={`${fieldId}-path`}>
+        <input id={`${fieldId}-path`} type="text" value={backupPath} onChange={(e) => setBackupPath(e.target.value)}
           className={inputClass} placeholder="/path/to/wallet_backup.sqlite" disabled={busy || unknown || !!success} />
       </Field>
-      <Field label="Wallet password"><input type="password" value={password} onChange={e => setPassword(e.target.value)} className={inputClass} placeholder="Wallet password" disabled={busy || unknown || !!success} /></Field>
-      <Field label="TOTP code (if enabled)"><input value={totpCode} onChange={e => setTotpCode(e.target.value)} className={inputClass} placeholder="TOTP code (if enabled)" disabled={busy || unknown || !!success} /></Field>
+      <Field label={t.menu.backupPasswordLabel} htmlFor={`${fieldId}-password`}><input id={`${fieldId}-password`} type="password" value={password} onChange={e => setPassword(e.target.value)} className={inputClass} placeholder="Wallet password" disabled={busy || unknown || !!success} /></Field>
+      <Field label={t.menu.backupTotpLabel} htmlFor={`${fieldId}-totp`}><input id={`${fieldId}-totp`} value={totpCode} onChange={e => setTotpCode(e.target.value)} className={inputClass} placeholder="TOTP code (if enabled)" disabled={busy || unknown || !!success} /></Field>
       {walletChanged && <div role="alert">Wallet changed. Close this dialog and open it for the current wallet.</div>}
       {error && <div role="alert" className="text-sm text-danger mb-3">{error}</div>}
       {success && <div role="status" className="text-sm text-success mb-3 p-3 bg-success/10 rounded-lg">{success}</div>}

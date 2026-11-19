@@ -22,6 +22,14 @@ export interface NetworkInfo {
   banned_count: number;
 }
 
+export interface VerifyProofResult {
+  verified: boolean;
+  tx_hash: string;
+  block_height: number;
+  merkle_root: string;
+  message: string;
+}
+
 /** BalanceInfo matches Rust `commands::account::BalanceInfo` — wallet balance (i64 fields). */
 export interface BalanceInfo {
   confirmed: number;
@@ -256,8 +264,19 @@ export const api = {
     invoke<any>('get_header_store_info'),
   getServersByStatus: () =>
     invoke<any>('get_servers_by_status'),
-  verifyTransactionProof: (txid: string, proof: string) =>
-    invoke<any>('verify_transaction_proof', { txid, proof }),
+  verifyTransactionProof: async (txHash: string, blockHeight: number): Promise<VerifyProofResult> => {
+    if (!/^[0-9a-fA-F]{64}$/.test(txHash) || !Number.isSafeInteger(blockHeight) || blockHeight < 0) {
+      throw new Error('Invalid transaction hash or block height');
+    }
+    const result = await invoke<VerifyProofResult>('verify_transaction_proof', { txHash, blockHeight });
+    if (!result || typeof result.verified !== 'boolean' || typeof result.tx_hash !== 'string'
+        || result.tx_hash.toLowerCase() !== txHash.toLowerCase() || result.block_height !== blockHeight
+        || typeof result.merkle_root !== 'string' || !/^[0-9a-fA-F]{64}$/.test(result.merkle_root)
+        || typeof result.message !== 'string' || !result.message.trim()) {
+      throw new Error('Invalid transaction proof response');
+    }
+    return result;
+  },
 
   // Network switching
   listNetworks: () => invoke<NetworkDefinition[]>('list_networks'),

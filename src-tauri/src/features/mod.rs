@@ -118,6 +118,7 @@ pub struct StasTokenTransfer {
 pub struct DetectorController {
     detectors: Mutex<Vec<Box<dyn OnChainDataDetector>>>,
     ids: Mutex<HashMap<&'static str, usize>>, // id -> index in detectors vec
+    initialized: OnceLock<Result<(), String>>,
 }
 
 impl DetectorController {
@@ -125,6 +126,7 @@ impl DetectorController {
         Self {
             detectors: Mutex::new(Vec::new()),
             ids: Mutex::new(HashMap::new()),
+            initialized: OnceLock::new(),
         }
     }
 
@@ -151,9 +153,10 @@ impl DetectorController {
         self.ids.lock().unwrap().contains_key(id)
     }
 
-    /// Get a detector by ID. Panics if not found (Fail-Fast, Prinzip 7).
-    pub fn get_handle(&self, id: &str) -> Option<usize> {
+    /// Resolve a detector index, returning an error for an unknown ID.
+    pub fn get_handle(&self, id: &str) -> Result<usize, String> {
         self.ids.lock().unwrap().get(id).copied()
+            .ok_or_else(|| format!("DetectorController: unknown detector ID '{id}'"))
     }
 
     /// Run all detectors in insertion order (fallback chain).
@@ -195,7 +198,7 @@ static CONTROLLER: OnceLock<DetectorController> = OnceLock::new();
 pub fn controller() -> &'static DetectorController {
     CONTROLLER.get_or_init(|| {
         let ctrl = DetectorController::new();
-        init_detectors(&ctrl);
+        init_detectors(&ctrl).expect("detector initialization failed");
         ctrl
     })
 }
@@ -206,11 +209,29 @@ pub fn controller() -> &'static DetectorController {
 /// 1-satoshi envelope), then OP_RETURN (protocol prefix matching), then
 /// STAS (heuristic pattern matching). New detectors are added here without
 /// modifying any dispatch logic.
-fn init_detectors(ctrl: &DetectorController) {
-    // Ignore errors if a detector is already registered (idempotent init).
-    let _ = ctrl.register(Box::new(OrdinalDetector));
-    let _ = ctrl.register(Box::new(OpReturnDetector));
-    let _ = ctrl.register(Box::new(StasTokenDetector));
+fn init_detectors(ctrl: &DetectorController) -> Result<(), String> {
+    ctrl.initialized.get_or_init(|| {
+        register_builtin_batch(ctrl, [
+            Box::new(OrdinalDetector), Box::new(OpReturnDetector), Box::new(StasTokenDetector),
+        ])
+    }).clone()
+}
+
+fn register_builtin_batch<const N: usize>(ctrl: &DetectorController, builtins: [Box<dyn OnChainDataDetector>; N]) -> Result<(), String> {
+    let mut ids = ctrl.ids.lock().unwrap();
+    let mut detectors = ctrl.detectors.lock().unwrap();
+    let mut seen = std::collections::HashSet::new();
+    for detector in &builtins {
+        let id = detector.get_id();
+        if ids.contains_key(id) || !seen.insert(id) {
+            return Err(format!("DetectorController: duplicate detector ID '{id}' — already registered"));
+        }
+    }
+    for detector in builtins {
+        ids.insert(detector.get_id(), detectors.len());
+        detectors.push(detector);
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -330,6 +351,51 @@ mod tests {
     }
 
     #[test]
+    fn unknown_lookup_fails_loudly() {
+        let ctrl = fresh_controller();
+        ctrl.register(Box::new(FakeDetector { id: "known", result: None })).unwrap();
+        assert!(ctrl.get_handle("missing").unwrap_err().contains("missing"));
+        assert_eq!(ctrl.get_handle("known"), Ok(0));
+        ctrl.register(Box::new(FakeDetector { id: "after", result: None })).unwrap();
+        assert_eq!(ctrl.get_handle("after"), Ok(1));
+    }
+
+    #[test]
+    fn initialization_collision_fails_without_partial_registration() {
+        let ctrl = fresh_controller();
+        ctrl.register(Box::new(FakeDetector { id: "op_return", result: None })).unwrap();
+        let result = init_detectors(&ctrl).unwrap_err();
+        assert!(result.contains("op_return"));
+        assert_eq!(init_detectors(&ctrl).unwrap_err(), result);
+        assert_eq!(ctrl.len(), 1);
+        assert!(!ctrl.has_handle("ordinal"));
+        assert!(!ctrl.has_handle("stas"));
+    }
+
+    #[test]
+    fn builtin_initialization_is_ordered_and_idempotent() {
+        let ctrl = fresh_controller();
+        init_detectors(&ctrl).unwrap();
+        init_detectors(&ctrl).unwrap();
+        assert_eq!(ctrl.len(), 3);
+        assert_eq!(ctrl.get_handle("ordinal"), Ok(0));
+        assert_eq!(ctrl.get_handle("op_return"), Ok(1));
+        assert_eq!(ctrl.get_handle("stas"), Ok(2));
+    }
+
+    #[test]
+    fn duplicate_ids_within_builtin_batch_leave_registry_unchanged() {
+        let ctrl = fresh_controller();
+        let result = register_builtin_batch(&ctrl, [
+            Box::new(FakeDetector { id: "duplicate", result: None }) as Box<dyn OnChainDataDetector>,
+            Box::new(FakeDetector { id: "duplicate", result: None }),
+        ]);
+        assert!(result.unwrap_err().contains("duplicate"));
+        assert!(ctrl.is_empty());
+        assert!(!ctrl.has_handle("duplicate"));
+    }
+
+    #[test]
     fn test_register_and_detect() {
         let ctrl = fresh_controller();
         ctrl.register(Box::new(FakeDetector {
@@ -357,6 +423,8 @@ mod tests {
             result.unwrap_err().contains("duplicate detector ID"),
             "error message must mention duplicate detector ID"
         );
+        assert_eq!(ctrl.len(), 1);
+        assert_eq!(ctrl.get_handle("dup"), Ok(0));
     }
 
     #[test]

@@ -2,12 +2,28 @@
 import { useEffect, useState, useCallback } from 'react';
 import { api } from '../api';
 
+type HeaderSyncProgress = { synced: number; new_tip: number; server_tip: number; message: string };
+
+function parseHeaderProgress(value: unknown): HeaderSyncProgress {
+  if (!value || typeof value !== 'object') throw new Error('Invalid header sync response');
+  const result = value as Record<string, unknown>;
+  const isHeight = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+  if (!isHeight(result.synced) || !isHeight(result.new_tip) || !isHeight(result.server_tip)
+      || result.new_tip > result.server_tip || result.synced > result.new_tip
+      || (result.synced === 0 && result.new_tip < result.server_tip)
+      || typeof result.message !== 'string' || !result.message.trim()) {
+    throw new Error('Invalid header sync response');
+  }
+  return result as HeaderSyncProgress;
+}
+
 export function NetworkView() {
   const [info, setInfo] = useState<any>(null);
   const [servers, setServers] = useState<any[]>([]);
   const [networks, setNetworks] = useState<{ id: string; name: string }[]>([]);
   const [activeNetwork, setActiveNetwork] = useState('mainnet');
   const [headerStore, setHeaderStore] = useState<any>(null);
+  const [headerProgress, setHeaderProgress] = useState<HeaderSyncProgress | null>(null);
   const [chainInfo, setChainInfo] = useState<any>(null);
   const [connecting, setConnecting] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -37,6 +53,7 @@ export function NetworkView() {
 
   const handleConnect = async (host: string) => {
     setConnecting(true);
+    setHeaderProgress(null);
     setError(null);
     setSuccess(null);
     try {
@@ -54,6 +71,7 @@ export function NetworkView() {
 
   const handleDisconnect = async () => {
     setConnecting(true);
+    setHeaderProgress(null);
     setError(null);
     try {
       await api.disconnectServer();
@@ -83,9 +101,11 @@ export function NetworkView() {
   const handleSyncHeaders = async () => {
     setSyncing(true);
     setError(null);
+    setSuccess(null);
+    setHeaderProgress(null);
     try {
-      await api.syncHeaders();
-      setSuccess('Headers synced');
+      const result = parseHeaderProgress(await api.syncHeaders());
+      setHeaderProgress(result);
       await loadData();
     } catch (e: any) {
       setError(e.message || 'Header sync failed');
@@ -106,7 +126,9 @@ export function NetworkView() {
   };
 
   const handleSwitchNetwork = async (networkId: string) => {
+    setConnecting(true);
     setError(null);
+    setHeaderProgress(null);
     try {
       await api.switchNetwork(networkId);
       setActiveNetwork(networkId);
@@ -114,6 +136,8 @@ export function NetworkView() {
       await loadData();
     } catch (e: any) {
       setError(e.message || `Failed to switch to ${networkId}`);
+    } finally {
+      setConnecting(false);
     }
   };
 
@@ -147,34 +171,41 @@ export function NetworkView() {
           )}
           {headerStore && (
             <div className="text-xs text-gray-500 mt-1">
-              Headers: {headerStore.count ?? '?'} | Best height: {headerStore.best_height ?? '?'}
+              Headers: {headerStore.header_count ?? '?'} | Stored height: {headerStore.tip_height ?? '?'}
             </div>
           )}
           <div className="flex gap-2 mt-3">
             <button
               onClick={handleSyncWallet}
-              disabled={syncing}
+              disabled={syncing || connecting}
               className="bg-accent hover:bg-accent-hover text-white rounded-lg px-3 py-1.5 text-xs font-medium disabled:opacity-50 transition-colors"
             >
               {syncing ? 'Syncing…' : 'Sync Wallet'}
             </button>
             <button
               onClick={handleSyncHeaders}
-              disabled={syncing}
+              disabled={syncing || connecting}
               className="bg-void-800 hover:bg-void-700 text-gray-100 rounded-lg px-3 py-1.5 text-xs font-medium border border-void-700 disabled:opacity-50 transition-colors"
             >
-              Sync Headers
+              {headerProgress && headerProgress.new_tip < headerProgress.server_tip ? 'Continue Header Sync' : 'Sync Headers'}
             </button>
             {info?.connected && (
               <button
                 onClick={handleDisconnect}
-                disabled={connecting}
+                disabled={connecting || syncing}
                 className="text-danger hover:text-red-400 rounded-lg px-3 py-1.5 text-xs font-medium border border-danger/30 transition-colors"
               >
                 {connecting ? '…' : 'Disconnect'}
               </button>
             )}
           </div>
+          {headerProgress && (
+            <div role="status" className="text-xs text-gray-400 mt-2">
+              <div>Stored header tip: {headerProgress.new_tip}; server-reported tip: {headerProgress.server_tip}.</div>
+              <div>{headerProgress.new_tip < headerProgress.server_tip ? 'Partial progress. Continue header sync to request more headers.' : 'Header sync reached the server-reported height.'}</div>
+              <div>Server agreement does not establish independent chain consensus.</div>
+            </div>
+          )}
         </div>
 
         {/* Network switching */}
@@ -185,6 +216,7 @@ export function NetworkView() {
               <button
                 key={net.id}
                 onClick={() => handleSwitchNetwork(net.id)}
+                disabled={syncing || connecting}
                 className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
                   activeNetwork === net.id
                     ? 'bg-accent text-white border-accent'
@@ -210,7 +242,7 @@ export function NetworkView() {
                 <div className="flex gap-2">
                   <button
                     onClick={() => handleConnect(srvInfo.host)}
-                    disabled={connecting}
+                    disabled={connecting || syncing}
                     className="text-xs text-accent hover:text-accent-hover disabled:opacity-50"
                   >
                     Connect

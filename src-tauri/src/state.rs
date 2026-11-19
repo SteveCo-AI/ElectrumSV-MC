@@ -147,7 +147,9 @@ pub struct NetworkState {
     pub active_backend: Option<crate::network::backend::BackendType>,
     /// Persistent block header store for SPV verification.
     /// Lazy-initialized on first use (requires a data directory path).
-    pub header_store: Option<HeaderStore>,
+    pub header_store: Option<std::sync::Arc<HeaderStore>>,
+    /// Serializes header-store initialization and operations without holding the network mutex across awaits.
+    pub header_store_operation: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Active network ID: "mainnet", "testnet", or "stn".
     pub active_network: String,
 }
@@ -161,6 +163,7 @@ impl NetworkState {
             woc_client: None,
             active_backend: None,
             header_store: None,
+            header_store_operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             active_network: "mainnet".to_string(),
         }
     }
