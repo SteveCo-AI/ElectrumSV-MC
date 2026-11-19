@@ -215,6 +215,21 @@ pub enum Strategy {
     Privacy,
 }
 
+/// Ordered public identifiers and their selection behavior. `None` uses the
+/// existing largest-first selector rather than the advanced chooser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StrategyEntry {
+    pub id: &'static str,
+    pub strategy: Option<Strategy>,
+}
+
+pub const STRATEGY_CATALOG: [StrategyEntry; 4] = [
+    StrategyEntry { id: "largest_first", strategy: None },
+    StrategyEntry { id: "branch_and_bound", strategy: Some(Strategy::BranchAndBound) },
+    StrategyEntry { id: "random_subset", strategy: Some(Strategy::RandomSubset) },
+    StrategyEntry { id: "privacy", strategy: Some(Strategy::Privacy) },
+];
+
 // ---------------------------------------------------------------------------
 // CoinChooser — the main entry point
 // ---------------------------------------------------------------------------

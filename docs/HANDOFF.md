@@ -1,6 +1,6 @@
 # ElectrumSV-MC – Work Handoff
 
-Status: 2026-11-19. Development is paused at the user's request. This document records the state; it does not authorize further work.
+Status: 2026-11-19. The user requested the architecture stage after the earlier pause. This document records the state; it does not authorize further work.
 
 ## Objective and locations
 
@@ -32,6 +32,10 @@ Files and SHA-256 hashes at the pause:
 The implementer reported three failures reproduced before the fix, followed by 28/28 targeted tests, 165/165 GUI tests, a successful GUI build, and `git diff --check`. These results do not constitute a new release build or acceptance. The initial source review partially confirmed the examined session and DTO contracts; a compatibility point mentioned before the pause had not yet been specified. Do not treat it as resolved.
 
 On resumption, first inspect the current diff and these hashes, complete the independent review including the compatibility point, and address any substantiated findings. Only after successful review should U1 be accepted in the [roadmap](roadmap.md) and a new release artifact considered. Save subsequent changes to the designated GitHub branch; do not publish user data or test secrets.
+
+## Architecture stage in progress
+
+The user approved wallet-specific domain-boundary rules and implementation based on the architecture audit. `AGENTS.md` now records those rules. A2 centralizes the existing coin-selection names and mappings in a typed catalog; focused offline checks and review are complete. A3 network lifecycle and payment-backend boundaries are still in progress, with concurrency, cancellation and cleanup under investigation. See [roadmap](roadmap.md) for acceptance status; do not treat an unfinished A3 as verified.
 
 ## Remaining limitations
 

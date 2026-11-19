@@ -79,24 +79,12 @@ fn derive_change_address(xprv: &str) -> Result<String, TransactionCmdError> {
 // Commands
 // ============================================================================
 
-/// Parse a coin-selection strategy string into an optional `Strategy`.
-///
-/// - `None` or `"largest_first"` → `None` (use the default largest-first CoinSelector)
-/// - `"branch_and_bound"` → `Some(Strategy::BranchAndBound)`
-/// - `"random_subset"` → `Some(Strategy::RandomSubset)`
-/// - `"privacy"` → `Some(Strategy::Privacy)`
-/// - anything else → `Err`
 fn parse_strategy(s: &Option<String>) -> Result<Option<Strategy>, String> {
-    match s.as_deref() {
-        None | Some("largest_first") => Ok(None),
-        Some("branch_and_bound") => Ok(Some(Strategy::BranchAndBound)),
-        Some("random_subset") => Ok(Some(Strategy::RandomSubset)),
-        Some("privacy") => Ok(Some(Strategy::Privacy)),
-        Some(other) => Err(format!(
-            "invalid coin_selection_strategy '{}': expected one of largest_first, branch_and_bound, random_subset, privacy",
-            other
-        )),
-    }
+    let Some(name) = s.as_deref() else { return Ok(None) };
+    crate::core::coinchooser::STRATEGY_CATALOG.iter().find(|entry| entry.id == name)
+        .map(|entry| entry.strategy)
+        .ok_or_else(|| format!("invalid coin_selection_strategy '{}': expected one of {}", name,
+            crate::core::coinchooser::STRATEGY_CATALOG.iter().map(|entry| entry.id).collect::<Vec<_>>().join(", ")))
 }
 
 /// Prepare an unsigned transaction.
@@ -181,7 +169,7 @@ pub async fn prepare_tx(
     ensure_change_key(&pool, account_id).await?;
     let change_address = derive_change_address(&xprv).map_err(|e| e.to_string())?;
 
-    // Parse coin selection strategy (None/empty -> largest-first default)
+    // Parse coin selection strategy (None -> largest-first default)
     let strategy = parse_strategy(&coin_selection_strategy)?;
 
     // Build unsigned transaction
@@ -414,6 +402,29 @@ mod tests {
     use bsv::transaction::{transaction::Transaction, transaction_input::TransactionInput, transaction_output::TransactionOutput};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn catalog_strategy_parser_preserves_names_default_and_errors() {
+        use crate::core::coinchooser::STRATEGY_CATALOG;
+        let expected = [
+            ("largest_first", None),
+            ("branch_and_bound", Some(Strategy::BranchAndBound)),
+            ("random_subset", Some(Strategy::RandomSubset)),
+            ("privacy", Some(Strategy::Privacy)),
+        ];
+        assert_eq!(parse_strategy(&None).unwrap(), None);
+        assert_eq!(STRATEGY_CATALOG.len(), expected.len());
+        let mut ids = std::collections::HashSet::new();
+        for (entry, (id, strategy)) in STRATEGY_CATALOG.iter().zip(expected) {
+            assert!(ids.insert(entry.id));
+            assert_eq!((entry.id, entry.strategy), (id, strategy));
+            assert_eq!(parse_strategy(&Some(entry.id.to_owned())).unwrap(), strategy);
+        }
+        for invalid in ["", " ", "privacy ", " privacy", "Privacy", "bogus"] {
+            assert_eq!(parse_strategy(&Some(invalid.to_owned())).unwrap_err(), format!(
+                "invalid coin_selection_strategy '{}': expected one of largest_first, branch_and_bound, random_subset, privacy", invalid));
+        }
+    }
+
     #[tokio::test]
     async fn ledger_prepare_sign_and_mock_broadcast_survives_reopen() {
         let mut state = AppState::new();
@@ -442,6 +453,15 @@ mod tests {
         drop(pool);
         let dest = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".to_string();
         let payment = vec![PaymentOutput { address: dest, satoshis: 10_000 }];
+        for invalid in ["", "Privacy", " privacy", "bogus"] {
+            let error = prepare_tx(&state, payment.clone(), Some(1), None, Some(invalid.into())).await.unwrap_err();
+            assert_eq!(error, format!("invalid coin_selection_strategy '{}': expected one of largest_first, branch_and_bound, random_subset, privacy", invalid));
+        }
+        let (pool, _, _, _) = get_wallet_data(&state).unwrap();
+        let plans: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM SpendPlans").fetch_one(&pool).await.unwrap();
+        let reservations: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM SpendReservations").fetch_one(&pool).await.unwrap();
+        assert_eq!((plans.0, reservations.0), (0, 0));
+        drop(pool);
         let (first, second) = tokio::join!(
             prepare_tx(&state, payment.clone(), Some(1), Some("hello".into()), None),
             prepare_tx(&state, payment.clone(), Some(1), Some("hello".into()), None));

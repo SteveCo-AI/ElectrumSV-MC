@@ -5,7 +5,6 @@
 // AUD-007: sign_tx requires TOTP verification before signing.
 // Every TX plan is bound to a wallet by wallet_path to prevent cross-wallet replay.
 
-use crate::core::coinchooser::Strategy;
 use crate::core::signer::{LocalSigner, Signer};
 use crate::core::transaction::{
     FeeEstimator, PaymentOutput, SelectedUtxo, TransactionError, TxBuilder, TxPlan,
@@ -155,26 +154,6 @@ fn derive_change_address(xprv: &str) -> Result<String, TransactionCmdError> {
 // ============================================================================
 // Commands
 // ============================================================================
-
-/// Parse a coin-selection strategy string into an optional `Strategy`.
-///
-/// - `None` or `"largest_first"` → `None` (use the default largest-first CoinSelector)
-/// - `"branch_and_bound"` → `Some(Strategy::BranchAndBound)`
-/// - `"random_subset"` → `Some(Strategy::RandomSubset)`
-/// - `"privacy"` → `Some(Strategy::Privacy)`
-/// - anything else → `Err`
-fn parse_strategy(s: &Option<String>) -> Result<Option<Strategy>, String> {
-    match s.as_deref() {
-        None | Some("largest_first") => Ok(None),
-        Some("branch_and_bound") => Ok(Some(Strategy::BranchAndBound)),
-        Some("random_subset") => Ok(Some(Strategy::RandomSubset)),
-        Some("privacy") => Ok(Some(Strategy::Privacy)),
-        Some(other) => Err(format!(
-            "invalid coin_selection_strategy '{}': expected one of largest_first, branch_and_bound, random_subset, privacy",
-            other
-        )),
-    }
-}
 
 /// Prepare a durable wallet-bound spend plan.
 #[tauri::command]
@@ -839,85 +818,6 @@ mod tests {
             TransactionCmdError::NotSigned.to_string(),
             "TX plan is not signed yet — sign first"
         );
-    }
-
-    // --- parse_strategy tests ---
-
-    /// parse_strategy: None and "largest_first" both map to None (largest-first default).
-    #[test]
-    fn test_parse_strategy_none_and_largest_first() {
-        assert!(parse_strategy(&None).unwrap().is_none());
-        assert!(parse_strategy(&Some("largest_first".to_string())).unwrap().is_none());
-    }
-
-    /// parse_strategy: named strategies map to the matching Strategy variant.
-    #[test]
-    fn test_parse_strategy_named_strategies() {
-        assert_eq!(
-            parse_strategy(&Some("branch_and_bound".to_string())).unwrap(),
-            Some(Strategy::BranchAndBound)
-        );
-        assert_eq!(
-            parse_strategy(&Some("random_subset".to_string())).unwrap(),
-            Some(Strategy::RandomSubset)
-        );
-        assert_eq!(
-            parse_strategy(&Some("privacy".to_string())).unwrap(),
-            Some(Strategy::Privacy)
-        );
-    }
-
-    /// parse_strategy: invalid strings return an error with a descriptive message.
-    #[test]
-    fn test_parse_strategy_invalid_returns_error() {
-        let err = parse_strategy(&Some("does_not_exist".to_string())).unwrap_err();
-        assert!(err.contains("invalid coin_selection_strategy"));
-        assert!(err.contains("does_not_exist"));
-        // The error message should list the valid options.
-        assert!(err.contains("largest_first"));
-        assert!(err.contains("privacy"));
-    }
-
-    /// parse_strategy: None -> None (largest_first default)
-    #[test]
-    fn test_parse_strategy_none() {
-        assert!(parse_strategy(&None).unwrap().is_none());
-    }
-
-    /// parse_strategy: "largest_first" -> None
-    #[test]
-    fn test_parse_strategy_largest_first() {
-        assert!(parse_strategy(&Some("largest_first".to_string())).unwrap().is_none());
-    }
-
-    /// parse_strategy: "privacy" -> Some(Strategy::Privacy)
-    #[test]
-    fn test_parse_strategy_privacy() {
-        let s = parse_strategy(&Some("privacy".to_string())).unwrap();
-        assert_eq!(s, Some(Strategy::Privacy));
-    }
-
-    /// parse_strategy: "branch_and_bound" -> Some(Strategy::BranchAndBound)
-    #[test]
-    fn test_parse_strategy_bnb() {
-        let s = parse_strategy(&Some("branch_and_bound".to_string())).unwrap();
-        assert_eq!(s, Some(Strategy::BranchAndBound));
-    }
-
-    /// parse_strategy: "random_subset" -> Some(Strategy::RandomSubset)
-    #[test]
-    fn test_parse_strategy_random_subset() {
-        let s = parse_strategy(&Some("random_subset".to_string())).unwrap();
-        assert_eq!(s, Some(Strategy::RandomSubset));
-    }
-
-    /// parse_strategy: invalid string -> error mentioning the name and valid options
-    #[test]
-    fn test_parse_strategy_invalid() {
-        let err = parse_strategy(&Some("bogus_strategy".to_string())).unwrap_err();
-        assert!(err.contains("bogus_strategy"));
-        assert!(err.contains("largest_first"));
-        assert!(err.contains("privacy"));
     }
 
     // --- AUD-008: Plan store tests ---

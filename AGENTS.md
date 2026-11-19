@@ -1,0 +1,13 @@
+# Wallet architecture instructions
+
+These instructions apply to ElectrumSV-MC in addition to the workspace and global `AGENTS.md` files. Follow the current user request and preserve existing wallet data and uncommitted work.
+
+## Domain boundaries and Controller–Handle
+
+- Keep concrete providers, their lifecycle, and capability differences behind the responsible domain boundary. Callers should use a stable service contract instead of repeating provider-specific wiring or dispatch. This applies even when fewer than three implementations exist.
+- Before introducing a controller or registry, record the shared domain task, actual implementations, runtime selection, expansion or orchestration needs, capabilities, error behavior, and simpler alternatives. Do not count tests, operating-system variants, or planned implementations as existing providers.
+- Apply the Controller–Handle skill when its domain criteria are met. The installed skill is `/var/home/RaSt/.hermes/skills/software-development/controller-handle-architecture/SKILL.md`; its `references/core-workflow.md` must be read before implementing or migrating that pattern. If the external skill is unavailable, these project rules remain readable, but a migration explicitly requiring the skill needs its source. For fewer than three genuinely distinct runtime implementations, prefer a direct service, small port, factory, or typed dispatcher unless an explicit user decision overrides the skill.
+- Construct dependencies at the composition root. Controllers coordinate; handles implement domain behavior. Reject duplicate and unknown IDs explicitly, preserve deterministic order where observable, and make initialization repeatable.
+- Preserve wallet security contracts: authentication, key isolation, transaction state and reservation persistence, explicit retry behavior, network identity and capabilities, resource ownership, cancellation, and concurrency. A shared abstraction must not erase differences such as address versus scripthash, push versus polling, or unverified chain claims.
+- Test affected behavior and failure paths against the risks of the change. A controller alone does not guarantee fault isolation, consensus, or the correctness of a provider's claims. Keep existing services where practical; do not introduce plugin systems or broad refactors without demonstrated need.
+- The current [architecture audit](docs/controller-handle-audit-2026-11-19.md) records candidates and limitations; verify current source before acting on it. Update the roadmap and affected contract documentation when behavior or ownership changes.

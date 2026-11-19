@@ -188,11 +188,18 @@ pub struct CoinSelectionStrategies {
 #[tauri::command]
 pub fn get_coin_selection_strategies() -> Result<CoinSelectionStrategies, String> {
     Ok(CoinSelectionStrategies {
-        strategies: vec![
-            "largest_first".to_string(),
-            "branch_and_bound".to_string(),
-            "random_subset".to_string(),
-            "privacy".to_string(),
-        ],
+        strategies: crate::core::coinchooser::STRATEGY_CATALOG.iter()
+            .map(|entry| entry.id.to_string()).collect(),
     })
+}
+
+#[cfg(test)]
+mod coin_selection_catalog_tests {
+    #[test]
+    fn strategy_response_has_stable_api_shape_and_order() {
+        let response = super::get_coin_selection_strategies().unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), serde_json::json!({
+            "strategies": ["largest_first", "branch_and_bound", "random_subset", "privacy"]
+        }));
+    }
 }
