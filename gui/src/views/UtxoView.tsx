@@ -14,7 +14,7 @@ function validateOutputs(value: unknown): { outputs: UtxoEntry[]; total: number 
     if (!item || typeof item !== 'object' || typeof item.tx_hash !== 'string' || !/^[0-9a-f]{64}$/i.test(item.tx_hash) ||
         !Number.isSafeInteger(item.tx_index) || item.tx_index < 0 || item.tx_index > 0xffffffff ||
         !Number.isSafeInteger(item.value) || item.value < 0 ||
-        !Number.isSafeInteger(item.keyinstance_id) || item.keyinstance_id < 0 ||
+        !Number.isSafeInteger(item.keyinstance_id) ||
         typeof item.is_coinbase !== 'boolean' || typeof item.script_pubkey !== 'string' || !/^(?:[0-9a-f]{2})*$/i.test(item.script_pubkey)) {
       throw new Error('Invalid UTXO');
     }

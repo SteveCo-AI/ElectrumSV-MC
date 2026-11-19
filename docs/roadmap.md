@@ -35,7 +35,9 @@ Bereits vor diesem Stichtag implementierte und geprüfte Arbeiten werden nicht i
 Scope from 2026-11-19: **U1** at the top level. Progress: **0/1 (0%)** accepted. Completion of the previous stage does not mean the entire wallet is complete.
 
 - [ ] **U1 – Bind the UTXO display to the active wallet session:** Prevent stale or delayed data from other sessions and distinguish errors or invalid data from a genuinely empty balance. Check safe amount and duplicate handling with targeted regressions. This finding concerns the display and does not establish a signing or spending defect.
-  - Status: **implemented and submitted for review; not accepted**. The implementer reported 28/28 targeted and 165/165 GUI tests and a successful build. Independent review and a yet-unspecified compatibility point remained open at the pause; see the [work handoff](HANDOFF.md).
+  - Status: **in progress** after review identified an unnecessarily restrictive signed-ID display check and a related sync sentinel boundary requiring investigation. No real negative-ID legacy wallet has been established.
+  - [x] U1.1: Align the read-only view with safe integer IDs from the backend DTO, preserve all other validation and session guards, and review/test both valid and invalid boundaries. The old behavior was reproduced for synthetic negative IDs; after correction 38 focused and 175 full GUI tests passed, and the build succeeded. No actual legacy negative-ID wallet has been established.
+  - [ ] U1.2: Trace and investigate how negative persisted key IDs interact with temporary discovery sentinels, including the `i64::MIN` boundary; demonstrate impact before choosing a data-preserving correction.
 
 ## Architecture boundary stage
 

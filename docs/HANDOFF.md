@@ -20,18 +20,18 @@ The current Linux test artifact is `src-tauri/target/release/electrumsv-mc`, SHA
 
 ## Current local state: U1
 
-U1 is **implemented and submitted for review, not accepted**. It is being saved to the development branch as a work-in-progress checkpoint. The changed UTXO view distinguishes wallet path, instance token, and account; separates stale responses, loading errors, and empty results; and validates values and duplicate outpoints. It no longer labels every non-coinbase output as P2PKH without script evidence. This is a GUI guard, not a demonstrated backend instance-CAS guarantee.
+U1 remains **in progress, not fully accepted**. The read-only UTXO view correction U1.1 was accepted after review; the related sync identifier boundary U1.2 remains under investigation. The changed UTXO view distinguishes wallet path, instance token, and account; separates stale responses, loading errors, and empty results; and validates values and duplicate outpoints. It no longer labels every non-coinbase output as P2PKH without script evidence. This is a GUI guard, not a demonstrated backend instance-CAS guarantee.
 
 Files and SHA-256 hashes at the pause:
 
-- `gui/src/views/UtxoView.tsx`: `66d5320f10278f9dfa0763b8d2178e3462c01fa9f3bcc886bbcf46d4c2d143be`
+- `gui/src/views/UtxoView.tsx`: `f5fa829c2f3a60b2c3d700dd48976dc555423157cfc68996dae525cab7363f4e`
 - `gui/src/api.ts`: `c22eea0b367fc2ef94fd90a4d3aabd97a674dc82437a2c2dc6dc5395158d715b`
-- `gui/src/__tests__/UtxoView.test.tsx`: `35b3fdd69bb2eb900b025e4b84ebeebd34c98f1f35403e96e75971562396308f`
+- `gui/src/__tests__/UtxoView.test.tsx`: `5a8fb90d3cb3ac4c5a7d3dce844a956193987ecf8ced44efec6f0782de1f936a`
 - `gui/src/__tests__/WalletViews.test.tsx`: `54b40d5aad248914cf469b2553a8bce49c0ae8f617d84eefd9428bc787ffef90`
 
-The implementer reported three failures reproduced before the fix, followed by 28/28 targeted tests, 165/165 GUI tests, a successful GUI build, and `git diff --check`. These results do not constitute a new release build or acceptance. The initial source review partially confirmed the examined session and DTO contracts; a compatibility point mentioned before the pause had not yet been specified. Do not treat it as resolved.
+U1.1 removed an unnecessarily strict nonnegative check on the read-only backend ID. Two synthetic negative-ID cases failed before the fix; 38/38 focused and 175/175 GUI tests passed afterward, along with a GUI build. No real negative-ID legacy wallet has been identified. U1.2 investigates the separate ambiguity between stored negative IDs and temporary discovery sentinels; it remains unaccepted. The current release binary predates the latest U1.1 source change.
 
-On resumption, first inspect the current diff and these hashes, complete the independent review including the compatibility point, and address any substantiated findings. Only after successful review should U1 be accepted in the [roadmap](roadmap.md) and a new release artifact considered. Save subsequent changes to the designated GitHub branch; do not publish user data or test secrets.
+Complete U1.2 with synthetic fixtures and source review before accepting U1 in the [roadmap](roadmap.md). Keep database changes atomic and protect existing wallet data. Save subsequent changes to the designated GitHub branch; do not publish user data or test secrets.
 
 ## Architecture stage
 

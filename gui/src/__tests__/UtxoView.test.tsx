@@ -114,7 +114,6 @@ describe('UTXO session and response handling', () => {
     null, {}, [null], [{ ...output, tx_hash: 'short' }], [{ ...output, tx_index: -1 }],
     [{ ...output, tx_index: 0x100000000 }], [{ ...output, tx_index: 1.5 }],
     [{ ...output, value: -1 }], [{ ...output, value: Number.MAX_SAFE_INTEGER + 1 }],
-    [{ ...output, keyinstance_id: null }], [{ ...output, keyinstance_id: -1 }],
     [{ ...output, is_coinbase: 0 }], [{ ...output, script_pubkey: 'a' }],
     [{ ...output, script_pubkey: 'xx' }],
     [{ ...output, value: Number.MAX_SAFE_INTEGER }, { ...output, tx_index: 5, value: 1 }],
@@ -122,6 +121,16 @@ describe('UTXO session and response handling', () => {
     getUtxos.mockResolvedValueOnce(value as any); render(<UtxoView />);
     expect(await screen.findByText(/UTXOs unavailable/)).toBeTruthy();
     expect(screen.queryByText('No unspent outputs.')).toBeNull();
+  });
+  it.each([-1, -Number.MAX_SAFE_INTEGER, 0, Number.MAX_SAFE_INTEGER])('accepts signed safe keyinstance_id %s', async id => {
+    getUtxos.mockResolvedValueOnce([{ ...output, keyinstance_id: id }]);
+    render(<UtxoView />);
+    expect(await screen.findByText('100 sat')).toBeTruthy();
+  });
+  it.each([null, undefined, NaN, Infinity, -Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1, -Number.MAX_SAFE_INTEGER - 1])('rejects invalid keyinstance_id %s', async id => {
+    getUtxos.mockResolvedValueOnce([{ ...output, keyinstance_id: id }] as any);
+    render(<UtxoView />);
+    expect(await screen.findByText(/UTXOs unavailable/)).toBeTruthy();
   });
   it('accepts safe boundary values and a valid script', async () => {
     getUtxos.mockResolvedValueOnce([{ ...output, tx_index: 0xffffffff, value: Number.MAX_SAFE_INTEGER, keyinstance_id: Number.MAX_SAFE_INTEGER, is_coinbase: true, script_pubkey: '00aF' }]);
