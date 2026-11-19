@@ -54,6 +54,16 @@ describe('explicit address discovery', () => {
     expect(useStore.getState().historyRefreshKey).toBe(0);
     expect(useStore.getState().balanceRefreshKey).toBe(0);
   });
+
+  it('reports scan failures without claiming that saving was impossible', async () => {
+    vi.mocked(api.scanAddressRange).mockRejectedValue('scan conflict');
+    render(<NetworkView />);
+    await screen.findByText(/Connected —/);
+    fireEvent.click(screen.getByText('Scan addresses'));
+    await screen.findByText(/scan conflict.*outcome may be unknown/);
+    expect(useStore.getState().historyRefreshKey).toBe(0);
+    expect(useStore.getState().balanceRefreshKey).toBe(0);
+  });
 });
 
 describe('header synchronization status', () => {

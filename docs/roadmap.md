@@ -60,14 +60,14 @@ Scope from 2026-11-19: **A1–A3** at the top level. Progress: **3/3 (100%)** ac
 
 ## Recovery discovery stage
 
-Scope from 2026-11-19: **R4** at the top level. Progress: **0/1 (0%)** accepted. This scope does not measure overall wallet completion.
+Scope from 2026-11-19: **R4** at the top level. Progress: **1/1 (100%)** accepted for the defined synthetic scope. This scope does not measure overall wallet completion.
 
-- [ ] **R4 – Explicit extended address discovery:** Provide a user-initiated bounded search beyond the default 20-address gap through a shared backend, optional agent interface and GUI. Preserve existing wallet data atomically, report conflicts, bind the operation to the wallet instance, and state server privacy and completeness limits. Existing regular sync and its marker semantics remain distinct.
+- [x] **R4 – Explicit extended address discovery:** Provide a user-initiated bounded search beyond the default 20-address gap through a shared backend, optional agent interface and GUI. Preserve existing wallet data atomically, report conflicts, bind the operation to the wallet instance, and state server privacy and completeness limits. Existing regular sync and its marker semantics remain distinct.
   - [x] R4.1: Implement the bounded backend scan and an atomic conservative merge, including existing spent/unspent outputs, history, raw transactions, discovery markers, session changes, resource budgets, cancellation and rollback.
     - Accepted for the synthetic scenarios reviewed: 7 merge tests, 25 network-command tests, 49 ElectrumX tests, 5 regular sync regression tests, 1 ledger test, and 3 isolated TLS tests. The latter include discovery on both branches beyond the default gap, close/reopen and ordinary resync, session replacement and rejection of an overflowing output index. Server completeness and real legacy wallets are not proven.
     - Follow-up: reject ElectrumX UTXO output indices outside `u32` instead of truncating server values; preserve valid boundary values and test failure before any scan commit.
     - Bind the scanned account and master-key row to the derivation context and compare them inside the merge transaction; reject changed rows without leaking key material.
     - Validate the supported key inventory and derive each output script from the bound account public key and referenced path; reject mismatched ownership or ambiguous discovery paths. Verify scan → reopen → ordinary resync with synthetic data.
-  - [ ] R4.2: Expose the reviewed backend operation through the Tauri and explicitly enabled agent interfaces with bounded parameters and clear errors.
-  - [ ] R4.3: Add an explicit GUI action with range, privacy, progress/result and conflict handling; verify the full synthetic loopback flow before acceptance.
-    - In progress: Tauri and agent wiring plus GUI action implemented; the agent path passed local TLS tests and the GUI has focused mock tests and a production build. A full GUI-to-Tauri-to-local-TLS scan remains to be verified before acceptance.
+  - [x] R4.2: Expose the reviewed backend operation through the Tauri and explicitly enabled agent interfaces with bounded parameters and clear errors. Local TLS agent tests cover disabled network capability and invalid range.
+  - [x] R4.3: Add an explicit GUI action with range, privacy, progress/result and conflict handling; verify the full synthetic loopback flow before acceptance.
+    - The private Wry test passed with the production NetworkView, Tauri command and local TLS fixture. It verified two discovered branches past the gap, persisted outputs, unchanged discovery marker and refresh signals. The test pre-opens the synthetic wallet and connects the fixture; it does not cover GUI login, GUI connection, a real server or completeness. See [test host](../tools/wry-scan/README.md).

@@ -694,4 +694,4 @@ mod payment_dispatch_tests {
 
 #[cfg(test)]
 #[path = "agent_tls_test.rs"]
-mod agent_tls_test;
+pub(crate) mod agent_tls_test;

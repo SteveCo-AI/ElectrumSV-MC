@@ -30,6 +30,9 @@ mod wry_gate_test;
 #[cfg(all(test, target_os = "linux"))]
 mod wry_payment_test;
 
+#[cfg(all(test, target_os = "linux"))]
+mod wry_scan_test;
+
 #[tauri::command]
 fn get_app_name() -> String {
     env!("CARGO_PKG_NAME").to_string()

@@ -14,7 +14,7 @@ const CERT: &[u8] = include_bytes!("../tests/fixtures/tls/server.pem");
 const WRONG_HOST_CERT: &[u8] = include_bytes!("../tests/fixtures/tls/wrong-host.pem");
 const KEY: &[u8] = include_bytes!("../tests/fixtures/tls/server-key.pem");
 
-fn roots() -> rustls::RootCertStore {
+pub(crate) fn roots() -> rustls::RootCertStore {
     let mut store = rustls::RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut &CA[..]) { store.add(cert.unwrap()).unwrap(); }
     store
@@ -80,7 +80,7 @@ async fn server(cert: &'static [u8], target: String, raw: String, txid: String,
     (port, task)
 }
 
-async fn scan_server(targets: std::collections::HashMap<String, (String,String,u64)>, histories: Arc<AtomicUsize>, gate: Option<(tokio::sync::oneshot::Sender<()>,tokio::sync::oneshot::Receiver<()>)>, bad_index: bool) -> (u16, tokio::task::JoinHandle<()>) {
+pub(crate) async fn scan_server(targets: std::collections::HashMap<String, (String,String,u64)>, histories: Arc<AtomicUsize>, gate: Option<(tokio::sync::oneshot::Sender<()>,tokio::sync::oneshot::Receiver<()>)>, bad_index: bool) -> (u16, tokio::task::JoinHandle<()>) {
     let acceptor = TlsAcceptor::from(Arc::new(server_config(CERT)));
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let port = listener.local_addr().unwrap().port();

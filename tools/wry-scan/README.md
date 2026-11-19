@@ -1,0 +1,5 @@
+# Private Wry scan test
+
+This ignored Linux test renders the production NetworkView and invokes the production Tauri scan command against a preconnected local TLS fixture. It uses a synthetic wallet and checks both branches beyond the default gap, the stored outputs, the discovery marker and GUI refresh signals. The test does not exercise GUI wallet login or GUI connection setup, a real server, consensus or server completeness.
+
+Build with `./gui/node_modules/.bin/vite build --config tools/wry-scan/vite.config.mjs` and compile the offline library test binary. Run only `--exact wry_scan_test::real_wry_address_scan_with_local_tls --ignored --nocapture` in a private network namespace with private Xvfb and fresh private temporary data. Set `WALLET_WRY_SCAN_ASSET_DIR` and `WALLET_WRY_SCAN_DATA_DIR` to the in-namespace directories. Require exit zero, one test and `WRY_SCAN_PASS gui ipc local_tls two_branches persisted`.
