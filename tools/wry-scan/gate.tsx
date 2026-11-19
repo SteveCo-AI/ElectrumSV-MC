@@ -23,8 +23,13 @@ async function run() {
     stage = 'start'; const button = await until(() => [...document.querySelectorAll('button')].find(b => b.textContent === 'Scan addresses' && !b.disabled), stage);
     button.click();
     stage = 'result'; await until(() => document.body.textContent?.includes('2 new keys found.'), stage);
-    stage = 'database'; await invoke('scan_observe');
+    stage = 'database'; await invoke('scan_observe', { afterSync: false });
     if (useStore.getState().historyRefreshKey !== 1 || useStore.getState().balanceRefreshKey !== 1) throw new Error('refresh');
+    stage = 'sync'; const sync = await until(() => [...document.querySelectorAll('button')].find(b => b.textContent === 'Sync Wallet' && !b.disabled), stage);
+    sync.click();
+    await until(() => document.body.textContent?.includes('synced wallet '), stage);
+    stage = 'sync-database'; await invoke('scan_observe', { afterSync: true });
+    if (useStore.getState().historyRefreshKey !== 2 || useStore.getState().balanceRefreshKey !== 2) throw new Error('sync refresh');
     window.location.assign('https://wallet-scan.invalid/pass');
   } catch { window.location.assign(`https://wallet-scan.invalid/fail-${stage}`); }
 }

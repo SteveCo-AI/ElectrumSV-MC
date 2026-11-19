@@ -74,6 +74,13 @@ struct Account {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SyncAccount {
+    account_id: Option<i64>,
+    wallet_instance_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddressScan {
     account_id: i64,
     wallet_instance_token: String,
@@ -290,8 +297,8 @@ async fn dispatch_inner(
             output(crate::commands::network::disconnect_server_inner(state).await)
         }
         "sync_wallet" => {
-            let p: Account = parse(params)?;
-            output(crate::commands::network::sync_wallet_inner(state, p.account_id).await)
+            let p: SyncAccount = parse(params)?;
+            output(crate::commands::network::sync_wallet_with_token_inner(state, p.account_id, p.wallet_instance_token.as_deref()).await)
         }
         "scan_address_range" => {
             let p: AddressScan = parse(params)?;

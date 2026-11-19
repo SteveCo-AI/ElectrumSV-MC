@@ -18,7 +18,7 @@ struct Fixture { path: String, token: String, account: i64, histories: Arc<Atomi
 #[tauri::command]
 fn scan_identity(fixture: State<'_, Fixture>) -> Value { json!({"path":fixture.path,"token":fixture.token,"account":fixture.account}) }
 #[tauri::command]
-async fn scan_observe(state: State<'_, crate::state::AppState>, fixture: State<'_, Fixture>) -> Result<(), String> {
+async fn scan_observe(state: State<'_, crate::state::AppState>, fixture: State<'_, Fixture>, after_sync: bool) -> Result<(), String> {
     let pool = state.active_wallet.lock().unwrap().as_ref().ok_or("no wallet")?.db_pool.clone();
     let keys = crate::db::repositories::get_keyinstances_for_account(&pool, fixture.account).await.map_err(|e| e.to_string())?;
     let outputs = crate::db::repositories::get_utxos_for_account(&pool, fixture.account).await.map_err(|e| e.to_string())?;
@@ -26,8 +26,10 @@ async fn scan_observe(state: State<'_, crate::state::AppState>, fixture: State<'
         let key = keys.iter().find(|key| serde_json::from_slice::<Value>(&key.derivation_data).ok().is_some_and(|data| data["subpath"] == json!([chain,25]))).ok_or("missing derived key")?;
         if !outputs.iter().any(|output| output.keyinstance_id == key.keyinstance_id && output.value == 50_000 + chain) { return Err("missing output".into()); }
     }
-    if keys.len() != 2 || outputs.len() != 2 || fixture.histories.load(Ordering::SeqCst) != 54 { return Err("unexpected scan data or request count".into()); }
-    if crate::db::repositories::get_wallet_data(&pool, &format!("address_discovery_v1_{}", fixture.account)).await.map_err(|e| e.to_string())?.is_some() { return Err("discovery marker changed".into()); }
+    let histories = fixture.histories.load(Ordering::SeqCst);
+    if keys.len() != 2 || outputs.len() != 2 || (!after_sync && histories != 54) || (after_sync && histories <= 54) { return Err("unexpected scan data or request count".into()); }
+    let marker = crate::db::repositories::get_wallet_data(&pool, &format!("address_discovery_v1_{}", fixture.account)).await.map_err(|e| e.to_string())?;
+    if marker.as_deref() != if after_sync { Some("done") } else { None } { return Err("unexpected discovery marker".into()); }
     Ok(())
 }
 
@@ -61,7 +63,7 @@ fn real_wry_address_scan_with_local_tls() {
     let mut context = tauri::generate_context!(); context.config_mut().build.dev_url = None; context.config_mut().app.windows.clear(); context.set_assets(Box::new(ScanAssets(assets)));
     let setup_result = result.clone();
     let app = tauri::Builder::default().any_thread().manage(state).manage(Fixture { path: created.wallet_path, token: created.wallet_instance_token, account: created.account_id, histories })
-        .invoke_handler(tauri::generate_handler![scan_identity, scan_observe, crate::commands::network::get_network_info, crate::commands::network::get_servers, crate::commands::network::get_header_store_info, crate::commands::network::scan_address_range])
+        .invoke_handler(tauri::generate_handler![scan_identity, scan_observe, crate::commands::network::get_network_info, crate::commands::network::get_servers, crate::commands::network::get_header_store_info, crate::commands::network::scan_address_range, crate::commands::network::sync_wallet])
         .setup(move |app| {
             let handle = app.handle().clone(); let result = setup_result.clone();
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into())).title("Private scan test")
@@ -74,5 +76,5 @@ fn real_wry_address_scan_with_local_tls() {
         }).build(context).expect("build scan Wry host");
     let exit = app.run_return(|_, _| {}); server.abort();
     assert_eq!(exit, 0); assert_eq!(result.load(Ordering::SeqCst), 1);
-    println!("WRY_SCAN_PASS gui ipc local_tls two_branches persisted");
+    println!("WRY_SCAN_PASS gui ipc local_tls two_branches persisted bound_sync");
 }

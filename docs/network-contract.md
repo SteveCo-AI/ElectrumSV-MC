@@ -31,6 +31,10 @@ The opt-in scan queries the connected ElectrumX server for both P2PKH derivation
 
 The scan has a 120-second deadline before commit and a 64 MiB accepted matched JSON-RPC response-frame budget. One rejecting frame may already have been read, and notification and transport overhead are outside that budget. Cancellation, process failure or a lost response around commit can leave the caller uncertain whether the operation committed. Inspect the wallet before retrying; do not automatically retry.
 
+## Wallet synchronization identity
+
+The GUI passes the selected account and active wallet-instance token when starting normal synchronization. The backend checks the token when it captures the wallet and checks the same session again before committing. A stale result is not displayed in the GUI; a successful current result triggers history and balance refresh. The agent may optionally provide the token too. Existing callers that omit the token retain unbound startup behavior and may synchronize whichever wallet is active when their request starts; the token is not authentication. Synchronization still does not establish server completeness or consensus.
+
 ## Rust API compatibility
 
 This stage changes the public Rust API: `NetworkBackend` now requires `QueryTarget`, query and subscription arguments use typed targets, `NetworkError` adds `Unsupported`, and `BackendBalance::new` returns `Result`. External Rust callers and trait implementers may need changes; compatibility with downstream crates has not been verified. The wallet's Tauri and agent JSON contracts were not intentionally changed by this stage.

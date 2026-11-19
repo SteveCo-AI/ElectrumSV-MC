@@ -568,7 +568,7 @@ fn require_matching_scan_source(account_key: &ExtendedKey, source: &repositories
 pub async fn scan_address_range_inner(state: &AppState, account_id: i64, wallet_instance_token: &str, end_index_exclusive: u32) -> Result<ExplicitScanResult, String> {
     if !(1..=1000).contains(&end_index_exclusive) { return Err("end_index_exclusive must be between 1 and 1000".into()); }
     let deadline = tokio::time::Instant::now() + SCAN_TIMEOUT;
-    let (result, new_keys) = sync_wallet_impl(state, Some(account_id), Some((wallet_instance_token, end_index_exclusive, deadline))).await?;
+    let (result, new_keys) = sync_wallet_impl(state, Some(account_id), Some(wallet_instance_token), Some((end_index_exclusive, deadline))).await?;
     Ok(ExplicitScanResult { start_index: 0, end_index_exclusive, new_keys, server_host: result.server_host })
 }
 
@@ -586,20 +586,26 @@ pub async fn scan_address_range(
 pub async fn sync_wallet(
     state: State<'_, AppState>,
     account_id: Option<i64>,
+    wallet_instance_token: Option<String>,
 ) -> Result<SyncResult, String> {
-    sync_wallet_inner(&state, account_id).await
+    sync_wallet_with_token_inner(&state, account_id, wallet_instance_token.as_deref()).await
 }
 
 pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Result<SyncResult, String> {
-    Ok(sync_wallet_impl(state, account_id, None).await?.0)
+    sync_wallet_with_token_inner(state, account_id, None).await
 }
 
-async fn sync_wallet_impl(state: &AppState, account_id: Option<i64>, scan: Option<(&str,u32,tokio::time::Instant)>) -> Result<(SyncResult,usize), String> {
+pub async fn sync_wallet_with_token_inner(state: &AppState, account_id: Option<i64>, wallet_instance_token: Option<&str>) -> Result<SyncResult, String> {
+    if wallet_instance_token.is_some_and(str::is_empty) { return Err("wallet instance token is empty".into()); }
+    Ok(sync_wallet_impl(state, account_id, wallet_instance_token, None).await?.0)
+}
+
+async fn sync_wallet_impl(state: &AppState, account_id: Option<i64>, wallet_instance_token: Option<&str>, scan: Option<(u32,tokio::time::Instant)>) -> Result<(SyncResult,usize), String> {
     // Serialize synchronization across wallets; no state mutex is held over network I/O.
-    let deadline = scan.map(|(_,_,deadline)| deadline);
+    let deadline = scan.map(|(_,deadline)| deadline);
     let response_budget = scan.map(|_| std::sync::Arc::new(ScanResponseBudget::new(64 * 1024 * 1024)));
     let _sync_guard = bounded(deadline, async { Ok(SYNC_LOCK.lock().await) }).await?;
-    let context_guard = if scan.is_some() { Some(bounded(deadline, async { Ok(state.wallet_operation.lock().await) }).await?) } else { None };
+    let context_guard = if wallet_instance_token.is_some() { Some(bounded(deadline, async { Ok(state.wallet_operation.lock().await) }).await?) } else { None };
     // 1. Extract client from network state (without holding lock across awaits)
     let client = {
         let net = state.network.lock().unwrap();
@@ -615,7 +621,7 @@ async fn sync_wallet_impl(state: &AppState, account_id: Option<i64>, scan: Optio
     let (pool, default_acct_id, xprv_opt, wallet_path, wallet_instance) = {
         let guard = state.active_wallet.lock().unwrap();
         let active = guard.as_ref().ok_or("no wallet is currently open")?;
-        if scan.is_some_and(|(token,_,_)| token != active.instance_token) { return Err("active wallet token changed".into()); }
+        if wallet_instance_token.is_some_and(|token| token != active.instance_token) { return Err("active wallet token changed".into()); }
         (
             active.db_pool.clone(),
             active.account_id,
@@ -646,11 +652,11 @@ async fn sync_wallet_impl(state: &AppState, account_id: Option<i64>, scan: Optio
             else { repositories::get_keyinstances_for_account(&pool, acct_id).await };
         result.map_err(|e| format!("failed to load keyinstances: {e}"))
     }).await?;
-    if let Some((_,end,scan_deadline)) = scan {
+    if let Some((end,scan_deadline)) = scan {
         repositories::validate_scan_inventory(source.as_ref().ok_or("missing scan derivation source")?, &expected_keys, &[], end, scan_deadline)
             .map_err(|e| format!("unsupported scan inventory: {e}"))?;
     }
-    let (discovered, discovery_history_count) = if let Some((_, end, scan_deadline)) = scan {
+    let (discovered, discovery_history_count) = if let Some((end, scan_deadline)) = scan {
         let budget = response_budget.as_ref().ok_or("missing scan response budget")?;
         let (found,count) = bounded(deadline, discover_explicit_range(&client, &account_key, &expected_keys, end, scan_deadline, budget)).await?;
         (Some(found),count)
@@ -852,8 +858,8 @@ async fn sync_wallet_impl(state: &AppState, account_id: Option<i64>, scan: Optio
     })).await?;
 
     let _wallet_guard = bounded(deadline, async { Ok(state.wallet_operation.lock().await) }).await?;
-    require_scan_wallet_session(state, &wallet_instance, acct_id, scan.map(|(token,_,_)| token))?;
-    if let Some((_,end,deadline)) = scan {
+    require_scan_wallet_session(state, &wallet_instance, acct_id, wallet_instance_token)?;
+    if let Some((end,deadline)) = scan {
         repositories::merge_explicit_scan_snapshot(&pool, acct_id, &expected_keys, source.as_ref().ok_or("missing scan derivation source")?, discovered.as_deref().unwrap_or(&[]), &snapshots, end, deadline)
             .await.map_err(|e| format!("failed to merge scan snapshot: {e}"))?;
     } else {

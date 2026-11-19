@@ -252,8 +252,8 @@ export const api = {
     invoke<any>('connect_server', { host, port }),
   disconnectServer: () =>
     invoke<any>('disconnect_server'),
-  syncWallet: () =>
-    invoke<any>('sync_wallet'),
+  syncWallet: (accountId: number, walletInstanceToken: string) =>
+    invoke<{ server_host: string; account_id: number; synced: boolean; message: string }>('sync_wallet', { accountId, walletInstanceToken }),
   scanAddressRange: (accountId: number, walletInstanceToken: string, endIndexExclusive: number) =>
     invoke<{ start_index: number; end_index_exclusive: number; new_keys: number; server_host: string }>(
       'scan_address_range', { accountId, walletInstanceToken, endIndexExclusive }

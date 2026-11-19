@@ -25,8 +25,10 @@ export function NetworkView() {
     context.current = { wallet: activeWalletPath, token: walletInstanceToken, account: activeAccountId, generation: context.current.generation + 1 };
   }
   const scanInFlight = useRef(false);
+  const syncInFlight = useRef(false);
   const [scanEnd, setScanEnd] = useState('100');
   const [scanMessage, setScanMessage] = useState<{ generation: number; text: string; error: boolean } | null>(null);
+  const [syncMessage, setSyncMessage] = useState<{ generation: number; text: string; error: boolean } | null>(null);
   const [info, setInfo] = useState<any>(null);
   const [servers, setServers] = useState<any[]>([]);
   const [networks, setNetworks] = useState<{ id: string; name: string }[]>([]);
@@ -94,15 +96,34 @@ export function NetworkView() {
   };
 
   const handleSyncWallet = async () => {
+    if (syncInFlight.current || !activeWalletPath || !walletInstanceToken || activeAccountId === null) return;
+    const generation = context.current.generation;
+    const isCurrent = () => {
+      const current = useStore.getState();
+      return context.current.generation === generation && current.activeWalletPath === activeWalletPath &&
+        current.walletInstanceToken === walletInstanceToken && current.activeAccountId === activeAccountId;
+    };
+    syncInFlight.current = true;
     setSyncing(true);
     setError(null);
+    setSuccess(null);
+    setSyncMessage(null);
     try {
-      const result = await api.syncWallet();
+      const result = await api.syncWallet(activeAccountId, walletInstanceToken);
+      if (!isCurrent()) return;
+      if (!result || result.account_id !== activeAccountId || typeof result.synced !== 'boolean' ||
+          typeof result.server_host !== 'string' || !result.server_host.trim() ||
+          typeof result.message !== 'string' || !result.message.trim()) throw new Error('Invalid sync response');
       if (!result.synced) throw new Error(result.message);
-      setSuccess(result.message);
-    } catch (e: any) {
-      setError(e.message || 'Sync failed');
+      triggerHistoryRefresh();
+      triggerBalanceRefresh();
+      setSyncMessage({ generation, text: result.message, error: false });
+    } catch (e: unknown) {
+      if (!isCurrent()) return;
+      const message = typeof e === 'string' ? e : e instanceof Error ? e.message : 'Sync failed';
+      setSyncMessage({ generation, text: message, error: true });
     } finally {
+      syncInFlight.current = false;
       setSyncing(false);
     }
   };
@@ -223,7 +244,7 @@ export function NetworkView() {
           <div className="flex gap-2 mt-3">
             <button
               onClick={handleSyncWallet}
-              disabled={syncing || connecting}
+              disabled={syncing || connecting || !info?.connected || !activeWalletPath || !walletInstanceToken || activeAccountId === null}
               className="bg-accent hover:bg-accent-hover text-white rounded-lg px-3 py-1.5 text-xs font-medium disabled:opacity-50 transition-colors"
             >
               {syncing ? 'Syncing…' : 'Sync Wallet'}
@@ -245,6 +266,7 @@ export function NetworkView() {
               </button>
             )}
           </div>
+          {syncMessage?.generation === context.current.generation && <div role="status" className={`text-xs mt-2 ${syncMessage.error ? 'text-danger' : 'text-success'}`}>{syncMessage.text}</div>}
           {headerProgress && (
             <div role="status" className="text-xs text-gray-400 mt-2">
               <div>Stored header tip: {headerProgress.new_tip}; server-reported tip: {headerProgress.server_tip}.</div>

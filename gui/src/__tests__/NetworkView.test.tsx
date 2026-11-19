@@ -4,7 +4,7 @@ import { NetworkView } from '../views/NetworkView';
 import { useStore } from '../store';
 
 vi.mock('../api', () => ({ api: {
-  getNetworkInfo: vi.fn(), getServers: vi.fn(), listNetworks: vi.fn(), getHeaderStoreInfo: vi.fn(), syncHeaders: vi.fn(), scanAddressRange: vi.fn(),
+  getNetworkInfo: vi.fn(), getServers: vi.fn(), listNetworks: vi.fn(), getHeaderStoreInfo: vi.fn(), syncHeaders: vi.fn(), syncWallet: vi.fn(), scanAddressRange: vi.fn(),
 } }));
 import { api } from '../api';
 
@@ -15,6 +15,50 @@ beforeEach(() => {
   vi.mocked(api.getServers).mockResolvedValue([]);
   vi.mocked(api.listNetworks).mockResolvedValue([]);
   vi.mocked(api.getHeaderStoreInfo).mockResolvedValue({ header_count: 3, tip_height: 2 });
+});
+
+describe('wallet synchronization', () => {
+  beforeEach(() => {
+    useStore.setState({ activeWalletPath: '/wallet', walletInstanceToken: 'instance', activeAccountId: 3 });
+    vi.mocked(api.getNetworkInfo).mockResolvedValue({ connected: true } as any);
+  });
+
+  it('binds sync to the wallet session and refreshes wallet data on success', async () => {
+    vi.mocked(api.syncWallet).mockResolvedValue({ synced: true, account_id: 3, server_host: 'test-server', message: 'Sync complete' });
+    render(<NetworkView />);
+    await screen.findByText(/Connected —/);
+    fireEvent.click(screen.getByText('Sync Wallet'));
+    await screen.findByText('Sync complete');
+    expect(api.syncWallet).toHaveBeenCalledWith(3, 'instance');
+    expect(useStore.getState().historyRefreshKey).toBe(1);
+    expect(useStore.getState().balanceRefreshKey).toBe(1);
+  });
+
+  it('ignores a result from an earlier wallet instance', async () => {
+    let finish!: (value: any) => void;
+    vi.mocked(api.syncWallet).mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    render(<NetworkView />);
+    await screen.findByText(/Connected —/);
+    fireEvent.click(screen.getByText('Sync Wallet'));
+    act(() => useStore.setState({ walletInstanceToken: 'new-instance' }));
+    await act(async () => finish({ synced: true, account_id: 3, server_host: 'test-server', message: 'Sync complete' }));
+    expect(screen.queryByText('Sync complete')).not.toBeInTheDocument();
+    expect(useStore.getState().historyRefreshKey).toBe(0);
+    expect(useStore.getState().balanceRefreshKey).toBe(0);
+  });
+
+  it('reports the actual error without keeping an earlier success', async () => {
+    vi.mocked(api.syncWallet).mockResolvedValueOnce({ synced: true, account_id: 3, server_host: 'test-server', message: 'Sync complete' })
+      .mockRejectedValueOnce('wallet changed');
+    render(<NetworkView />);
+    await screen.findByText(/Connected —/);
+    fireEvent.click(screen.getByText('Sync Wallet'));
+    await screen.findByText('Sync complete');
+    fireEvent.click(screen.getByText('Sync Wallet'));
+    await screen.findByText('wallet changed');
+    expect(screen.queryByText('Sync complete')).not.toBeInTheDocument();
+    expect(useStore.getState().historyRefreshKey).toBe(1);
+  });
 });
 
 describe('explicit address discovery', () => {

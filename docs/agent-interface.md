@@ -66,7 +66,7 @@ Die Kommunikation erfolgt über stdin und stdout als JSON-RPC-2.0-Objekte, jewei
 | `verify_totp` | `code` | Mit Zahlungsfreigabe aktuellen TOTP-Code prüfen. |
 | `connect_server` | `host`, `port` | Mit Netzwerkfreigabe explizit zum angegebenen ElectrumX-TLS-Ziel verbinden. |
 | `disconnect_server` | keine | Mit Netzwerkfreigabe Verbindung trennen. |
-| `sync_wallet` | optional `account_id` | Mit Netzwerkfreigabe aktuelle Wallet über die bestehende Verbindung synchronisieren. |
+| `sync_wallet` | optional `account_id`, `wallet_instance_token` | With network capability, synchronize over the existing connection. Supplying the token from `get_wallet_status` binds the request to that wallet instance; an old token is rejected. Existing callers may omit it and retain the previous unbound behavior. The token is an instance identifier, not authentication. |
 | `scan_address_range` | `account_id`, `wallet_instance_token`, `end_index_exclusive` | With network capability, explicitly scan both branches from index zero to the exclusive end (1–1000) using the connected ElectrumX server. The current wallet token is returned by `get_wallet_status`. A lost response around commit leaves the outcome unknown; inspect the wallet before retrying. The server sees queried script hashes and may return incomplete data. |
 | `prepare_tx` | `outputs` mit `address` und `satoshis`, `fee_rate`; optional `op_return_data`, `strategy` | Mit Zahlungsfreigabe Plan vorbereiten und Inputs reservieren; Fee-Rate in sat/Byte ist ausdrücklich anzugeben. |
 | `sign_tx` | `plan_id`, `totp_code` | Mit Zahlungsfreigabe und gültigem TOTP denselben Plan wie in der GUI signieren; sendet ihn nicht. |

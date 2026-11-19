@@ -325,7 +325,10 @@ async fn agent_tls_synthetic_negative_key_and_discovery_sync() {
     let history_requests = Arc::new(AtomicUsize::new(0));
     let (port, server_task) = server(CERT, target, funding.to_hex().unwrap(), txid.clone(), Arc::new(AtomicBool::new(false)), sent.clone(), Some(history_requests.clone())).await;
     dispatch_inner(&state, caps, "connect_server", json!({"host":"127.0.0.1","port":port}), Some(roots())).await.unwrap();
-    assert_eq!(call("sync_wallet", json!({"account_id":account})).await.unwrap()["synced"], true);
+    let token = created["wallet_instance_token"].as_str().unwrap();
+    assert!(call("sync_wallet", json!({"account_id":account,"wallet_instance_token":"wrong"})).await.unwrap_err().1.contains("token changed"));
+    assert_eq!(history_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(call("sync_wallet", json!({"account_id":account,"wallet_instance_token":token})).await.unwrap()["synced"], true);
     let keys = repositories::get_keyinstances_for_account(&pool, account).await.unwrap();
     assert!(keys.iter().any(|key| key.keyinstance_id == -1));
     let discovered = keys.iter().find(|key| serde_json::from_slice::<Value>(&key.derivation_data).unwrap()["subpath"] == json!([0,1])).unwrap();
@@ -351,9 +354,16 @@ async fn agent_tls_synthetic_negative_key_and_discovery_sync() {
     assert_eq!(call("get_history", json!({"account_id":account})).await.unwrap(), history);
     assert_eq!(repositories::get_wallet_data(&pool, &format!("address_discovery_v1_{account}")).await.unwrap().as_deref(), Some("done"));
     assert!(!sent.load(Ordering::SeqCst));
+    drop(pool);
+    call("close_wallet", json!({})).await.unwrap();
+    let reopened = call("open_wallet", json!({"wallet_path":"synthetic"})).await.unwrap();
+    let history_before_stale = history_requests.load(Ordering::SeqCst);
+    assert!(call("sync_wallet", json!({"account_id":account,"wallet_instance_token":token})).await.unwrap_err().1.contains("token changed"));
+    assert_eq!(history_requests.load(Ordering::SeqCst), history_before_stale);
+    call("unlock_wallet", json!({"password":"pw"})).await.unwrap();
+    assert_eq!(call("sync_wallet", json!({"account_id":account,"wallet_instance_token":reopened["wallet_instance_token"]})).await.unwrap()["synced"], true);
     call("disconnect_server", json!({})).await.unwrap();
     server_task.abort();
-    drop(pool);
     call("close_wallet", json!({})).await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
