@@ -35,6 +35,8 @@ The scan has a 120-second deadline before commit and a 64 MiB accepted matched J
 
 The GUI passes the selected account and active wallet-instance token when starting normal synchronization. The backend checks the token when it captures the wallet and checks the same session again before committing. A stale result is not displayed in the GUI; a successful current result triggers history and balance refresh. The agent may optionally provide the token too. Existing callers that omit the token retain unbound startup behavior and may synchronize whichever wallet is active when their request starts; the token is not authentication. Synchronization still does not establish server completeness or consensus.
 
+When an account has no stored keys and the initial discovery actually completes without reported activity, normal sync returns success with a bounded-search warning. It leaves the discovery marker absent so another normal sync repeats discovery. If a marker already exists and there are no stored keys, it reports non-success without claiming to have searched. A wallet or key change during the empty search and a server error abort the result. The final key recheck guards in-process operations; it does not guarantee against arbitrary external database changes or ABA races.
+
 ## Rust API compatibility
 
 This stage changes the public Rust API: `NetworkBackend` now requires `QueryTarget`, query and subscription arguments use typed targets, `NetworkError` adds `Unsupported`, and `BackendBalance::new` returns `Result`. External Rust callers and trait implementers may need changes; compatibility with downstream crates has not been verified. The wallet's Tauri and agent JSON contracts were not intentionally changed by this stage.

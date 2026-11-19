@@ -674,12 +674,22 @@ async fn sync_wallet_impl(state: &AppState, account_id: Option<i64>, wallet_inst
     }
 
     if key_instances.is_empty() && scan.is_none() {
-        log::warn!("sync_wallet: no keyinstances found for account {} — generating initial receiving addresses", acct_id);
+        let _wallet_guard = state.wallet_operation.lock().await;
+        require_scan_wallet_session(state, &wallet_instance, acct_id, wallet_instance_token)?;
+        if !repositories::get_keyinstances_for_account(&pool, acct_id).await.map_err(|e| format!("failed to reload keyinstances: {e}"))?.is_empty() {
+            return Err("account keys changed during synchronization".into());
+        }
+        let searched = discovered.is_some();
+        let message = if searched {
+            "No activity was reported for the first 20 addresses on each branch. Server data may be incomplete; create a receiving address or use extended discovery. This search will be repeated on the next sync."
+        } else {
+            "No stored addresses and discovery was already marked complete. Create a receiving address or use extended discovery."
+        };
         return Ok((SyncResult {
             server_host: client.server_host(),
             account_id: acct_id,
-            synced: false,
-            message: "no keyinstances found — generate receive addresses first".to_string(),
+            synced: searched,
+            message: message.to_string(),
         },new_keys));
     }
 

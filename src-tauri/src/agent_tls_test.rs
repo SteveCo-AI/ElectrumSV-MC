@@ -117,6 +117,96 @@ pub(crate) async fn scan_server(targets: std::collections::HashMap<String, (Stri
 }
 
 #[tokio::test]
+async fn agent_tls_empty_wallet_sync_and_address_lifecycle() {
+    use crate::db::repositories;
+    let dir = std::env::temp_dir().join(format!("electrumsv-empty-sync-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut state = AppState::new();
+    state.data_dir = dir.to_str().unwrap().into();
+    let caps = Capabilities { network: true, ..Default::default() };
+    let call = |method, params| dispatch_inner(&state, caps, method, params, None);
+    let created = call("create_wallet", json!({"name":"synthetic","password":"pw","mnemonic":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"})).await.unwrap();
+    let account = created["account_id"].as_i64().unwrap();
+    let token = created["wallet_instance_token"].as_str().unwrap();
+    let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+    let histories = Arc::new(AtomicUsize::new(0));
+    let (port, server_task) = scan_server(std::collections::HashMap::new(), histories.clone(), None, false).await;
+    dispatch_inner(&state, caps, "connect_server", json!({"host":"127.0.0.1","port":port}), Some(roots())).await.unwrap();
+    let marker = format!("address_discovery_v1_{account}");
+    sqlx::query("INSERT INTO WalletData(key,value,date_created,date_updated) VALUES (?,'done',1,1)").bind(&marker).execute(&pool).await.unwrap();
+    let marked = call("sync_wallet",json!({"account_id":account,"wallet_instance_token":token})).await.unwrap();
+    assert_eq!(marked["synced"],false);
+    assert!(marked["message"].as_str().unwrap().contains("already marked complete"));
+    assert_eq!(histories.load(Ordering::SeqCst),0);
+    sqlx::query("DELETE FROM WalletData WHERE key=?").bind(&marker).execute(&pool).await.unwrap();
+    let result = call("sync_wallet",json!({"account_id":account,"wallet_instance_token":token})).await.unwrap();
+    assert_eq!(result["synced"], true);
+    assert!(result["message"].as_str().unwrap().contains("No activity"));
+    assert_eq!(histories.load(Ordering::SeqCst),40);
+    assert!(repositories::get_keyinstances_for_account(&pool,account).await.unwrap().is_empty());
+    assert!(repositories::get_wallet_data(&pool,&marker).await.unwrap().is_none());
+    assert_eq!(call("get_balance",json!({"account_id":account})).await.unwrap()["total"],0);
+    let second = call("sync_wallet",json!({"account_id":account,"wallet_instance_token":token})).await.unwrap();
+    assert_eq!(second["synced"],true);
+    assert_eq!(histories.load(Ordering::SeqCst),80);
+    assert!(repositories::get_wallet_data(&pool,&marker).await.unwrap().is_none());
+    let address = call("get_receive_address",json!({"account_id":account})).await.unwrap();
+    assert_eq!(address["derivation_index"],0);
+    assert_eq!(call("sync_wallet",json!({"account_id":account,"wallet_instance_token":token})).await.unwrap()["synced"],true);
+    assert_eq!(repositories::get_keyinstances_for_account(&pool,account).await.unwrap().len(),1);
+    assert_eq!(repositories::get_wallet_data(&pool,&marker).await.unwrap().as_deref(),Some("done"));
+    call("disconnect_server",json!({})).await.unwrap();
+    server_task.abort();
+    drop(pool);
+    call("close_wallet",json!({})).await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn agent_tls_empty_wallet_sync_rejects_changed_wallet_key_and_server_failure() {
+    use crate::db::repositories;
+    for case in ["reopen", "new_key", "server_eof"] {
+        let dir = std::env::temp_dir().join(format!("electrumsv-empty-race-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = AppState::new(); state.data_dir = dir.to_str().unwrap().into();
+        let caps = Capabilities { network: true, ..Default::default() };
+        let call = |method, params| dispatch_inner(&state, caps, method, params, None);
+        let created = call("create_wallet", json!({"name":"synthetic","password":"pw","mnemonic":"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"})).await.unwrap();
+        let account = created["account_id"].as_i64().unwrap();
+        let token = created["wallet_instance_token"].as_str().unwrap();
+        let (started_tx,started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx,resume_rx) = tokio::sync::oneshot::channel();
+        let (port,server_task) = scan_server(std::collections::HashMap::new(), Arc::new(AtomicUsize::new(0)), Some((started_tx,resume_rx)), false).await;
+        dispatch_inner(&state,caps,"connect_server",json!({"host":"127.0.0.1","port":port}),Some(roots())).await.unwrap();
+        let sync = crate::commands::network::sync_wallet_with_token_inner(&state,Some(account),Some(token));
+        tokio::pin!(sync);
+        tokio::select! { result = &mut sync => panic!("sync finished before barrier: {result:?}"), _ = started_rx => {} }
+        match case {
+            "reopen" => {
+                call("close_wallet",json!({})).await.unwrap();
+                call("open_wallet",json!({"wallet_path":"synthetic"})).await.unwrap();
+                resume_tx.send(()).unwrap();
+            }
+            "new_key" => {
+                call("get_receive_address",json!({"account_id":account})).await.unwrap();
+                resume_tx.send(()).unwrap();
+            }
+            _ => { server_task.abort(); drop(resume_tx); }
+        }
+        let error = sync.await.unwrap_err();
+        assert!(error.contains(match case { "reopen" => "active wallet changed", "new_key" => "account keys changed", _ => "address discovery failed" }), "{case}: {error}");
+        let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+        assert_eq!(repositories::get_keyinstances_for_account(&pool,account).await.unwrap().len(),usize::from(case == "new_key"));
+        assert!(repositories::get_wallet_data(&pool,&format!("address_discovery_v1_{account}")).await.unwrap().is_none());
+        assert!(repositories::get_utxos_for_account(&pool,account).await.unwrap().is_empty());
+        call("disconnect_server",json!({})).await.unwrap();
+        server_task.abort(); drop(pool);
+        call("close_wallet",json!({})).await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn agent_tls_explicit_scan_both_branches_preserves_marker() {
     use bsv::compat::bip32::ExtendedKey;
     use crate::db::repositories;

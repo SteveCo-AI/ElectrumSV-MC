@@ -18,18 +18,23 @@ struct Fixture { path: String, token: String, account: i64, histories: Arc<Atomi
 #[tauri::command]
 fn scan_identity(fixture: State<'_, Fixture>) -> Value { json!({"path":fixture.path,"token":fixture.token,"account":fixture.account}) }
 #[tauri::command]
-async fn scan_observe(state: State<'_, crate::state::AppState>, fixture: State<'_, Fixture>, after_sync: bool) -> Result<(), String> {
+async fn scan_observe(state: State<'_, crate::state::AppState>, fixture: State<'_, Fixture>, stage: u8) -> Result<(), String> {
     let pool = state.active_wallet.lock().unwrap().as_ref().ok_or("no wallet")?.db_pool.clone();
     let keys = crate::db::repositories::get_keyinstances_for_account(&pool, fixture.account).await.map_err(|e| e.to_string())?;
     let outputs = crate::db::repositories::get_utxos_for_account(&pool, fixture.account).await.map_err(|e| e.to_string())?;
-    for chain in 0..=1 {
-        let key = keys.iter().find(|key| serde_json::from_slice::<Value>(&key.derivation_data).ok().is_some_and(|data| data["subpath"] == json!([chain,25]))).ok_or("missing derived key")?;
-        if !outputs.iter().any(|output| output.keyinstance_id == key.keyinstance_id && output.value == 50_000 + chain) { return Err("missing output".into()); }
+    if stage > 0 {
+        for chain in 0..=1 {
+            let key = keys.iter().find(|key| serde_json::from_slice::<Value>(&key.derivation_data).ok().is_some_and(|data| data["subpath"] == json!([chain,25]))).ok_or("missing derived key")?;
+            if !outputs.iter().any(|output| output.keyinstance_id == key.keyinstance_id && output.value == 50_000 + chain) { return Err("missing output".into()); }
+        }
     }
     let histories = fixture.histories.load(Ordering::SeqCst);
-    if keys.len() != 2 || outputs.len() != 2 || (!after_sync && histories != 54) || (after_sync && histories <= 54) { return Err("unexpected scan data or request count".into()); }
+    let valid = match stage { 0 => keys.is_empty() && outputs.is_empty() && histories == 40,
+        1 => keys.len() == 2 && outputs.len() == 2 && histories == 94,
+        2 => keys.len() == 2 && outputs.len() == 2 && histories > 94, _ => false };
+    if !valid { return Err("unexpected scan data or request count".into()); }
     let marker = crate::db::repositories::get_wallet_data(&pool, &format!("address_discovery_v1_{}", fixture.account)).await.map_err(|e| e.to_string())?;
-    if marker.as_deref() != if after_sync { Some("done") } else { None } { return Err("unexpected discovery marker".into()); }
+    if marker.as_deref() != if stage == 2 { Some("done") } else { None } { return Err("unexpected discovery marker".into()); }
     Ok(())
 }
 
@@ -76,5 +81,5 @@ fn real_wry_address_scan_with_local_tls() {
         }).build(context).expect("build scan Wry host");
     let exit = app.run_return(|_, _| {}); server.abort();
     assert_eq!(exit, 0); assert_eq!(result.load(Ordering::SeqCst), 1);
-    println!("WRY_SCAN_PASS gui ipc local_tls two_branches persisted bound_sync");
+    println!("WRY_SCAN_PASS empty_sync extended_discovery bound_sync persisted");
 }
