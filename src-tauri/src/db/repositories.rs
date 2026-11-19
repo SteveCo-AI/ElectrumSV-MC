@@ -244,6 +244,21 @@ pub async fn get_keyinstance_counts(
     Ok((receiving, change))
 }
 
+pub async fn next_keyinstance_index(pool: &SqlitePool, account_id: i64, chain: i64) -> anyhow::Result<i64> {
+    let keys = get_keyinstances_for_account(pool, account_id).await?;
+    let mut next = 0;
+    for key in keys {
+        if key.derivation_type != derivation_type::BIP32 { continue; }
+        let json: serde_json::Value = serde_json::from_slice(&key.derivation_data)?;
+        let path = json.get("subpath").and_then(|v| v.as_array()).ok_or_else(|| anyhow::anyhow!("invalid key path"))?;
+        if path.first().and_then(|v| v.as_i64()) == Some(chain) {
+            let index = path.get(1).and_then(|v| v.as_i64()).filter(|i| *i >= 0).ok_or_else(|| anyhow::anyhow!("invalid key index"))?;
+            next = next.max(index.checked_add(1).ok_or_else(|| anyhow::anyhow!("key index overflow"))?);
+        }
+    }
+    Ok(next)
+}
+
 // ============================================================================
 // TransactionOutput queries (Milestone 3)
 // ============================================================================
@@ -335,7 +350,7 @@ pub struct TxDeltaHistoryRow {
     /// Display hex txid (reversed byte order, AUD-014 fix)
     pub tx_hash_hex: String,
     /// Net value delta for this account (sum of deltas)
-    pub value_delta: i64,
+    pub value_delta: Option<i64>,
     /// Transaction creation timestamp
     pub date_created: i64,
     /// Block height (None = unconfirmed)
@@ -355,8 +370,8 @@ pub async fn get_tx_history_for_account(
     offset: i64,
 ) -> anyhow::Result<Vec<TxDeltaHistoryRow>> {
     // First get the raw deltas joined with transactions
-    let rows: Vec<(Vec<u8>, i64, i64, Option<i64>, Option<String>)> = sqlx::query_as(
-        "SELECT td.tx_hash, SUM(td.value_delta) as value_delta, \
+    let rows: Vec<(Vec<u8>, Option<i64>, i64, Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT td.tx_hash, CASE WHEN MIN(td.value_known) = 1 THEN SUM(td.value_delta) ELSE NULL END as value_delta, \
          MIN(tx.date_created) as date_created, \
          tx.block_height, tx.description \
          FROM TransactionDeltas td \
@@ -529,10 +544,10 @@ pub async fn upsert_transaction_delta(
     let now = chrono::Utc::now().timestamp();
 
     sqlx::query(
-        "INSERT INTO TransactionDeltas (keyinstance_id, tx_hash, value_delta, date_created, date_updated) \
-         VALUES (?, ?, ?, ?, ?) \
+        "INSERT INTO TransactionDeltas (keyinstance_id, tx_hash, value_delta, date_created, date_updated, value_known) \
+         VALUES (?, ?, ?, ?, ?, 1) \
          ON CONFLICT(keyinstance_id, tx_hash) DO UPDATE SET \
-            value_delta = excluded.value_delta, \
+            value_delta = excluded.value_delta, value_known = 1, \
             date_updated = excluded.date_updated",
     )
     .bind(keyinstance_id)
@@ -601,6 +616,109 @@ pub async fn get_outputs_for_keyinstances(
 
     let rows = query.fetch_all(pool).await?;
     Ok(rows)
+}
+
+pub struct SyncTransaction {
+    pub hash: Vec<u8>,
+    pub height: Option<i64>,
+    pub raw: std::sync::Arc<[u8]>,
+    pub delta: Option<i64>,
+}
+pub struct SyncOutput {
+    pub hash: Vec<u8>,
+    pub height: Option<i64>,
+    pub index: i64,
+    pub value: i64,
+    pub coinbase: bool,
+    pub script_pubkey: String,
+}
+pub struct SyncKeySnapshot {
+    // Newly discovered keys have temporary negative IDs, in discovery order.
+    pub key_id: i64,
+    pub transactions: Vec<SyncTransaction>,
+    pub outputs: Vec<SyncOutput>,
+}
+
+/// Atomically replace one account's previously fetched and validated sync snapshot.
+pub async fn replace_sync_snapshot(
+    pool: &SqlitePool, account_id: i64, expected_keys: &[KeyInstanceRow],
+    discovered: Option<&[(u64, u64)]>, snapshots: &[SyncKeySnapshot],
+) -> anyhow::Result<()> {
+    let expected_ids: std::collections::HashSet<i64> = expected_keys.iter().map(|key| key.keyinstance_id)
+        .chain((0..discovered.map_or(0, |paths| paths.len())).map(|i| -(i as i64) - 1)).collect();
+    let snapshot_ids: std::collections::HashSet<i64> = snapshots.iter().map(|snapshot| snapshot.key_id).collect();
+    if expected_ids.len() != expected_keys.len() + discovered.map_or(0, |paths| paths.len()) ||
+        snapshot_ids.len() != snapshots.len() || snapshot_ids != expected_ids {
+        anyhow::bail!("snapshot must contain every account key exactly once");
+    }
+    let mut tx = pool.begin().await?;
+    let current = sqlx::query_as::<_, KeyInstanceRow>(
+        "SELECT * FROM KeyInstances WHERE account_id = ? ORDER BY keyinstance_id")
+        .bind(account_id).fetch_all(&mut *tx).await?;
+    if current.len() != expected_keys.len() || current.iter().zip(expected_keys).any(|(a, b)|
+        a.keyinstance_id != b.keyinstance_id || a.derivation_type != b.derivation_type ||
+        a.derivation_data != b.derivation_data || a.masterkey_id != b.masterkey_id || a.script_type != b.script_type) {
+        anyhow::bail!("account keys changed during synchronization");
+    }
+    let now = chrono::Utc::now().timestamp();
+    let mut new_ids = Vec::new();
+    if let Some(paths) = discovered {
+        let master: (i64,) = sqlx::query_as("SELECT default_masterkey_id FROM Accounts WHERE account_id = ? AND default_masterkey_id IS NOT NULL")
+            .bind(account_id).fetch_one(&mut *tx).await?;
+        for (chain, index) in paths {
+            let data = serde_json::json!({"subpath": [chain, index]}).to_string().into_bytes();
+            let inserted = sqlx::query("INSERT INTO KeyInstances (account_id, masterkey_id, derivation_type, derivation_data, script_type, flags, description, date_created, date_updated) VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?)")
+                .bind(account_id).bind(master.0).bind(derivation_type::BIP32).bind(data).bind(script_type::P2PKH).bind(now).bind(now)
+                .execute(&mut *tx).await?;
+            new_ids.push(inserted.last_insert_rowid());
+        }
+        let marker = format!("address_discovery_v1_{account_id}");
+        sqlx::query("INSERT INTO WalletData (key, value, date_created, date_updated) VALUES (?, 'done', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, date_updated = excluded.date_updated")
+            .bind(marker).bind(now).bind(now).execute(&mut *tx).await?;
+    }
+    // Reject ownership conflicts before deleting any existing account outputs.
+    for snapshot in snapshots {
+        let id = if snapshot.key_id < 0 {
+            *new_ids.get((-snapshot.key_id - 1) as usize).ok_or_else(|| anyhow::anyhow!("invalid discovered key"))?
+        } else { snapshot.key_id };
+        for output in &snapshot.outputs {
+            let owner: Option<(i64,)> = sqlx::query_as("SELECT keyinstance_id FROM TransactionOutputs WHERE tx_hash = ? AND tx_index = ?")
+                .bind(&output.hash).bind(output.index).fetch_optional(&mut *tx).await?;
+            if owner.is_some_and(|owner| owner.0 != id) {
+                anyhow::bail!("UTXO belongs to a different keyinstance");
+            }
+        }
+    }
+    for snapshot in snapshots {
+        let id = if snapshot.key_id < 0 {
+            *new_ids.get((-snapshot.key_id - 1) as usize).ok_or_else(|| anyhow::anyhow!("invalid discovered key"))?
+        } else { snapshot.key_id };
+        if snapshot.key_id >= 0 && !expected_keys.iter().any(|key| key.keyinstance_id == id) {
+            anyhow::bail!("snapshot key does not belong to account");
+        }
+        sqlx::query("DELETE FROM TransactionOutputs WHERE keyinstance_id = ?").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM TransactionDeltas WHERE keyinstance_id = ?").bind(id).execute(&mut *tx).await?;
+        for item in &snapshot.transactions {
+            sync_upsert_transaction(&mut tx, &item.hash, item.height, Some(item.raw.as_ref()), now).await?;
+            sqlx::query("INSERT INTO TransactionDeltas (keyinstance_id, tx_hash, value_delta, date_created, date_updated, value_known) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(keyinstance_id, tx_hash) DO UPDATE SET value_delta = excluded.value_delta, value_known = excluded.value_known, date_updated = excluded.date_updated")
+                .bind(id).bind(&item.hash).bind(item.delta.unwrap_or(0)).bind(now).bind(now).bind(i32::from(item.delta.is_some())).execute(&mut *tx).await?;
+        }
+        for output in &snapshot.outputs {
+            sync_upsert_transaction(&mut tx, &output.hash, output.height, None, now).await?;
+            let flags = if output.coinbase { txo_flags::IS_COINBASE } else { 0 };
+            sqlx::query("INSERT INTO TransactionOutputs (tx_hash, tx_index, value, keyinstance_id, flags, script_pubkey, date_created, date_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tx_hash, tx_index) DO UPDATE SET value = excluded.value, flags = excluded.flags, script_pubkey = excluded.script_pubkey, date_updated = excluded.date_updated")
+                .bind(&output.hash).bind(output.index).bind(output.value).bind(id).bind(flags).bind(&output.script_pubkey).bind(now).bind(now).execute(&mut *tx).await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn sync_upsert_transaction(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, hash: &[u8], height: Option<i64>, raw: Option<&[u8]>, now: i64) -> anyhow::Result<()> {
+    let flags = if height.is_none() { tx_flags::IS_UNCONFIRMED } else { 0 };
+    sqlx::query("INSERT INTO Transactions (tx_hash, tx_data, block_height, flags, date_created, date_updated) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(tx_hash) DO UPDATE SET tx_data = COALESCE(excluded.tx_data, Transactions.tx_data), block_height = excluded.block_height, flags = excluded.flags, date_updated = excluded.date_updated")
+        .bind(hash).bind(raw).bind(height).bind(flags).bind(now).bind(now).execute(&mut **tx).await?;
+    Ok(())
 }
 
 /// Delete all TransactionOutputs and TransactionDeltas for a set of keyinstance_ids.
@@ -1215,92 +1333,51 @@ pub async fn consume_recovery_code(pool: &SqlitePool, code_hash: &str) -> anyhow
     }
 }
 
+pub async fn recover_totp_atomically(pool: &SqlitePool, code_hash: &str) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let stored: Option<(String,)> = sqlx::query_as("SELECT value FROM WalletData WHERE key = ?").bind(TOTP_RECOVERY_CODES_KEY).fetch_optional(&mut *tx).await?;
+    let Some((json,)) = stored else { return Ok(false); };
+    let codes: Vec<String> = serde_json::from_str(&json)?;
+    if !codes.iter().any(|code| code == code_hash) { return Ok(false); }
+    let updated = sqlx::query("UPDATE WalletData SET value = '[]', date_updated = ? WHERE key = ? AND value = ?")
+        .bind(chrono::Utc::now().timestamp()).bind(TOTP_RECOVERY_CODES_KEY).bind(json).execute(&mut *tx).await?;
+    if updated.rows_affected() != 1 { return Ok(false); }
+    let deleted = sqlx::query("DELETE FROM TotpSecrets WHERE id = 1").execute(&mut *tx).await?;
+    if deleted.rows_affected() != 1 { return Ok(false); }
+    tx.commit().await?;
+    Ok(true)
+}
+
 // ============================================================================
 // Extra repository functions for ported features
 // ============================================================================
 
-/// Get a transaction by txid from the wallet DB.
-pub async fn get_transaction_by_txid(
-    pool: &SqlitePool,
-    txid: &str,
-) -> anyhow::Result<Option<TransactionRow>> {
-    let row = sqlx::query_as::<_, TransactionRow>(
-        "SELECT tx_hash_hex as txid, status, raw_tx, account_id, fee \
-         FROM AccountTransactions WHERE tx_hash_hex = ?",
-    )
-    .bind(txid)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row)
+/// Get an account-owned transaction by display txid.
+pub async fn get_transaction_by_txid(pool: &SqlitePool, account_id: i64, txid: &str) -> anyhow::Result<Option<TransactionRow>> {
+    let hash = crate::core::address::hex_str_to_hash(txid)?;
+    if hash.len() != 32 { anyhow::bail!("invalid transaction hash length"); }
+    Ok(sqlx::query_as::<_, TransactionRow>(
+        "SELECT t.tx_data, t.block_height, t.fee_value, t.description FROM Transactions t JOIN AccountTransactions a ON a.tx_hash = t.tx_hash WHERE t.tx_hash = ? AND a.account_id = ?")
+        .bind(hash).bind(account_id).fetch_optional(pool).await?)
 }
 
-/// Transaction row for get_transaction_by_txid.
-#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TransactionRow {
-    pub txid: String,
-    pub status: String,
-    pub raw_tx: Option<String>,
-    pub account_id: Option<i64>,
-    pub fee: Option<i64>,
+    pub tx_data: Option<Vec<u8>>,
+    pub block_height: Option<i64>,
+    pub fee_value: Option<i64>,
+    pub description: Option<String>,
 }
 
-/// Get transaction inputs by txid.
-pub async fn get_transaction_inputs(
-    pool: &SqlitePool,
-    txid: &str,
-) -> anyhow::Result<Vec<TransactionInputRow>> {
-    let rows = sqlx::query_as::<_, TransactionInputRow>(
-        "SELECT prev_tx_hash, prev_vout, script_sig, sequence \
-         FROM TransactionInputs WHERE tx_hash_hex = ? ORDER BY input_index",
-    )
-    .bind(txid)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+/// Query wallet-owned current outputs; this is not a full transaction detail.
+pub async fn get_transaction_outputs(pool: &SqlitePool, txid: &str) -> anyhow::Result<Vec<TxOutputDetailRow>> {
+    let hash = crate::core::address::hex_str_to_hash(txid)?;
+    if hash.len() != 32 { anyhow::bail!("invalid transaction hash length"); }
+    Ok(sqlx::query_as::<_, TxOutputDetailRow>("SELECT value, COALESCE(script_pubkey, '') AS script_pubkey FROM TransactionOutputs WHERE tx_hash = ? ORDER BY tx_index")
+        .bind(hash).fetch_all(pool).await?)
 }
-
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
-pub struct TransactionInputRow {
-    pub prev_tx_hash: String,
-    pub prev_vout: i64,
-    pub script_sig: String,
-    pub sequence: u32,
-}
-
-/// Get transaction outputs by txid.
-pub async fn get_transaction_outputs(
-    pool: &SqlitePool,
-    txid: &str,
-) -> anyhow::Result<Vec<TxOutputDetailRow>> {
-    let rows = sqlx::query_as::<_, TxOutputDetailRow>(
-        "SELECT value, script_pubkey \
-         FROM TransactionOutputs WHERE tx_hash_hex = ? ORDER BY output_index",
-    )
-    .bind(txid)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
-}
-
-/// Transaction output row for get_transaction_outputs (value + script_pubkey only).
-#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
-pub struct TxOutputDetailRow {
-    pub value: i64,
-    pub script_pubkey: String,
-}
-
-/// Get a transaction label by txid.
-pub async fn get_tx_label(
-    pool: &SqlitePool,
-    txid: &str,
-) -> anyhow::Result<Option<String>> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT label FROM TransactionLabels WHERE tx_hash_hex = ?")
-            .bind(txid)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.map(|(label,)| label))
-}
+pub struct TxOutputDetailRow { pub value: i64, pub script_pubkey: String }
 
 /// Count remaining (unused) TOTP recovery codes.
 pub async fn count_remaining_recovery_codes(pool: &SqlitePool) -> anyhow::Result<i64> {
@@ -1348,6 +1425,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_snapshot_rolls_back_and_resyncs_idempotently() {
+        let (pool, _dir) = setup_test_db("sync_snapshot_atomic").await;
+        let master = insert_master_key(&pool, None, derivation_type::BIP32, b"test").await.unwrap();
+        let account = insert_account(&pool, Some(master), script_type::P2PKH, "Test").await.unwrap();
+        let first = insert_keyinstance(&pool, account, Some(master), derivation_type::BIP32,
+            br#"{"subpath":[0,0]}"#, script_type::P2PKH, 0, None).await.unwrap();
+        let second = insert_keyinstance(&pool, account, Some(master), derivation_type::BIP32,
+            br#"{"subpath":[0,1]}"#, script_type::P2PKH, 0, None).await.unwrap();
+        let old = vec![1; 32];
+        upsert_transaction(&pool, &old, Some(10), None).await.unwrap();
+        upsert_transaction_output(&pool, &old, 0, 50000, first, 0, None).await.unwrap();
+        upsert_transaction_delta(&pool, first, &old, 50000).await.unwrap();
+        let expected = get_keyinstances_for_account(&pool, account).await.unwrap();
+        let snapshots = vec![
+            SyncKeySnapshot { key_id: first, transactions: vec![], outputs: vec![] },
+            SyncKeySnapshot { key_id: second, transactions: vec![], outputs: vec![SyncOutput {
+                hash: vec![2; 32], height: Some(11), index: 0, value: 12000, coinbase: false, script_pubkey: "76a91400".into(),
+            }] },
+        ];
+        sqlx::query("CREATE TRIGGER fail_sync BEFORE INSERT ON TransactionOutputs BEGIN SELECT RAISE(ABORT, 'injected failure'); END")
+            .execute(&pool).await.unwrap();
+        let mut snapshots_with_discovery = vec![SyncKeySnapshot { key_id: -1, transactions: vec![], outputs: vec![] }];
+        snapshots_with_discovery.extend(snapshots);
+        let error = replace_sync_snapshot(&pool, account, &expected, Some(&[(1, 3)]), &snapshots_with_discovery).await.unwrap_err();
+        assert!(format!("{error:#}").contains("injected failure"));
+        assert_eq!(get_keyinstances_for_account(&pool, account).await.unwrap().len(), 2);
+        assert!(get_wallet_data(&pool, &format!("address_discovery_v1_{account}")).await.unwrap().is_none());
+        assert_eq!(get_balance_for_account(&pool, account).await.unwrap(), (50000, 0, 50000));
+        let history = get_tx_history_for_account(&pool, account, 50, 0).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].value_delta, Some(50000));
+        sqlx::query("DROP TRIGGER fail_sync").execute(&pool).await.unwrap();
+        let snapshots = &snapshots_with_discovery[1..];
+        for _ in 0..2 {
+            replace_sync_snapshot(&pool, account, &expected, None, snapshots).await.unwrap();
+            assert_eq!(get_balance_for_account(&pool, account).await.unwrap(), (12000, 0, 12000));
+            assert!(get_tx_history_for_account(&pool, account, 50, 0).await.unwrap().is_empty());
+            assert_eq!(get_utxos_for_account(&pool, account).await.unwrap().len(), 1);
+        }
+        insert_keyinstance(&pool, account, Some(master), derivation_type::BIP32,
+            br#"{"subpath":[1,3]}"#, script_type::P2PKH, 0, None).await.unwrap();
+        assert!(replace_sync_snapshot(&pool, account, &expected, Some(&[(1, 3)]), &snapshots_with_discovery).await.is_err());
+        assert_eq!(get_keyinstances_for_account(&pool, account).await.unwrap().len(), 3);
+        assert!(get_wallet_data(&pool, &format!("address_discovery_v1_{account}")).await.unwrap().is_none());
+        assert_eq!(get_balance_for_account(&pool, account).await.unwrap(), (12000, 0, 12000));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn sync_history_known_and_unknown_roundtrip() {
+        let (pool, _dir) = setup_test_db("sync_history_values").await;
+        let master = insert_master_key(&pool, None, derivation_type::BIP32, b"test").await.unwrap();
+        let account = insert_account(&pool, Some(master), script_type::P2PKH, "test").await.unwrap();
+        let key = insert_keyinstance(&pool, account, Some(master), derivation_type::BIP32, br#"{"subpath":[0,0]}"#, script_type::P2PKH, 0, None).await.unwrap();
+        let keys = get_keyinstances_for_account(&pool, account).await.unwrap();
+        let hash: Vec<u8> = (0..32).collect();
+        let snapshot = |delta| vec![SyncKeySnapshot { key_id: key, transactions: vec![SyncTransaction {
+            hash: hash.clone(), height: Some(22), raw: vec![1, 2, 3].into(), delta,
+        }], outputs: vec![] }];
+        replace_sync_snapshot(&pool, account, &keys, None, &snapshot(None)).await.unwrap();
+        assert_eq!(get_tx_history_for_account(&pool, account, 50, 0).await.unwrap()[0].value_delta, None);
+        replace_sync_snapshot(&pool, account, &keys, None, &snapshot(Some(-500))).await.unwrap();
+        let rows = get_tx_history_for_account(&pool, account, 50, 0).await.unwrap();
+        assert_eq!(rows[0].value_delta, Some(-500));
+        let stored: Option<(Vec<u8>,)> = sqlx::query_as("SELECT tx_data FROM Transactions WHERE tx_hash = ?").bind(&hash).fetch_optional(&pool).await.unwrap();
+        assert_eq!(stored.unwrap().0, vec![1, 2, 3]);
+        assert_eq!(rows[0].tx_hash_hex, crate::core::address::hash_to_hex_str(&hash));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn sync_discovery_maps_every_key_and_preserves_scripts() {
+        let (pool, _dir) = setup_test_db("sync_discovery_mapping").await;
+        let master = insert_master_key(&pool, None, derivation_type::BIP32, b"test").await.unwrap();
+        let account = insert_account(&pool, Some(master), script_type::P2PKH, "Test").await.unwrap();
+        let expected = get_keyinstances_for_account(&pool, account).await.unwrap();
+        let paths = [(0, 7), (1, 9)];
+        let snapshots = vec![
+            SyncKeySnapshot { key_id: -2, transactions: vec![], outputs: vec![SyncOutput {
+                hash: vec![3; 32], height: Some(8), index: 2, value: 30, coinbase: false, script_pubkey: "bbaa".into(),
+            }] },
+            SyncKeySnapshot { key_id: -1, transactions: vec![], outputs: vec![SyncOutput {
+                hash: (0..32).collect(), height: Some(9), index: 1, value: 40, coinbase: false, script_pubkey: "aabb".into(),
+            }] },
+        ];
+        replace_sync_snapshot(&pool, account, &expected, Some(&paths), &snapshots).await.unwrap();
+        let keys = get_keyinstances_for_account(&pool, account).await.unwrap();
+        assert_eq!(keys.len(), 2);
+        let outputs = get_utxos_for_account(&pool, account).await.unwrap();
+        assert_eq!(outputs.iter().find(|o| o.value == 40).unwrap().keyinstance_id, keys[0].keyinstance_id);
+        assert_eq!(outputs.iter().find(|o| o.value == 30).unwrap().keyinstance_id, keys[1].keyinstance_id);
+        let txid = crate::core::address::hash_to_hex_str(&(0..32).collect::<Vec<u8>>());
+        let details = get_transaction_outputs(&pool, &txid).await.unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].script_pubkey, "aabb");
+        assert_eq!(details[0].value, 40);
+        assert_eq!(get_wallet_data(&pool, &format!("address_discovery_v1_{account}")).await.unwrap().as_deref(), Some("done"));
+        let incomplete = vec![SyncKeySnapshot { key_id: keys[0].keyinstance_id, transactions: vec![], outputs: vec![] }];
+        assert!(replace_sync_snapshot(&pool, account, &keys, None, &incomplete).await.is_err());
+        let duplicate = vec![SyncKeySnapshot { key_id: keys[0].keyinstance_id, transactions: vec![], outputs: vec![] },
+            SyncKeySnapshot { key_id: keys[0].keyinstance_id, transactions: vec![], outputs: vec![] }];
+        assert!(replace_sync_snapshot(&pool, account, &keys, None, &duplicate).await.is_err());
+        assert_eq!(get_balance_for_account(&pool, account).await.unwrap().2, 70);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn sync_refuses_another_accounts_output_and_rolls_back() {
+        let (pool, _dir) = setup_test_db("sync_output_owner").await;
+        let master = insert_master_key(&pool, None, derivation_type::BIP32, b"test").await.unwrap();
+        let account = insert_account(&pool, Some(master), script_type::P2PKH, "First").await.unwrap();
+        let other = insert_account(&pool, Some(master), script_type::P2PKH, "Second").await.unwrap();
+        let key = insert_keyinstance(&pool, account, Some(master), derivation_type::BIP32, br#"{"subpath":[0,0]}"#, script_type::P2PKH, 0, None).await.unwrap();
+        let other_key = insert_keyinstance(&pool, other, Some(master), derivation_type::BIP32, br#"{"subpath":[0,1]}"#, script_type::P2PKH, 0, None).await.unwrap();
+        let hash = vec![7; 32];
+        upsert_transaction(&pool, &hash, Some(10), None).await.unwrap();
+        upsert_transaction_output(&pool, &hash, 0, 50000, other_key, 0, Some("abcd")).await.unwrap();
+        let keys = get_keyinstances_for_account(&pool, account).await.unwrap();
+        let snapshots = vec![SyncKeySnapshot { key_id: key, transactions: vec![], outputs: vec![SyncOutput {
+            hash, height: Some(11), index: 0, value: 50000, coinbase: false, script_pubkey: "abcd".into(),
+        }] }];
+        assert!(replace_sync_snapshot(&pool, account, &keys, None, &snapshots).await.is_err());
+        assert_eq!(get_balance_for_account(&pool, other).await.unwrap().2, 50000);
+        assert_eq!(get_utxos_for_account(&pool, other).await.unwrap()[0].keyinstance_id, other_key);
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn test_insert_and_read_master_key() {
         let (pool, _dir) = setup_test_db("mk_rw").await;
 
@@ -1392,7 +1597,7 @@ mod tests {
 
         // migration key should already be set by create_wallet_db
         let migration = get_wallet_data(&pool, "migration").await.unwrap();
-        assert_eq!(migration, Some("31".to_string()));
+        assert_eq!(migration, Some(connection::MIGRATION_CURRENT.to_string()));
 
         // Set a new key
         set_wallet_data(&pool, "password-token", "encrypted_token")

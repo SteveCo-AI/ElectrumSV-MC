@@ -22,13 +22,15 @@ pub struct BalanceInfo {
     pub confirmed: i64,
     pub unconfirmed: i64,
     pub total: i64,
+    pub reserved: i64,
+    pub available: i64,
 }
 
 /// History entry for get_history command.
 #[derive(Debug, serde::Serialize)]
 pub struct HistoryEntry {
     pub tx_hash: String,
-    pub value_delta: i64,
+    pub value_delta: Option<i64>,
     pub date_created: i64,
     pub block_height: Option<i64>,
     pub description: Option<String>,
@@ -92,7 +94,7 @@ impl From<bsv::compat::error::CompatError> for AccountError {
 
 /// Extract needed data from the active wallet without holding the lock across awaits.
 /// Returns (db_pool, account_id, decrypted_xprv) where decrypted_xprv is None if locked.
-fn get_active_wallet_data(
+pub(crate) fn get_active_wallet_data(
     state: &AppState,
 ) -> Result<(sqlx::SqlitePool, i64, Option<String>), AccountError> {
     let guard = state.active_wallet.lock().unwrap();
@@ -117,21 +119,7 @@ pub async fn get_balance(
     state: State<'_, AppState>,
     account_id: Option<i64>,
 ) -> Result<BalanceInfo, String> {
-    log::info!("get_balance — account_id: {:?}", account_id);
-
-    let (pool, default_account_id, _) =
-        get_active_wallet_data(&state).map_err(|e| e.to_string())?;
-    let acct_id = account_id.unwrap_or(default_account_id);
-
-    let (confirmed, unconfirmed, total) = repositories::get_balance_for_account(&pool, acct_id)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(BalanceInfo {
-        confirmed,
-        unconfirmed,
-        total,
-    })
+    crate::services::account_service::get_balance(&state, account_id).await
 }
 
 /// Get transaction history for the active account.
@@ -145,6 +133,12 @@ pub async fn get_history(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<HistoryEntry>, String> {
+    get_history_inner(&state, account_id, limit, offset).await
+}
+
+pub async fn get_history_inner(
+    state: &AppState, account_id: Option<i64>, limit: Option<i64>, offset: Option<i64>,
+) -> Result<Vec<HistoryEntry>, String> {
     let lim = limit.unwrap_or(50);
     let off = offset.unwrap_or(0);
     log::info!(
@@ -155,7 +149,7 @@ pub async fn get_history(
     );
 
     let (pool, default_account_id, _) =
-        get_active_wallet_data(&state).map_err(|e| e.to_string())?;
+        get_active_wallet_data(state).map_err(|e| e.to_string())?;
     let acct_id = account_id.unwrap_or(default_account_id);
 
     let rows = repositories::get_tx_history_for_account(&pool, acct_id, lim, off)
@@ -205,6 +199,28 @@ pub async fn get_utxos(
         .collect())
 }
 
+#[tauri::command]
+pub async fn list_receive_addresses(state: State<'_, AppState>, account_id: Option<i64>) -> Result<Vec<ReceiveAddressResult>, String> {
+    let (pool, active, xprv) = get_active_wallet_data(&state).map_err(|e| e.to_string())?;
+    let selected = account_id.unwrap_or(active);
+    if selected != active { return Err("only the active account supports address derivation".into()); }
+    let key = ExtendedKey::from_string(&xprv.ok_or("wallet is locked")?).map_err(|e| e.to_string())?;
+    let keys = repositories::get_keyinstances_for_account(&pool, selected).await.map_err(|e| e.to_string())?;
+    let mut result = Vec::new();
+    for item in keys {
+        if item.derivation_type != repositories::derivation_type::BIP32 { continue; }
+        let v: serde_json::Value = serde_json::from_slice(&item.derivation_data).map_err(|e| e.to_string())?;
+        let path = v.get("subpath").and_then(|v| v.as_array()).ok_or("invalid key path")?;
+        if path.first().and_then(|v| v.as_u64()) != Some(0) { continue; }
+        let index = path.get(1).and_then(|v| v.as_i64()).filter(|i| *i >= 0).ok_or("invalid key index")?;
+        let child = key.derive(&format!("0/{index}")).map_err(|e| e.to_string())?;
+        let public = child.public_key().map_err(|e| e.to_string())?;
+        result.push(ReceiveAddressResult { address: address::pubkey_to_p2pkh_address(&public), keyinstance_id: item.keyinstance_id, derivation_index: index });
+    }
+    result.sort_by_key(|item| item.derivation_index);
+    Ok(result)
+}
+
 /// Get the next receive address for the active account.
 ///
 /// Derives a new BIP32 key at path 0/N (receiving chain), generates
@@ -215,77 +231,7 @@ pub async fn get_receive_address(
     state: State<'_, AppState>,
     account_id: Option<i64>,
 ) -> Result<ReceiveAddressResult, String> {
-    log::info!("get_receive_address — account_id: {:?}", account_id);
-
-    let (pool, default_account_id, xprv_opt) =
-        get_active_wallet_data(&state).map_err(|e| e.to_string())?;
-
-    let xprv_str = xprv_opt.ok_or(AccountError::WalletLocked.to_string())?;
-    let acct_id = account_id.unwrap_or(default_account_id);
-
-    // Parse the xprv
-    let account_key = ExtendedKey::from_string(&xprv_str)
-        .map_err(|e| AccountError::InvalidXprv(e.to_string()).to_string())?;
-
-    // Get the next receiving index
-    let (receiving_count, _) = repositories::get_keyinstance_counts(&pool, acct_id)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let next_index = receiving_count;
-
-    // Derive the receiving key at 0/next_index
-    let derivation_path = format!("0/{}", next_index);
-    let child_key = account_key
-        .derive(&derivation_path)
-        .map_err(|e| AccountError::DerivationFailed(e.to_string()).to_string())?;
-
-    // Get the public key
-    let pubkey = child_key
-        .public_key()
-        .map_err(|e| AccountError::DerivationFailed(e.to_string()).to_string())?;
-
-    // Generate the P2PKH address
-    let address_str = address::pubkey_to_p2pkh_address(&pubkey);
-
-    // Store the KeyInstance in the database
-    let derivation_data = serde_json::json!({
-        "subpath": [0, next_index]
-    })
-    .to_string()
-    .into_bytes();
-
-    // Get the masterkey_id from the first master key
-    let mk_row = repositories::get_first_master_key(&pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    let masterkey_id = mk_row.map(|mk| mk.masterkey_id);
-
-    let keyinstance_id = repositories::insert_keyinstance(
-        &pool,
-        acct_id,
-        masterkey_id,
-        repositories::derivation_type::BIP32,
-        &derivation_data,
-        repositories::script_type::P2PKH,
-        0, // flags = 0 (no special flags)
-        None,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
-    log::info!(
-        "Generated receive address {} at 0/{} (keyinstance {})",
-        address_str,
-        next_index,
-        keyinstance_id
-    );
-
-    Ok(ReceiveAddressResult {
-        address: address_str,
-        keyinstance_id,
-        derivation_index: next_index,
-    })
+    crate::services::account_service::get_receive_address(&state, account_id).await
 }
 
 /// Get the public key (hex) for a specific KeyInstance.
@@ -557,6 +503,7 @@ mod tests {
             active_wallet: std::sync::Mutex::new(None),
             network: std::sync::Mutex::new(crate::state::NetworkState::new()),
             pending_plans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wallet_operation: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -582,7 +529,7 @@ mod tests {
         assert_eq!(total, 0);
         drop(guard);
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -601,7 +548,7 @@ mod tests {
         assert!(history.is_empty());
         drop(guard);
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -620,7 +567,7 @@ mod tests {
         assert!(utxos.is_empty());
         drop(guard);
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -640,7 +587,7 @@ mod tests {
         assert_eq!(change, 0);
         drop(guard);
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -711,7 +658,7 @@ mod tests {
         assert_ne!(addr, addr2);
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -738,7 +685,7 @@ mod tests {
         assert!(addr.starts_with('1'));
         log::info!("Known vector address: {}", addr);
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -796,7 +743,7 @@ mod tests {
         assert_eq!(expected_hex, actual_hex);
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -846,7 +793,7 @@ mod tests {
 
         // Insert a transaction delta
         sqlx::query(
-            "INSERT INTO TransactionDeltas (keyinstance_id, tx_hash, value_delta, date_created, date_updated) VALUES (?, ?, 50000, ?, ?)",
+            "INSERT INTO TransactionDeltas (keyinstance_id, tx_hash, value_delta, date_created, date_updated, value_known) VALUES (?, ?, 50000, ?, ?, 1)",
         )
         .bind(ki_id)
         .bind(&tx_hash_internal)
@@ -869,10 +816,10 @@ mod tests {
             v
         });
         assert_eq!(history[0].tx_hash_hex, expected_display);
-        assert_eq!(history[0].value_delta, 50000);
+        assert_eq!(history[0].value_delta, Some(50000));
 
         drop(guard);
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     // ========================================================================
@@ -938,7 +885,7 @@ mod tests {
         assert_eq!(cfg.public_keys, pks);
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -993,7 +940,7 @@ mod tests {
         assert!(cfg.date_updated > 0);
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -1068,6 +1015,6 @@ mod tests {
         );
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 }

@@ -4,7 +4,6 @@
   "description": "Default capability for ElectrumSV-Mc",
   "windows": ["main"],
   "permissions": [
-    "core:default",
-    "shell:allow-open"
+    "core:default"
   ]
 }

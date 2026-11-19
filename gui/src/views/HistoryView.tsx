@@ -1,24 +1,14 @@
 // History view — transaction history list with TX detail panel
 // Enhanced: decodes on-chain data (Ordinals, OP_RETURN, STAS tokens)
 import { useEffect, useState } from 'react';
-import { api, type DecodedOutput } from '../api';
+import { api, type DecodedOutput, type HistoryEntry, type TransactionDetail } from '../api';
 import { useStore } from '../store';
-
-interface TxDetail {
-  txid: string;
-  status: string;
-  raw_tx?: string;
-  account_id?: number;
-  inputs?: { prev_tx_hash: string; prev_vout: number; script_sig: string; sequence: number }[];
-  outputs?: { value: number; script_pubkey: string }[];
-  fee?: number;
-}
 
 export function HistoryView() {
   const { activeAccountId, setError, historyRefreshKey } = useStore();
-  const [history, setHistory] = useState<any[]>([]);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
-  const [selectedTx, setSelectedTx] = useState<TxDetail | null>(null);
+  const [selectedTx, setSelectedTx] = useState<TransactionDetail | null>(null);
   const [txLoading, setTxLoading] = useState(false);
   const [txLabel, setTxLabel] = useState('');
   const [labelSaved, setLabelSaved] = useState(false);
@@ -29,7 +19,7 @@ export function HistoryView() {
     if (activeAccountId === null) return;
     setLoading(true);
     api.getHistory(activeAccountId)
-      .then((r: any) => setHistory(Array.isArray(r) ? r : (r.history || [])))
+      .then(setHistory)
       .catch((e: Error) => {
         setError(`History: ${e.message}`);
         setHistory([]);
@@ -43,17 +33,14 @@ export function HistoryView() {
     setDecodedOutputs([]);
     setLabelSaved(false);
     try {
-      const detail: any = await api.getTransaction(txHash);
+      const detail = await api.getTransaction(txHash);
       setSelectedTx(detail);
-      setTxLabel(detail?.label || '');
+      setTxLabel(detail.label ?? '');
 
       // Decode outputs for on-chain data
-      if (detail?.outputs && detail.outputs.length > 0) {
+      if (detail.detail_complete && detail.raw_tx !== null && detail.inputs !== null && detail.outputs !== null && detail.outputs.length > 0) {
         setDecoding(true);
-        const outputs = detail.outputs.map((o: any) => ({
-          value: o.value,
-          script_pubkey: o.script_pubkey || '',
-        }));
+        const outputs = detail.outputs;
         try {
           const decoded = await api.decodeTxOutputs(outputs);
           setDecodedOutputs(decoded);
@@ -64,8 +51,8 @@ export function HistoryView() {
           setDecoding(false);
         }
       }
-    } catch (e: any) {
-      setError(`TX detail: ${e.message}`);
+    } catch (e: unknown) {
+      setError(`TX detail: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setTxLoading(false);
     }
@@ -152,6 +139,8 @@ export function HistoryView() {
     }
   };
 
+  const hasCompleteDetails = selectedTx !== null && selectedTx.detail_complete && selectedTx.raw_tx !== null && selectedTx.inputs !== null && selectedTx.outputs !== null;
+
   if (loading) return <div className="p-4 text-gray-400">Loading history...</div>;
   if (!history.length) return <div className="p-4 text-gray-400">No transactions yet.</div>;
 
@@ -166,13 +155,14 @@ export function HistoryView() {
             <div className="flex-1">Date</div>
             <div className="flex-1">TX Hash</div>
             <div className="w-24 text-right">Amount</div>
-            <div className="w-20 text-right">Status</div>
+            <div className="w-36 text-right">Status</div>
           </div>
           {/* Rows */}
           {history.map((tx, i) => {
-            const isIncoming = tx.value_delta > 0;
-            const status = tx.status || (tx.height > 0 ? 'confirmed' : 'pending');
-            const date = tx.height > 0 ? `Block ${tx.height}` : 'Pending';
+            const isIncoming = tx.value_delta !== null && tx.value_delta > 0;
+            const isConfirmed = tx.block_height !== null && tx.block_height > 0;
+            const status = isConfirmed ? 'Server: confirmed' : 'Pending';
+            const date = isConfirmed ? `Block ${tx.block_height}` : 'Pending';
             return (
               <div
                 key={i}
@@ -185,12 +175,12 @@ export function HistoryView() {
                 <div className="flex-1 text-sm font-mono text-gray-300 truncate">
                   {tx.tx_hash?.slice(0, 24) || 'unknown'}...
                 </div>
-                <div className={`w-24 text-right text-sm font-medium ${isIncoming ? 'text-success' : 'text-danger'}`}>
-                  {isIncoming ? '+' : ''}{tx.value_delta || 0} sat
+                <div className={`w-24 text-right text-sm font-medium ${tx.value_delta === null || tx.value_delta === 0 ? 'text-gray-400' : isIncoming ? 'text-success' : 'text-danger'}`}>
+                  {tx.value_delta === null ? 'Unknown' : `${isIncoming ? '+' : ''}${tx.value_delta} sat`}
                 </div>
-                <div className="w-20 text-right">
-                  <span className={`text-xs px-2 py-0.5 rounded-full ${
-                    status === 'confirmed' ? 'bg-success/20 text-success' : 'bg-warning/20 text-warning'
+                <div className="w-36 text-right">
+                  <span title={isConfirmed ? "Reported by server; chain validation is not guaranteed" : undefined} className={`text-xs px-2 py-0.5 rounded-full ${
+                    isConfirmed ? 'bg-success/20 text-success' : 'bg-warning/20 text-warning'
                   }`}>
                     {status}
                   </span>
@@ -252,13 +242,13 @@ export function HistoryView() {
               {/* Status */}
               <div>
                 <div className="text-xs text-gray-400 mb-1">Status</div>
-                <span className="text-xs px-2 py-0.5 rounded-full bg-success/20 text-success">
-                  Found
+                <span title={selectedTx.status === 'confirmed' ? "Reported by server; chain validation is not guaranteed" : undefined} className="text-xs px-2 py-0.5 rounded-full bg-success/20 text-success">
+                  {selectedTx.status === 'confirmed' ? 'Server: confirmed' : selectedTx.status}
                 </span>
               </div>
 
               {/* Account */}
-              {selectedTx.account_id !== undefined && (
+              {selectedTx.account_id !== null && (
                 <div>
                   <div className="text-xs text-gray-400 mb-1">Account</div>
                   <div className="text-sm text-gray-300">#{selectedTx.account_id}</div>
@@ -266,15 +256,19 @@ export function HistoryView() {
               )}
 
               {/* Fee */}
-              {selectedTx.fee !== undefined && (
+              {selectedTx.fee !== null && (
                 <div>
                   <div className="text-xs text-gray-400 mb-1">Fee</div>
                   <div className="text-sm text-gray-300">{selectedTx.fee.toLocaleString()} sat</div>
                 </div>
               )}
 
+              {!hasCompleteDetails && (
+                <div className="text-sm text-warning">Transaction details are incomplete: full transaction data is unavailable.</div>
+              )}
+
               {/* Inputs */}
-              {selectedTx.inputs && selectedTx.inputs.length > 0 && (
+              {hasCompleteDetails && selectedTx.inputs !== null && (
                 <div>
                   <div className="text-xs text-gray-400 mb-1">Inputs ({selectedTx.inputs.length})</div>
                   {selectedTx.inputs.map((inp, i) => (
@@ -287,7 +281,7 @@ export function HistoryView() {
               )}
 
               {/* Outputs with decoded data */}
-              {selectedTx.outputs && selectedTx.outputs.length > 0 && (
+              {hasCompleteDetails && selectedTx.outputs !== null && (
                 <div>
                   <div className="text-xs text-gray-400 mb-1">
                     Outputs ({selectedTx.outputs.length})
@@ -302,7 +296,7 @@ export function HistoryView() {
                           {renderDecodedBadge(decoded)}
                         </div>
                         <div className="font-mono text-gray-400 truncate mt-1">
-                          {out.script_pubkey?.slice(0, 40) || ''}...
+                          {out.script_pubkey.slice(0, 40)}...
                         </div>
                         {decoded && renderDecodedDetail(decoded)}
                       </div>

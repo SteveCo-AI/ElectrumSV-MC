@@ -124,6 +124,7 @@ pub struct MerkleProof {
     /// Merkle branch: pairs of (hash, direction) where direction=true means the
     /// partner is on the right side.
     pub merkle_branch: Vec<(String, bool)>,
+    pub position: Option<u64>,
     /// Merkle root from the block header (hex, internal byte order).
     pub root: String,
 }
@@ -200,100 +201,37 @@ pub enum NetworkError {
 ///
 /// Returns the scripthash as a hex string (display/reversed form, matching ElectrumX protocol).
 pub fn scripthash_from_address(addr: &str) -> Result<String, NetworkError> {
-    // BSV P2PKH script: 76 a9 14 <20-byte-pubkeyhash> 88 ac
-    // We need to get the pubkeyhash from the address
-    let _addr_str = addr;
-    // For now, we decode the address to get the hash160 and build the script
-    // The bsv-sdk Address type can give us the underlying hash
-    // We'll use bs58 decode + checksum verify
-    let decoded = bs58::decode(addr)
-        .into_vec()
-        .map_err(|e| NetworkError::Protocol(format!("invalid address {addr}: {e}")))?;
-
-    if decoded.len() < 25 {
-        return Err(NetworkError::Protocol(format!(
-            "address too short: {} bytes",
-            decoded.len()
-        )));
-    }
-
-    // P2PKH: version byte (0x00 for mainnet) + 20-byte hash + 4-byte checksum
-    let version = decoded[0];
-    let pubkey_hash = &decoded[1..21];
-
-    if version != 0x00 {
-        return Err(NetworkError::Protocol(format!(
-            "not a mainnet P2PKH address (version byte 0x{version:02x})"
-        )));
-    }
-
-    // Build the scriptPubKey: OP_DUP OP_HASH160 <push 20> <hash> OP_EQUALVERIFY OP_CHECKSIG
-    let mut script = Vec::with_capacity(25);
-    script.push(0x76); // OP_DUP
-    script.push(0xa9); // OP_HASH160
-    script.push(0x14); // push 20 bytes
-    script.extend_from_slice(pubkey_hash);
-    script.push(0x88); // OP_EQUALVERIFY
-    script.push(0xac); // OP_CHECKSIG
-
-    // ElectrumX scripthash = hash256(script) reversed
     use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&script);
-    let hash1 = hasher.finalize();
-
-    let mut hasher2 = Sha256::new();
-    hasher2.update(hash1);
-    let hash2 = hasher2.finalize();
-
-    // Reverse byte order for display (same as txid convention)
-    let mut reversed = hash2.to_vec();
-    reversed.reverse();
-
-    Ok(hex::encode(&reversed))
+    let decoded = bs58::decode(addr).into_vec().map_err(|e| NetworkError::Protocol(format!("invalid address: {e}")))?;
+    if decoded.len() != 25 || decoded[0] != 0 {
+        return Err(NetworkError::Protocol("expected a mainnet P2PKH address".into()));
+    }
+    let checksum = Sha256::digest(Sha256::digest(&decoded[..21]));
+    if decoded[21..] != checksum[..4] {
+        return Err(NetworkError::Protocol("invalid address checksum".into()));
+    }
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&decoded[1..21]);
+    Ok(scripthash_from_pubkey_hash(&hash))
 }
 
-/// Compute the ElectrumX scripthash from a 20-byte pubkey hash (hash160).
-///
-/// This builds the P2PKH scriptPubKey from the pubkey hash and then
-/// computes hash256(script) reversed — the ElectrumX scripthash.
 pub fn scripthash_from_pubkey_hash(pubkey_hash: &[u8; 20]) -> String {
-    // Build P2PKH script: OP_DUP OP_HASH160 <push 20> <hash> OP_EQUALVERIFY OP_CHECKSIG
-    let mut script = Vec::with_capacity(25);
-    script.push(0x76); // OP_DUP
-    script.push(0xa9); // OP_HASH160
-    script.push(0x14); // push 20 bytes
-    script.extend_from_slice(pubkey_hash);
-    script.push(0x88); // OP_EQUALVERIFY
-    script.push(0xac); // OP_CHECKSIG
-
-    // hash256(script) reversed
     use sha2::{Digest, Sha256};
-    let h1 = Sha256::digest(&script);
-    let h2 = Sha256::digest(h1);
-    let mut reversed = h2.to_vec();
-    reversed.reverse();
-    hex::encode(&reversed)
+    let mut script = Vec::with_capacity(25);
+    script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+    script.extend_from_slice(pubkey_hash);
+    script.extend_from_slice(&[0x88, 0xac]);
+    let mut hash = Sha256::digest(&script).to_vec();
+    hash.reverse();
+    hex::encode(hash)
 }
 
-/// Compute the ElectrumX scripthash from a raw scriptPubKey (hex).
 pub fn scripthash_from_script(script_hex: &str) -> Result<String, NetworkError> {
-    let script = hex::decode(script_hex)
-        .map_err(|e| NetworkError::Protocol(format!("invalid script hex: {e}")))?;
-
     use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&script);
-    let hash1 = hasher.finalize();
-
-    let mut hasher2 = Sha256::new();
-    hasher2.update(hash1);
-    let hash2 = hasher2.finalize();
-
-    let mut reversed = hash2.to_vec();
-    reversed.reverse();
-
-    Ok(hex::encode(&reversed))
+    let script = hex::decode(script_hex).map_err(|e| NetworkError::Protocol(format!("invalid script hex: {e}")))?;
+    let mut hash = Sha256::digest(&script).to_vec();
+    hash.reverse();
+    Ok(hex::encode(hash))
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +385,8 @@ mod tests {
         // P2PKH script: 76a91462e907b15cbf27d5425399ebf6f0fb50ebb88f1888ac
         // hash160 = 62e907b15cbf27d5425399ebf6f0fb50ebb88f18
         let sh = scripthash_from_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa").unwrap();
+        assert_eq!(sh, "8b01df4e368ea28f8dc0423bcf7a4923e3a12d307c875e47a0cfbf90b5c39161");
+        assert!(scripthash_from_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb").is_err());
         // Should be 64 hex chars
         assert_eq!(sh.len(), 64);
         // Verify it matches the known ElectrumX scripthash
@@ -522,6 +462,7 @@ mod tests {
             tx_hash: "abcdef".to_string(),
             block_height: 800000,
             merkle_branch: vec![("deadbeef".to_string(), true)],
+            position: Some(0),
             root: "cafebabe".to_string(),
         };
         assert_eq!(p.block_height, 800000);

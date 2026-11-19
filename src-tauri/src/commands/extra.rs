@@ -129,8 +129,9 @@ pub struct TransactionDetail {
     pub raw_tx: Option<String>,
     pub account_id: Option<i64>,
     pub fee: Option<i64>,
-    pub inputs: Vec<TxInputDetail>,
-    pub outputs: Vec<TxOutputDetail>,
+    pub inputs: Option<Vec<TxInputDetail>>,
+    pub outputs: Option<Vec<TxOutputDetail>>,
+    pub detail_complete: bool,
     pub label: Option<String>,
 }
 
@@ -158,54 +159,42 @@ pub async fn get_transaction(
 ) -> Result<TransactionDetail, String> {
     log::info!("get_transaction — txid: {}", txid);
 
-    let pool = {
+    let (pool, account_id) = {
         let guard = state.active_wallet.lock().unwrap();
         let active = guard.as_ref().ok_or("no wallet is currently open")?;
-        active.db_pool.clone()
+        (active.db_pool.clone(), active.account_id)
     };
+    transaction_detail(&pool, account_id, &txid).await
+}
 
-    // Query transaction from DB
-    let tx = repositories::get_transaction_by_txid(&pool, &txid)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "transaction not found".to_string())?;
+pub(crate) async fn transaction_detail(pool: &sqlx::SqlitePool, account_id: i64, txid: &str) -> Result<TransactionDetail, String> {
+    let tx = repositories::get_transaction_by_txid(pool, account_id, txid).await
+        .map_err(|e| e.to_string())?.ok_or("transaction not found")?;
+    let (raw_tx, inputs, outputs) = match tx.tx_data {
+        None => (None, None, None),
+        Some(bytes) => {
+            crate::commands::network::validate_transaction_wire(&bytes)?;
+            let raw = hex::encode(&bytes);
+            let parsed = bsv::transaction::transaction::Transaction::from_hex(&raw).map_err(|e| format!("invalid stored transaction: {e}"))?;
+            let id = parsed.id().map_err(|e| e.to_string())?;
+            if !id.eq_ignore_ascii_case(txid) || parsed.to_hex().map_err(|e| e.to_string())? != raw {
+                return Err("stored transaction does not match txid".into());
+            }
+            let inputs = parsed.inputs.iter().map(|i| TxInputDetail {
+                prev_tx_hash: i.source_txid.clone().unwrap_or_default(), prev_vout: i.source_output_index as i64,
+                script_sig: i.unlocking_script.as_ref().map(|s| hex::encode(s.to_binary())).unwrap_or_default(), sequence: i.sequence,
+            }).collect();
+            let outputs = parsed.outputs.iter().map(|o| Ok(TxOutputDetail {
+                value: i64::try_from(o.satoshis.ok_or("missing output amount")?).map_err(|_| "output amount overflow")?,
+                script_pubkey: hex::encode(o.locking_script.to_binary()),
+            })).collect::<Result<Vec<_>, &str>>()?;
+            (Some(raw), Some(inputs), Some(outputs))
+        }
+    };
+    let detail_complete = raw_tx.is_some();
+    Ok(TransactionDetail { txid: txid.to_ascii_lowercase(), status: if tx.block_height.is_some() { "confirmed" } else { "pending" }.into(),
+        raw_tx, account_id: Some(account_id), fee: tx.fee_value, inputs, outputs, detail_complete, label: tx.description })
 
-    // Get inputs and outputs
-    let inputs = repositories::get_transaction_inputs(&pool, &txid)
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|i| TxInputDetail {
-            prev_tx_hash: i.prev_tx_hash,
-            prev_vout: i.prev_vout,
-            script_sig: i.script_sig,
-            sequence: i.sequence,
-        })
-        .collect();
-
-    let outputs = repositories::get_transaction_outputs(&pool, &txid)
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|o| TxOutputDetail {
-            value: o.value,
-            script_pubkey: o.script_pubkey,
-        })
-        .collect();
-
-    // Get label
-    let label = repositories::get_tx_label(&pool, &txid).await.ok().flatten();
-
-    Ok(TransactionDetail {
-        txid: tx.txid,
-        status: tx.status,
-        raw_tx: tx.raw_tx,
-        account_id: tx.account_id,
-        fee: tx.fee,
-        inputs,
-        outputs,
-        label,
-    })
 }
 
 // ============================================================================
@@ -220,62 +209,105 @@ pub async fn get_transaction(
 pub async fn backup_wallet(
     state: State<'_, AppState>,
     backup_path: String,
+    password: String,
 ) -> Result<String, String> {
+    backup_wallet_inner(&state, backup_path, password).await
+}
+
+pub async fn backup_wallet_inner(
+    state: &AppState,
+    backup_path: String,
+    password: String,
+) -> Result<String, String> {
+    let _operation = state.wallet_operation.lock().await;
     log::info!("backup_wallet — to: {}", backup_path);
 
-    let wallet_path = {
+    let (wallet_path, pool) = {
         let guard = state.active_wallet.lock().unwrap();
         let active = guard.as_ref().ok_or("no wallet is currently open")?;
-        active.wallet_path.clone()
+        if !crate::core::keystore::verify_password(&active.keystore_data, &password) { return Err("incorrect password".into()); }
+        (active.wallet_path.clone(), active.db_pool.clone())
     };
 
     if !std::path::Path::new(&wallet_path).exists() {
         return Err(format!("wallet file not found: {}", wallet_path));
     }
 
-    // Path-traversal protection: backup_path must resolve inside data_dir.
-    let backup_path_buf = std::path::PathBuf::from(&backup_path);
-    let data_dir = std::path::PathBuf::from(&state.data_dir);
-    let canonical_data_dir = data_dir
-        .canonicalize()
-        .map_err(|e| format!("failed to canonicalize data_dir: {}", e))?;
+    #[cfg(not(target_os = "linux"))]
+    return Err("secure wallet backup is not supported on this platform".into());
 
-    // The backup path may not exist yet, so canonicalize the parent and join.
-    let canonical_backup = {
-        let parent = backup_path_buf
-            .parent()
-            .ok_or_else(|| "backup path has no parent directory".to_string())?;
-        let canon_parent = parent
-            .canonicalize()
-            .map_err(|e| format!("failed to canonicalize backup parent: {}", e))?;
-        canon_parent.join(backup_path_buf.file_name().ok_or("backup path has no file name")?)
-    };
-
-    if !canonical_backup.starts_with(&canonical_data_dir) {
-        return Err("backup path must be within the application data directory".to_string());
-    }
-
-    // No silent overwrite — refuse if the target file already exists.
-    if canonical_backup.exists() {
-        return Err(format!(
-            "backup file already exists: {} — remove it first",
-            backup_path
-        ));
-    }
-
-    // Ensure the parent directory exists.
-    if let Some(parent) = canonical_backup.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create backup directory: {}", e))?;
-    }
-
-    std::fs::copy(&wallet_path, &canonical_backup)
-        .map_err(|e| format!("backup failed: {}", e))?;
-
+    #[cfg(target_os = "linux")]
+    {
+    let target = secure_backup::Target::new(&state.data_dir, &backup_path)?;
+    let result = sqlx::query("VACUUM INTO ?").bind(target.sqlite_path()).execute(&pool).await;
+    result.map_err(|e| format!("backup failed: {e}"))?;
+    target.publish()?;
     log::info!("Wallet backed up to: {}", backup_path);
     Ok(backup_path)
+    }
 }
 
 // ============================================================================
+#[cfg(target_os = "linux")]
+mod secure_backup {
+    use rand::RngCore;
+    use std::{ffi::{CString, OsStr}, os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::ffi::OsStrExt}, path::{Component, Path}};
+    #[repr(C)]
+    struct OpenHow { flags: u64, mode: u64, resolve: u64 }
+    fn cstring(s: &OsStr) -> Result<CString, String> { CString::new(s.as_bytes()).map_err(|_| "path contains NUL".into()) }
+    fn owned(fd: i32) -> Result<OwnedFd, String> {
+        if fd < 0 { Err(std::io::Error::last_os_error().to_string()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
+    }
+    pub struct Target { parent: OwnedFd, stage: OwnedFd, stage_name: CString, leaf: CString }
+    impl Target {
+        pub fn new(data_dir: &str, backup: &str) -> Result<Self, String> {
+            let root = Path::new(data_dir).canonicalize().map_err(|e| e.to_string())?;
+            let path = Path::new(backup);
+            let relative = path.strip_prefix(&root).or_else(|_| path.strip_prefix(data_dir)).map_err(|_| "backup path must be inside the data directory")?;
+            let leaf = cstring(relative.file_name().ok_or("backup path has no filename")?)?;
+            if !relative.components().all(|c| matches!(c, Component::Normal(_))) { return Err("invalid backup path".into()); }
+            let root_fd = owned(unsafe { libc::open(cstring(root.as_os_str())?.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW) })?;
+            let parent_path = relative.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            let how = OpenHow { flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64, mode: 0, resolve: 0x02 | 0x04 | 0x08 };
+            let parent = owned(unsafe { libc::syscall(libc::SYS_openat2, root_fd.as_raw_fd(), cstring(parent_path.as_os_str())?.as_ptr(), &how, std::mem::size_of::<OpenHow>()) as i32 })?;
+            for _ in 0..16 {
+                let mut random = [0u8; 16]; rand::rngs::OsRng.fill_bytes(&mut random);
+                let name = CString::new(format!(".wallet-backup-{}", hex::encode(random))).unwrap();
+                if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::AlreadyExists { continue; }
+                    return Err(format!("backup staging: {err}"));
+                }
+                let stage = match owned(unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW) }) {
+                    Ok(v) => v,
+                    Err(e) => { unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR); } return Err(e); }
+                };
+                let target = Self { parent, stage, stage_name: name, leaf };
+                let snapshot = CString::new("snapshot").unwrap();
+                let fd = owned(unsafe { libc::openat(target.stage.as_raw_fd(), snapshot.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0o600) })?;
+                drop(fd);
+                return Ok(target);
+            }
+            Err("could not create unique backup staging directory".into())
+        }
+        pub fn sqlite_path(&self) -> String { format!("/proc/self/fd/{}/snapshot", self.stage.as_raw_fd()) }
+        pub fn publish(&self) -> Result<(), String> {
+            let name = CString::new("snapshot").unwrap();
+            let file = owned(unsafe { libc::openat(self.stage.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) })?;
+            if unsafe { libc::fsync(file.as_raw_fd()) } != 0 { return Err(format!("backup sync: {}", std::io::Error::last_os_error())); }
+            if unsafe { libc::linkat(self.stage.as_raw_fd(), name.as_ptr(), self.parent.as_raw_fd(), self.leaf.as_ptr(), 0) } != 0 { return Err(format!("backup publication: {}", std::io::Error::last_os_error())); }
+            if unsafe { libc::fsync(self.parent.as_raw_fd()) } != 0 { return Err(format!("backup published but directory sync failed: {}", std::io::Error::last_os_error())); }
+            Ok(())
+        }
+    }
+    impl Drop for Target {
+        fn drop(&mut self) {
+            let name = CString::new("snapshot").unwrap();
+            unsafe { libc::unlinkat(self.stage.as_raw_fd(), name.as_ptr(), 0); libc::unlinkat(self.parent.as_raw_fd(), self.stage_name.as_ptr(), libc::AT_REMOVEDIR); }
+        }
+    }
+}
+
 // Network switching (mainnet / testnet / STN)
 // ============================================================================
 
@@ -324,8 +356,8 @@ pub async fn switch_network(
 ) -> Result<String, String> {
     log::info!("switch_network — {}", network_id);
 
-    if network_id != "mainnet" && network_id != "testnet" && network_id != "stn" {
-        return Err(format!("unknown network: {}", network_id));
+    if network_id != "mainnet" {
+        return Err("Only mainnet is supported; network state and addresses are not isolated for testnet or STN".into());
     }
 
     let mut network = state.network.lock().unwrap();
@@ -461,61 +493,8 @@ pub async fn import_privkey(
     wif: String,
     password: String,
 ) -> Result<ImportPrivkeyResult, String> {
-    log::info!("import_privkey");
-
-    let (pool, account_id, _xprv_opt, keystore_data) = {
-        let guard = state.active_wallet.lock().unwrap();
-        let active = guard.as_ref().ok_or("no wallet is currently open")?;
-        (
-            active.db_pool.clone(),
-            active.account_id,
-            active.decrypted_xprv.clone(),
-            active.keystore_data.clone(),
-        )
-    };
-
-    // Verify password
-    if !crate::core::keystore::verify_password(&keystore_data, &password) {
-        return Err("incorrect password".to_string());
-    }
-
-    // Decode WIF (mainnet prefix 0x80)
-    let priv_key = bsv::primitives::private_key::PrivateKey::from_wif(&wif)
-        .map_err(|e| format!("invalid WIF: {}", e))?;
-
-    let pubkey = priv_key.to_public_key();
-    let address = crate::core::address::pubkey_to_p2pkh_address(&pubkey);
-
-    // Store as imported key (derivation_type = IMPORTED_PRIVATE_KEY = 1)
-    let derivation_data = serde_json::json!({
-        "type": "imported_privkey",
-        "wif_encrypted": crate::security::encryption::pw_encode(&wif, &password),
-    })
-    .to_string()
-    .into_bytes();
-
-    let mk_row = repositories::get_first_master_key(&pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    let masterkey_id = mk_row.map(|mk| mk.masterkey_id);
-
-    let keyinstance_id = repositories::insert_keyinstance(
-        &pool,
-        account_id,
-        masterkey_id,
-        1, // DerivationType::IMPORTED_PRIVATE_KEY
-        &derivation_data,
-        repositories::script_type::P2PKH,
-        0,
-        None,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
-    Ok(ImportPrivkeyResult {
-        address,
-        keyinstance_id,
-    })
+    let _ = (state, wif, password);
+    Err("Private-key import is disabled until imported outputs can be synchronized and spent safely".into())
 }
 
 // ============================================================================
@@ -531,6 +510,60 @@ mod tests {
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    #[tokio::test]
+    async fn actual_backup_checks_password_and_snapshots_live_wal() {
+        let state = make_test_state("actual_backup");
+        wallet_service::create_wallet(&state, "source", "test-password", None, None).await.unwrap();
+        let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+        let mut writer = pool.acquire().await.unwrap();
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&mut *writer).await.unwrap();
+        sqlx::query("PRAGMA wal_autocheckpoint=0").execute(&mut *writer).await.unwrap();
+        sqlx::query("INSERT INTO WalletData (key,value,date_created,date_updated) VALUES ('backup_test_marker','committed',0,0)").execute(&mut *writer).await.unwrap();
+        let main_only = std::path::Path::new(&state.data_dir).join("main-only.sqlite");
+        std::fs::copy(std::path::Path::new(&state.data_dir).join("source.sqlite"), &main_only).unwrap();
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&main_only).read_only(true).immutable(true);
+        let main_pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(options).await.unwrap();
+        let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM WalletData WHERE key='backup_test_marker'").fetch_one(&main_pool).await.unwrap();
+        assert_eq!(before.0, 0, "marker must be absent from checkpointed main file");
+        main_pool.close().await;
+        let backup = std::path::Path::new(&state.data_dir).join("copy.sqlite");
+        let path = backup.to_string_lossy().to_string();
+        assert!(backup_wallet_inner(&state, path.clone(), "wrong".into()).await.is_err());
+        assert!(backup_wallet_inner(&state, path.clone(), "".into()).await.is_err());
+        assert!(!backup.exists());
+        backup_wallet_inner(&state, path.clone(), "test-password".into()).await.unwrap();
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let original = std::fs::read(&backup).unwrap();
+        assert!(backup_wallet_inner(&state, path.clone(), "test-password".into()).await.is_err());
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        #[cfg(target_os = "linux")] {
+            let alias = std::path::Path::new(&state.data_dir).join("alias");
+            std::os::unix::fs::symlink(&state.data_dir, &alias).unwrap();
+            assert!(backup_wallet_inner(&state, alias.join("escape.sqlite").to_string_lossy().into(), "test-password".into()).await.is_err());
+        }
+        let second = std::path::Path::new(&state.data_dir).join("second.sqlite");
+        let guard = state.wallet_operation.lock().await;
+        let future = backup_wallet_inner(&state, second.to_string_lossy().into(), "test-password".into());
+        tokio::pin!(future);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(30), &mut future).await.is_err());
+        assert!(!second.exists());
+        drop(guard);
+        future.await.unwrap();
+        let restored = crate::db::connection::open_wallet_db(&path).await.unwrap();
+        assert_eq!(repositories::get_wallet_data(&restored, "backup_test_marker").await.unwrap().as_deref(), Some("committed"));
+        restored.close().await;
+        drop(writer);
+        drop(pool);
+        wallet_service::close_wallet(&state).await.unwrap();
+        wallet_service::open_wallet(&state, "copy").await.unwrap();
+        wallet_service::unlock_wallet_authorized(&state, "test-password", None).await.unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
+        std::fs::remove_dir_all(&state.data_dir).unwrap();
+    }
+
     fn make_test_state(test_name: &str) -> AppState {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let temp_dir =
@@ -544,7 +577,48 @@ mod tests {
             active_wallet: std::sync::Mutex::new(None),
             network: std::sync::Mutex::new(crate::state::NetworkState::new()),
             pending_plans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wallet_operation: tokio::sync::Mutex::new(()),
         }
+    }
+
+    #[tokio::test]
+    async fn detail_requires_account_and_preserves_unknown_raw() {
+        use bsv::transaction::{transaction::Transaction, transaction_input::TransactionInput, transaction_output::TransactionOutput};
+        use bsv::script::locking_script::LockingScript;
+        let state = make_test_state("tx_detail_verified");
+        wallet_service::create_wallet(&state, "wallet", "pw", None, None).await.unwrap();
+        let (pool, account) = { let g = state.active_wallet.lock().unwrap(); let a = g.as_ref().unwrap(); (a.db_pool.clone(), a.account_id) };
+        let master = repositories::get_first_master_key(&pool).await.unwrap().unwrap();
+        let key = repositories::insert_keyinstance(&pool, account, Some(master.masterkey_id), repositories::derivation_type::BIP32,
+            br#"{"subpath":[0,0]}"#, repositories::script_type::P2PKH, 0, None).await.unwrap();
+        let mut tx = Transaction::new();
+        let previous_id = hex::encode((0u8..32).collect::<Vec<_>>());
+        tx.inputs.push(TransactionInput { source_txid: Some(previous_id.clone()), source_output_index: 2, ..Default::default() });
+        tx.outputs.push(TransactionOutput { satoshis: Some(1234), locking_script: LockingScript::from_binary(&[0x51]), change: false });
+        tx.outputs.push(TransactionOutput { satoshis: Some(0), locking_script: LockingScript::from_binary(&[0x6a]), change: false });
+        let id = tx.id().unwrap();
+        let hash = crate::core::address::hex_str_to_hash(&id).unwrap();
+        repositories::upsert_transaction(&pool, &hash, Some(123), None).await.unwrap();
+        repositories::upsert_transaction_delta(&pool, key, &hash, 1234).await.unwrap();
+        repositories::set_transaction_label(&pool, &hash, Some("label")).await.unwrap();
+        let missing = transaction_detail(&pool, account, &id).await.unwrap();
+        assert!(!missing.detail_complete && missing.inputs.is_none() && missing.outputs.is_none());
+        assert!(transaction_detail(&pool, account + 1, &id).await.is_err());
+        assert!(transaction_detail(&pool, account, "ab").await.is_err());
+        let raw = hex::decode(tx.to_hex().unwrap()).unwrap();
+        repositories::upsert_transaction(&pool, &hash, Some(123), Some(&raw)).await.unwrap();
+        let detail = transaction_detail(&pool, account, &id).await.unwrap();
+        assert!(detail.detail_complete);
+        assert_eq!(detail.status, "confirmed");
+        assert_eq!(detail.label.as_deref(), Some("label"));
+        let inputs = detail.inputs.unwrap();
+        assert_eq!(inputs[0].prev_vout, 2);
+        assert_eq!(inputs[0].prev_tx_hash, previous_id);
+        assert_eq!(detail.outputs.unwrap().len(), 2);
+        sqlx::query("UPDATE Transactions SET tx_data = ? WHERE tx_hash = ?").bind(vec![0u8; 10]).bind(&hash).execute(&pool).await.unwrap();
+        assert!(transaction_detail(&pool, account, &id).await.is_err());
+        wallet_service::close_wallet(&state).await.unwrap();
+        drop(pool);
     }
 
     /// list_networks should return exactly 3 networks: mainnet, testnet, stn.
@@ -645,7 +719,7 @@ mod tests {
 
         // Cleanup
         std::fs::remove_file(&backup_path).ok();
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// import_privkey: a valid WIF key produces an address; wrong password is rejected.
@@ -729,7 +803,7 @@ mod tests {
         assert!(!crate::core::keystore::verify_password(&keystore_data, "wrong"));
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// get_transaction: querying a nonexistent txid should return "transaction not found".
@@ -779,7 +853,7 @@ mod tests {
         assert!(exists.is_none(), "nonexistent tx_hash should return None");
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// set_totp_scope: setting to "login" and "tx" should succeed; invalid scope rejected.
@@ -844,7 +918,7 @@ mod tests {
         assert_eq!(recovery_remaining, 0);
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// get_totp_status: on a fresh wallet, TOTP is disabled, scope defaults to "tx".
@@ -877,7 +951,7 @@ mod tests {
         assert_eq!(recovery_remaining, 0);
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// NetworkDefinition struct: verify the struct is serializable and has expected fields.

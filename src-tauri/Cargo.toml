@@ -34,6 +34,7 @@ thiserror = "2"
 log = "0.4"
 env_logger = "0.11"
 
+
 # Utilities
 hex = "0.4"
 bs58 = "0.5"
@@ -71,6 +72,9 @@ picqr = { git = "https://github.com/Minenclown/picqr.git", default-features = fa
 # qrcode library used by the original ElectrumSVP). Enabled via the
 # `qrcode-fallback` feature flag (Murena-Prinzip: OFF by default).
 qrcode = { version = "0.14", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [features]
 default = []

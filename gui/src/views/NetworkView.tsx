@@ -4,7 +4,7 @@ import { api } from '../api';
 
 export function NetworkView() {
   const [info, setInfo] = useState<any>(null);
-  const [servers, setServers] = useState<Record<string, any>>({});
+  const [servers, setServers] = useState<any[]>([]);
   const [networks, setNetworks] = useState<{ id: string; name: string }[]>([]);
   const [activeNetwork, setActiveNetwork] = useState('mainnet');
   const [headerStore, setHeaderStore] = useState<any>(null);
@@ -23,7 +23,7 @@ export function NetworkView() {
         api.getHeaderStoreInfo().catch(() => null),
       ]);
       if (netInfo) setInfo(netInfo);
-      if (srvResult) setServers((srvResult as any).servers || {});
+      if (srvResult) setServers(srvResult);
       if (netList) setNetworks(netList as any[]);
       if (hdrStore) setHeaderStore(hdrStore);
     } catch {
@@ -40,8 +40,8 @@ export function NetworkView() {
     setError(null);
     setSuccess(null);
     try {
-      const serverInfo = servers[host];
-      const port = serverInfo?.s || serverInfo?.t || 50001;
+      const serverInfo = servers.find((server) => server.host === host);
+      const port = serverInfo?.ssl_port || 50002;
       await api.connectServer(host, port);
       setSuccess(`Connected to ${host}`);
       await loadData();
@@ -70,8 +70,9 @@ export function NetworkView() {
     setSyncing(true);
     setError(null);
     try {
-      await api.syncWallet();
-      setSuccess('Wallet synced');
+      const result = await api.syncWallet();
+      if (!result.synced) throw new Error(result.message);
+      setSuccess(result.message);
     } catch (e: any) {
       setError(e.message || 'Sync failed');
     } finally {
@@ -203,19 +204,19 @@ export function NetworkView() {
         <div className="bg-void-900 rounded-lg p-4">
           <div className="text-sm text-gray-400 mb-2">ElectrumX Servers</div>
           <div className="space-y-1">
-            {Object.entries(servers).map(([host, srvInfo]: [string, any]) => (
-              <div key={host} className="text-sm text-gray-300 font-mono flex items-center justify-between">
-                <span>{host} <span className="text-gray-400">: {srvInfo.s || srvInfo.t}</span></span>
+            {servers.map((srvInfo) => (
+              <div key={srvInfo.host} className="text-sm text-gray-300 font-mono flex items-center justify-between">
+                <span>{srvInfo.host} <span className="text-gray-400">: {srvInfo.ssl_port}</span></span>
                 <div className="flex gap-2">
                   <button
-                    onClick={() => handleConnect(host)}
+                    onClick={() => handleConnect(srvInfo.host)}
                     disabled={connecting}
                     className="text-xs text-accent hover:text-accent-hover disabled:opacity-50"
                   >
                     Connect
                   </button>
                   <button
-                    onClick={() => handleBanServer(host)}
+                    onClick={() => handleBanServer(srvInfo.host)}
                     className="text-xs text-danger hover:text-red-400"
                   >
                     Ban
@@ -223,7 +224,7 @@ export function NetworkView() {
                 </div>
               </div>
             ))}
-            {!Object.keys(servers).length && <div className="text-gray-400">No servers loaded.</div>}
+            {!servers.length && <div className="text-gray-400">No servers loaded.</div>}
           </div>
         </div>
 

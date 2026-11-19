@@ -6,6 +6,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+pub mod agent;
 pub mod commands;
 pub mod core;
 pub mod db;
@@ -36,9 +37,13 @@ pub fn run() {
 
     log::info!("ElectrumSV-Mc starting (Rust/Tauri native mode)");
 
+    let mut state = AppState::new();
+    let (_data_lock, canonical_dir) = agent::lock_data_dir(std::path::Path::new(&state.data_dir))
+        .expect("cannot lock wallet data directory");
+    state.data_dir = canonical_dir;
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .manage(AppState::new())
+        .manage(state)
         .invoke_handler(tauri::generate_handler![
             get_app_version,
             get_app_name,
@@ -54,6 +59,7 @@ pub fn run() {
             commands::account::get_history,
             commands::account::get_utxos,
             commands::account::get_receive_address,
+            commands::account::list_receive_addresses,
             commands::account::get_public_key,
             // Network commands (Milestone 4)
             commands::network::get_network_info,
@@ -73,6 +79,10 @@ pub fn run() {
             commands::transactions::sign_tx,
             commands::transactions::sign_multisig_tx,
             commands::transactions::broadcast_tx,
+            commands::transactions::get_spend_plan_status,
+            commands::transactions::cancel_spend_plan,
+            commands::transactions::list_spend_plans,
+            commands::transactions::broadcast_spend_plan,
             commands::transactions::estimate_fee,
             // TOTP commands (Milestone 5 — AUD-007)
             commands::wallet::enable_totp,

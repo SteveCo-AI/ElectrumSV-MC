@@ -69,7 +69,7 @@ export function ReceiveView() {
     setLoading(true);
     try {
       const r = await api.getReceiveAddress(activeAccountId);
-      const newAddr = { address: r.address || '', key_id: r.key_id ?? null };
+      const newAddr = { address: r.address || '', key_id: r.keyinstance_id ?? r.key_id ?? null };
       if (newAddr.address && newAddr.address !== 'not_available') {
         setAddresses((prev) => {
           if (prev.some((a) => a.address === newAddr.address)) return prev;
@@ -86,7 +86,12 @@ export function ReceiveView() {
   useEffect(() => {
     setAddresses([]);
     setPaymentUri(null);
-    loadAddress();
+    if (activeAccountId === null) return;
+    setLoading(true);
+    api.listReceiveAddresses(activeAccountId).then((items) => {
+      if (items.length) setAddresses(items.map((item) => ({ address: item.address, key_id: item.keyinstance_id })));
+      else return loadAddress();
+    }).catch((e) => setError(`Receive addresses: ${String(e)}`)).finally(() => setLoading(false));
   }, [activeAccountId]);
 
   const handleNewAddress = async () => {

@@ -100,6 +100,7 @@ mod tests {
             active_wallet: std::sync::Mutex::new(None),
             network: std::sync::Mutex::new(crate::state::NetworkState::new()),
             pending_plans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wallet_operation: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -135,7 +136,7 @@ mod tests {
         }
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -160,7 +161,7 @@ mod tests {
         assert_eq!(val, Some("USD".to_string()));
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -195,7 +196,7 @@ mod tests {
         assert!(found, "language key should be present in WalletData");
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]

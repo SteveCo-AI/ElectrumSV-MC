@@ -165,7 +165,9 @@ pub fn decrypt_mnemonic(
 
 /// Verify a password against keystore data by attempting to decrypt the xprv.
 pub fn verify_password(data: &KeyStoreData, password: &str) -> bool {
-    decrypt_xprv(data, password).is_ok()
+    let Ok(raw) = decrypt_xprv(data, password) else { return false; };
+    let Ok(key) = ExtendedKey::from_string(&raw) else { return false; };
+    key.is_private() && key.to_public().is_ok_and(|public| public.to_base58() == data.xpub)
 }
 
 #[cfg(test)]
@@ -205,6 +207,22 @@ mod tests {
 
         let decrypted_mnemonic = decrypt_mnemonic(&ks_data, password).unwrap();
         assert_eq!(decrypted_mnemonic, TEST_MNEMONIC);
+    }
+
+    #[test]
+    fn password_verification_rejects_empty_ciphertext_and_accepts_matching_plaintext_legacy() {
+        let seed = mnemonic::mnemonic_to_seed(TEST_MNEMONIC, "").unwrap();
+        let derived = derive_keys_from_seed(&seed).unwrap();
+        let mut data = create_keystore_data(TEST_MNEMONIC, None, "secret", &derived);
+        assert!(!verify_password(&data, ""));
+        assert!(!verify_password(&data, "wrong"));
+        assert!(verify_password(&data, "secret"));
+        data.xprv = derived.xprv.clone();
+        assert!(verify_password(&data, ""));
+        data.xpub = derive_keys_from_seed(&[42; 64]).unwrap().xpub;
+        assert!(!verify_password(&data, ""));
+        data.xprv = data.xpub.clone();
+        assert!(!verify_password(&data, ""));
     }
 
     #[test]

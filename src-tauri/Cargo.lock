@@ -1013,6 +1013,7 @@ dependencies = [
  "chrono",
  "env_logger",
  "hex",
+ "libc",
  "log",
  "pbkdf2",
  "picqr",

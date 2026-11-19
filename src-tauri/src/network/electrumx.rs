@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex, Notify};
 use tokio_rustls::TlsConnector;
@@ -55,8 +55,8 @@ pub enum ElectrumNotification {
 
 const MAX_MESSAGE_SIZE: usize = 50 * 1024 * 1024; // 50 MB
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const PROTOCOL_MIN: u16 = 1;
-const PROTOCOL_MAX: u16 = 2;
+const PROTOCOL_MIN: &str = "1.4";
+const PROTOCOL_MAX: &str = "1.4";
 const CLIENT_VERSION: &str = "ElectrumSV-Mc 0.1.0";
 
 // ---------------------------------------------------------------------------
@@ -125,6 +125,14 @@ pub struct ElectrumXClient {
     inner: Arc<Inner>,
 }
 
+fn client_tls_config(roots: rustls::RootCertStore) -> Result<rustls::ClientConfig, NetworkError> {
+    Ok(rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| NetworkError::Tls(format!("TLS protocol configuration: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
+}
+
 impl ElectrumXClient {
     /// Create a new client for the given server (not yet connected).
     pub fn new(server: ServerEntry) -> Self {
@@ -145,9 +153,16 @@ impl ElectrumXClient {
             roots
         };
 
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        self.connect_with_roots(root_store).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn connect_with_test_roots(&self, roots: rustls::RootCertStore) -> Result<(), NetworkError> {
+        self.connect_with_roots(roots).await
+    }
+
+    async fn connect_with_roots(&self, root_store: rustls::RootCertStore) -> Result<(), NetworkError> {
+        let config = client_tls_config(root_store)?;
 
         let connector = TlsConnector::from(Arc::new(config));
         let addr = self.inner.server.tls_addr();
@@ -183,6 +198,9 @@ impl ElectrumXClient {
             *w = Some(writer);
         }
 
+        // Set the state before spawning so immediate EOF cannot resurrect a dead connection.
+        self.inner.connected.store(true, Ordering::SeqCst);
+
         // Start reader task
         let inner = self.inner.clone();
         let reader_task = tokio::spawn(async move {
@@ -194,10 +212,11 @@ impl ElectrumXClient {
             *rt = Some(reader_task);
         }
 
-        self.inner.connected.store(true, Ordering::SeqCst);
-
-        // Perform handshake
-        self.handshake().await?;
+        // Perform handshake; a failed negotiation must not leave a live session.
+        if let Err(error) = self.handshake().await {
+            let _ = self.disconnect().await;
+            return Err(error);
+        }
 
         Ok(())
     }
@@ -221,16 +240,28 @@ impl ElectrumXClient {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.inner.pending.lock().await;
+            if !self.inner.connected.load(Ordering::SeqCst) {
+                return Err(NetworkError::NotConnected);
+            }
             pending.insert(id, PendingRequest { tx });
         }
 
-        // Send request
-        {
+        // Bound both lock acquisition and writes so shutdown can acquire the writer.
+        let sent = tokio::time::timeout(REQUEST_TIMEOUT, async {
             let mut w = self.inner.writer.lock().await;
             let writer = w.as_mut().ok_or(NetworkError::NotConnected)?;
-            writer.write_all(json_str.as_bytes()).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await?;
+            write_request(writer, &json_str).await
+        }).await;
+        let error = match sent {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some(NetworkError::Connection(format!("request write timeout: {method}"))),
+        };
+        if let Some(error) = error {
+            self.inner.pending.lock().await.remove(&id);
+            // A partial write leaves framing ambiguous; end the connection.
+            let _ = self.disconnect().await;
+            return Err(error);
         }
 
         // Wait for response with timeout
@@ -287,7 +318,7 @@ impl ElectrumXClient {
             .map_err(|_| NetworkError::Protocol(format!("bad protocol major: {}", parts[0])))?;
         let minor: u16 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 
-        if !(PROTOCOL_MIN..=PROTOCOL_MAX).contains(&major) {
+        if major != 1 || minor != 4 {
             return Err(NetworkError::Protocol(format!(
                 "server protocol {major}.{minor} not in range [{PROTOCOL_MIN}, {PROTOCOL_MAX}]"
             )));
@@ -331,7 +362,7 @@ impl ElectrumXClient {
         {
             let mut w = self.inner.writer.lock().await;
             if let Some(mut writer) = w.take() {
-                let _ = writer.shutdown().await;
+                let _ = tokio::time::timeout(REQUEST_TIMEOUT, writer.shutdown()).await;
             }
         }
 
@@ -368,38 +399,53 @@ impl ElectrumXClient {
 // Reader loop — runs in a spawned task, dispatches responses + notifications
 // ---------------------------------------------------------------------------
 
-async fn read_loop(
-    inner: Arc<Inner>,
-    reader: tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>,
-) {
-    let mut reader = BufReader::with_capacity(64 * 1024, reader);
-    let mut line = String::new();
+async fn write_request<W: AsyncWrite + Unpin>(writer: &mut W, request: &str) -> Result<(), NetworkError> {
+    writer.write_all(request.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
 
+async fn read_bounded_frame<R: AsyncBufRead + Unpin>(reader: &mut R, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
+    let mut frame = Vec::new();
     loop {
-        line.clear();
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if frame.is_empty() { Ok(None) } else {
+                Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "incomplete ElectrumX frame"))
+            };
+        }
+        let end = available.iter().position(|&b| b == b'\n').map(|i| i + 1).unwrap_or(available.len());
+        if end > limit.saturating_sub(frame.len()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "ElectrumX message too large"));
+        }
+        let complete = available[end - 1] == b'\n';
+        frame.extend_from_slice(&available[..end]);
+        reader.consume(end);
+        if complete { return Ok(Some(frame)); }
+    }
+}
 
-        // Read one newline-delimited message
-        match reader.read_line(&mut line).await {
-            Ok(0) => {
-                // EOF — server closed connection
-                break;
-            }
-            Ok(n) => {
-                if n > MAX_MESSAGE_SIZE {
-                    log::error!("ElectrumX message too large: {n} bytes");
-                    continue;
-                }
-            }
+async fn read_loop<R: AsyncRead + Unpin>(inner: Arc<Inner>, reader: R) {
+    read_loop_with_limit(inner, reader, MAX_MESSAGE_SIZE).await;
+}
+
+async fn read_loop_with_limit<R: AsyncRead + Unpin>(inner: Arc<Inner>, reader: R, limit: usize) {
+    let mut reader = BufReader::with_capacity(64 * 1024, reader);
+    loop {
+        let line = match read_bounded_frame(&mut reader, limit).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
             Err(e) => {
                 if inner.connected.load(Ordering::SeqCst) {
                     log::error!("ElectrumX read error: {e}");
                 }
                 break;
             }
-        }
+        };
 
         // Parse JSON-RPC message
-        let msg: Value = match serde_json::from_str(&line) {
+        let msg: Value = match serde_json::from_slice(&line) {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("ElectrumX: malformed JSON: {e}");
@@ -418,27 +464,15 @@ async fn read_loop(
                 // Remove from pending first, then send (avoids moving from shared ref)
                 let req = inner.pending.lock().await.remove(&id);
                 if let Some(req) = req {
-                    // Check for error
-                    if let Some(err) = msg.get("error") {
-                        if !err.is_null() {
-                            let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
-                            let message = err
-                                .get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown error")
-                                .to_string();
-                            let _ = req
-                                .tx
-                                .send(Err(NetworkError::Server(format!("code {code}: {message}"))));
-                        } else {
-                            // Success
-                            let result = msg.get("result").cloned().unwrap_or(Value::Null);
-                            let _ = req.tx.send(Ok(result));
+                    // Accept legacy result/error:null envelopes without treating a missing result as null.
+                    match (msg.get("result"), msg.get("error")) {
+                        (Some(result), None | Some(Value::Null)) => { let _ = req.tx.send(Ok(result.clone())); }
+                        (None | Some(Value::Null), Some(error)) if !error.is_null() => {
+                            let code = error.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let message = error.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                            let _ = req.tx.send(Err(NetworkError::Server(format!("code {code}: {message}"))));
                         }
-                    } else {
-                        // No error field — success
-                        let result = msg.get("result").cloned().unwrap_or(Value::Null);
-                        let _ = req.tx.send(Ok(result));
+                        _ => { let _ = req.tx.send(Err(NetworkError::Protocol("invalid result/error response".into()))); }
                     }
                 }
             }
@@ -534,6 +568,8 @@ async fn read_loop(
 
     // Mark as disconnected
     inner.connected.store(false, Ordering::SeqCst);
+    // Dropping both halves closes the underlying connection on protocol failure.
+    *inner.writer.lock().await = None;
 
     // Fail all pending requests
     let mut pending = inner.pending.lock().await;
@@ -751,38 +787,16 @@ impl NetworkBackend for ElectrumXClient {
             )
             .await?;
 
-        let root = result
-            .get("merkle")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| NetworkError::Protocol("get_merkle: missing merkle root".into()))?
-            .to_string();
-
-        let branch_arr = result
-            .get("merkle_branch")
-            .or_else(|| result.get("branch"))
-            .and_then(|v| v.as_array())
+        let branch_arr = result.get("merkle").and_then(|v| v.as_array())
             .ok_or_else(|| NetworkError::Protocol("get_merkle: missing branch".into()))?;
-
-        let _pos = result
-            .get("pos")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| NetworkError::Protocol("get_merkle: missing pos".into()))?;
-
-        let mut merkle_branch = Vec::with_capacity(branch_arr.len());
-        for item in branch_arr {
-            let hash = item
-                .as_str()
-                .ok_or_else(|| NetworkError::Protocol("get_merkle: branch item not str".into()))?
-                .to_string();
-            merkle_branch.push((hash, false));
+        let pos = result.get("pos").and_then(|v| v.as_u64())
+            .ok_or_else(|| NetworkError::Protocol("get_merkle: missing position".into()))?;
+        let mut branch = Vec::with_capacity(branch_arr.len());
+        for (i, item) in branch_arr.iter().enumerate() {
+            let hash = item.as_str().ok_or_else(|| NetworkError::Protocol("get_merkle: invalid branch".into()))?;
+            branch.push((hash.to_string(), i < 64 && ((pos >> i) & 1) == 0));
         }
-
-        Ok(MerkleProof {
-            tx_hash: tx_hash.to_string(),
-            block_height,
-            merkle_branch,
-            root,
-        })
+        Ok(MerkleProof { tx_hash: tx_hash.to_string(), block_height, merkle_branch: branch, position: Some(pos), root: String::new() })
     }
 
     async fn subscribe_scripthash(&self, scripthash: &str) -> Result<(), NetworkError> {
@@ -815,7 +829,129 @@ impl NetworkBackend for ElectrumXClient {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tls_config_uses_explicit_provider_without_network() {
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+        let roots = rustls::RootCertStore::empty();
+        let config = super::client_tls_config(roots);
+        assert!(config.is_ok());
+        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn missing_writer_cleans_registered_request() {
+        let client = ElectrumXClient::new(ServerEntry::new("example.com", 50002));
+        client.inner.connected.store(true, Ordering::SeqCst);
+        assert!(matches!(client.call("test", json!([])).await, Err(NetworkError::NotConnected)));
+        assert!(client.inner.pending.lock().await.is_empty());
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn closed_synthetic_writer_returns_error() {
+        let (mut writer, reader) = tokio::io::duplex(8);
+        drop(reader);
+        assert!(write_request(&mut writer, "{}").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_frame_handles_boundary_and_eof() {
+        async fn one(bytes: &[u8], limit: usize) -> std::io::Result<Option<Vec<u8>>> {
+            read_bounded_frame(&mut BufReader::with_capacity(3, std::io::Cursor::new(bytes)), limit).await
+        }
+        assert_eq!(one(b"1234567\n", 8).await.unwrap().unwrap(), b"1234567\n");
+        assert_eq!(one(b"12345678\n", 8).await.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(one(b"123456789", 8).await.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(one(b"123", 8).await.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(one(b"", 8).await.unwrap().is_none());
+        let mut reader = BufReader::with_capacity(3, std::io::Cursor::new(b"one\ntwo\n"));
+        assert_eq!(read_bounded_frame(&mut reader, 8).await.unwrap().unwrap(), b"one\n");
+        assert_eq!(read_bounded_frame(&mut reader, 8).await.unwrap().unwrap(), b"two\n");
+        assert!(read_bounded_frame(&mut reader, 8).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_disconnects_and_fails_all_pending() {
+        let client = ElectrumXClient::new(ServerEntry::new("example.com", 50002));
+        client.inner.connected.store(true, Ordering::SeqCst);
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        {
+            let mut pending = client.inner.pending.lock().await;
+            pending.insert(1, PendingRequest { tx: tx1 });
+            pending.insert(2, PendingRequest { tx: tx2 });
+        }
+        let (mut writer, reader) = tokio::io::duplex(128);
+        let task = tokio::spawn(read_loop_with_limit(client.inner.clone(), reader, 16));
+        writer.write_all(b"12345678901234567\n{\"id\":1,\"result\":42}\n").await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+        assert!(matches!(rx1.await.unwrap(), Err(NetworkError::NotConnected)));
+        assert!(matches!(rx2.await.unwrap(), Err(NetworkError::NotConnected)));
+        assert!(!client.is_connected());
+        assert!(client.inner.pending.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_handles_jsonrpc_and_legacy_envelopes_without_inventing_null() {
+        let client = ElectrumXClient::new(ServerEntry::new("example.com", 50002));
+        client.inner.connected.store(true, Ordering::SeqCst);
+        let mut receivers = Vec::new();
+        for id in 1..=8 {
+            let (tx, rx) = oneshot::channel();
+            client.inner.pending.lock().await.insert(id, PendingRequest { tx });
+            receivers.push(rx);
+        }
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let task = tokio::spawn(read_loop_with_limit(client.inner.clone(), reader, 128));
+        writer.write_all(concat!(
+            "{\"id\":1}\n",
+            "{\"id\":2,\"error\":null}\n",
+            "{\"id\":3,\"result\":null}\n",
+            "{\"id\":4,\"result\":12}\n",
+            "{\"id\":5,\"result\":null,\"error\":null}\n",
+            "{\"id\":6,\"result\":12,\"error\":null}\n",
+            "{\"id\":7,\"result\":null,\"error\":{\"code\":-1,\"message\":\"failed\"}}\n",
+            "{\"id\":8,\"result\":12,\"error\":{\"code\":-1,\"message\":\"failed\"}}\n",
+        ).as_bytes()).await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+        let mut received = receivers.into_iter();
+        assert!(matches!(received.next().unwrap().await.unwrap(), Err(NetworkError::Protocol(_))));
+        assert!(matches!(received.next().unwrap().await.unwrap(), Err(NetworkError::Protocol(_))));
+        assert_eq!(received.next().unwrap().await.unwrap().unwrap(), Value::Null);
+        assert_eq!(received.next().unwrap().await.unwrap().unwrap(), json!(12));
+        assert_eq!(received.next().unwrap().await.unwrap().unwrap(), Value::Null);
+        assert_eq!(received.next().unwrap().await.unwrap().unwrap(), json!(12));
+        assert!(matches!(received.next().unwrap().await.unwrap(), Err(NetworkError::Server(_))));
+        assert!(matches!(received.next().unwrap().await.unwrap(), Err(NetworkError::Protocol(_))));
+    }
+
+    #[tokio::test]
+    async fn reader_dispatches_multiple_frames_and_rejects_partial_final_frame() {
+        let client = ElectrumXClient::new(ServerEntry::new("example.com", 50002));
+        client.inner.connected.store(true, Ordering::SeqCst);
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        let (tx3, rx3) = oneshot::channel();
+        {
+            let mut pending = client.inner.pending.lock().await;
+            pending.insert(1, PendingRequest { tx: tx1 });
+            pending.insert(2, PendingRequest { tx: tx2 });
+            pending.insert(3, PendingRequest { tx: tx3 });
+        }
+        let (mut writer, reader) = tokio::io::duplex(256);
+        let task = tokio::spawn(read_loop_with_limit(client.inner.clone(), reader, 128));
+        writer.write_all(b"{\"id\":1,\"result\":11}\n{\"id\":2,\"result\":22}\n{\"id\":3,\"result\":33}").await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+        assert_eq!(rx1.await.unwrap().unwrap(), json!(11));
+        assert_eq!(rx2.await.unwrap().unwrap(), json!(22));
+        assert!(matches!(rx3.await.unwrap(), Err(NetworkError::NotConnected)));
+        assert!(!client.is_connected());
+    }
 
     #[test]
     fn test_compute_txid_known_vector() {
@@ -937,8 +1073,8 @@ mod tests {
 
     #[test]
     fn test_protocol_version_constants() {
-        assert_eq!(PROTOCOL_MIN, 1);
-        assert_eq!(PROTOCOL_MAX, 2);
+        assert_eq!(PROTOCOL_MIN, "1.4");
+        assert_eq!(PROTOCOL_MAX, "1.4");
     }
 
     #[test]

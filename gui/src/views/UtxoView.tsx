@@ -12,7 +12,7 @@ export function UtxoView() {
     if (activeAccountId === null) return;
     setLoading(true);
     api.getUtxos(activeAccountId)
-      .then((r: any) => setUtxos(r.utxos || []))
+      .then((r: any) => setUtxos(Array.isArray(r) ? r : []))
       .catch(() => setUtxos([]))
       .finally(() => setLoading(false));
   }, [activeAccountId]);
@@ -36,7 +36,7 @@ export function UtxoView() {
         {utxos.map((u, i) => (
           <div key={i} className="flex px-4 py-2 border-b border-void-800 hover:bg-void-800 transition-colors">
             <div className="flex-1 text-sm font-mono text-gray-300 truncate">{u.tx_hash?.slice(0, 32) || 'unknown'}…</div>
-            <div className="w-16 text-right text-sm text-gray-300">{u.vout}</div>
+            <div className="w-16 text-right text-sm text-gray-300">{u.tx_index}</div>
             <div className="w-24 text-right text-sm text-gray-100">{u.value} sat</div>
             <div className="w-20 text-right text-xs text-gray-400">{u.is_coinbase ? 'coinbase' : 'p2pkh'}</div>
           </div>

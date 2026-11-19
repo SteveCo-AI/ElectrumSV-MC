@@ -21,6 +21,45 @@ use bsv::transaction::transaction_output::TransactionOutput;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// Check wire lengths before the SDK allocates vectors from untrusted varints.
+pub(crate) fn validate_transaction_wire(bytes: &[u8]) -> Result<(), String> {
+    fn take(bytes: &[u8], pos: &mut usize, n: usize) -> Result<(), String> {
+        *pos = pos.checked_add(n).filter(|end| *end <= bytes.len()).ok_or("truncated transaction")?;
+        Ok(())
+    }
+    fn compact(bytes: &[u8], pos: &mut usize) -> Result<usize, String> {
+        let first = *bytes.get(*pos).ok_or("truncated varint")?;
+        take(bytes, pos, 1)?;
+        let size = match first { 0..=252 => return Ok(first as usize), 253 => 2, 254 => 4, _ => 8 };
+        let start = *pos;
+        take(bytes, pos, size)?;
+        let mut value = 0u64;
+        for (i, byte) in bytes[start..*pos].iter().enumerate() { value |= (*byte as u64) << (8 * i); }
+        usize::try_from(value).map_err(|_| "varint overflow".into())
+    }
+    let mut pos = 0;
+    take(bytes, &mut pos, 4)?;
+    let inputs = compact(bytes, &mut pos)?;
+    if inputs > bytes.len() / 41 { return Err("invalid input count".into()); }
+    for _ in 0..inputs {
+        take(bytes, &mut pos, 36)?;
+        let len = compact(bytes, &mut pos)?;
+        take(bytes, &mut pos, len)?;
+        take(bytes, &mut pos, 4)?;
+    }
+    let outputs = compact(bytes, &mut pos)?;
+    if outputs > bytes.len() / 9 { return Err("invalid output count".into()); }
+    for _ in 0..outputs {
+        take(bytes, &mut pos, 8)?;
+        let len = compact(bytes, &mut pos)?;
+        take(bytes, &mut pos, len)?;
+    }
+    take(bytes, &mut pos, 4)?;
+    if pos != bytes.len() { return Err("trailing transaction data".into()); }
+    Ok(())
+}
+
+
 /// Transaction building errors.
 #[derive(Debug, Error)]
 pub enum TransactionError {
@@ -174,35 +213,44 @@ impl CoinSelector {
     }
 }
 
-/// Fee estimator — calculates fees based on transaction size.
-///
-/// BSV fee model: satoshis per byte. Default fee rate is 1 sat/byte
-/// (0.001 sat/byte on the network, but 1 is a safe minimum for relay).
+/// Conservative fee estimates based on serialized transaction size.
 pub struct FeeEstimator;
 
-impl FeeEstimator {
-    /// Default fee rate: 1 sat/byte (BSV standard).
-    pub const DEFAULT_FEE_RATE: u64 = 1; // sat/byte
+fn compact_size_len(n: usize) -> u64 {
+    if n < 253 { 1 } else if n <= 0xffff { 3 } else if n <= 0xffff_ffff { 5 } else { 9 }
+}
 
-    /// Estimate the fee for a transaction.
-    ///
-    /// `num_inputs`: number of inputs (UTXOs being spent)
-    /// `num_outputs`: number of outputs (payments + change)
-    /// `fee_rate`: satoshis per byte
-    ///
-    /// Transaction size estimate:
-    /// - Base: 10 bytes (version + locktime + varint overhead)
-    /// - Per input: 148 bytes (36 outpoint + ~108 unlocking script + 4 sequence)
-    /// - Per output: 34 bytes (8 value + 1 varint + 25 P2PKH script)
+/// Interpret hexadecimal input (optional 0x prefix) or otherwise use UTF-8 bytes.
+pub fn decode_op_return(input: &str) -> Vec<u8> {
+    let candidate = input.strip_prefix("0x").or_else(|| input.strip_prefix("0X")).unwrap_or(input);
+    hex::decode(candidate).unwrap_or_else(|_| input.as_bytes().to_vec())
+}
+
+impl FeeEstimator {
+    /// Local default in satoshis per byte.
+    pub const DEFAULT_FEE_RATE: u64 = 1;
+
+    /// Estimate a transaction with P2PKH outputs, without OP_RETURN data.
+    /// A maximal compressed P2PKH input is 149 bytes: 32 hash + 4 index + 1 script
+    /// length + 108 scriptSig + 4 sequence. The scriptSig is 1 push + up to 72 DER
+    /// signature bytes + 1 hash type + 1 push + 33 public-key bytes.
     pub fn estimate_fee(num_inputs: usize, num_outputs: usize, fee_rate: u64) -> u64 {
-        let base_size = 10u64;
-        let input_size = 148u64 * num_inputs as u64;
-        let output_size = 34u64 * num_outputs as u64;
-        let total_size = base_size + input_size + output_size;
-        total_size * fee_rate
+        Self::estimate_fee_with_data(num_inputs, num_outputs, None, fee_rate)
     }
 
-    /// Estimate fee with default fee rate (1 sat/byte).
+    /// `p2pkh_outputs` excludes the optional data output; CompactSize lengths are included.
+    pub fn estimate_fee_with_data(num_inputs: usize, p2pkh_outputs: usize, data: Option<&[u8]>, fee_rate: u64) -> u64 {
+        let output_count = p2pkh_outputs.saturating_add(usize::from(data.is_some()));
+        let mut size = 8u64.saturating_add(compact_size_len(num_inputs)).saturating_add(compact_size_len(output_count))
+            .saturating_add(149u64.saturating_mul(num_inputs as u64))
+            .saturating_add(34u64.saturating_mul(p2pkh_outputs as u64));
+        if let Some(data) = data {
+            let script_len = op_return_data(data).to_binary().len();
+            size = size.saturating_add(8).saturating_add(compact_size_len(script_len)).saturating_add(script_len as u64);
+        }
+        size.saturating_mul(fee_rate)
+    }
+
     pub fn estimate_fee_default(num_inputs: usize, num_outputs: usize) -> u64 {
         Self::estimate_fee(num_inputs, num_outputs, Self::DEFAULT_FEE_RATE)
     }
@@ -254,6 +302,47 @@ pub struct TxPlan {
     pub op_return: Option<Vec<u8>>,
 }
 
+/// Check that persisted preview metadata describes the unsigned transaction.
+pub fn validate_plan_consistency(plan: &TxPlan) -> Result<(), TransactionError> {
+    let fail = || TransactionError::InvalidOutput("transaction does not match plan preview".into());
+    let raw = hex::decode(&plan.unsigned_tx_hex).map_err(|_| fail())?;
+    validate_transaction_wire(&raw).map_err(|_| fail())?;
+    let tx = Transaction::from_hex(&plan.unsigned_tx_hex)?;
+    if tx.to_hex()? != plan.unsigned_tx_hex || tx.version != 1 || tx.lock_time != 0 || tx.inputs.len() != plan.inputs.len() || tx.inputs.is_empty() {
+        return Err(fail());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (input, prev) in tx.inputs.iter().zip(&plan.inputs) {
+        if !input.source_txid.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(&prev.tx_hash_hex)) || input.source_output_index != prev.tx_index || input.sequence != u32::MAX ||
+           input.unlocking_script.as_ref().is_some_and(|script| !script.to_binary().is_empty()) ||
+           !seen.insert((prev.tx_hash_hex.to_ascii_lowercase(), prev.tx_index)) { return Err(fail()); }
+    }
+    let inputs = plan.inputs.iter().try_fold(0u64, |sum, input| sum.checked_add(input.satoshis)).ok_or_else(fail)?;
+    if inputs != plan.total_input { return Err(fail()); }
+    let expected_count = plan.outputs.len() + usize::from(plan.op_return.is_some()) + usize::from(plan.change > 0);
+    if tx.outputs.len() != expected_count { return Err(fail()); }
+    for (actual, preview) in tx.outputs.iter().zip(&plan.outputs) {
+        crate::network::backend::scripthash_from_address(&preview.address).map_err(|_| fail())?;
+        let script = P2PKH::from_address(&preview.address)?.lock()?;
+        if actual.satoshis != Some(preview.satoshis) || actual.locking_script.to_binary() != script.to_binary() { return Err(fail()); }
+    }
+    let mut index = plan.outputs.len();
+    if let Some(data) = &plan.op_return {
+        let actual = &tx.outputs[index];
+        if actual.satoshis != Some(0) || actual.locking_script.to_binary() != op_return_data(data).to_binary() { return Err(fail()); }
+        index += 1;
+    }
+    if plan.change > 0 {
+        let address = plan.change_address.as_deref().ok_or_else(fail)?;
+        crate::network::backend::scripthash_from_address(address).map_err(|_| fail())?;
+        let script = P2PKH::from_address(address)?.lock()?;
+        if tx.outputs[index].satoshis != Some(plan.change) || tx.outputs[index].locking_script.to_binary() != script.to_binary() { return Err(fail()); }
+    }
+    let outputs = tx.outputs.iter().try_fold(0u64, |sum, output| sum.checked_add(output.satoshis?)).ok_or_else(fail)?;
+    if outputs != plan.total_output || inputs.checked_sub(outputs) != Some(plan.fee) { return Err(fail()); }
+    Ok(())
+}
+
 /// Convert a `SelectedUtxo` into a `coinchooser::Coin` for use by the
 /// advanced coin-selection strategies.
 fn utxo_to_coin(utxo: &SelectedUtxo) -> coinchooser::Coin {
@@ -285,12 +374,8 @@ impl TxBuilder {
         strategy: Option<coinchooser::Strategy>,
     ) -> Result<(Transaction, CoinSelectionResult), TransactionError> {
         // Calculate total payment amount
-        let total_payment: u64 = outputs
-            .iter()
-            .map(|o| o.satoshis)
-            .sum::<u64>()
-            .try_into()
-            .map_err(|_| TransactionError::InvalidOutput("payment amount overflow".into()))?;
+        let total_payment = outputs.iter().try_fold(0u64, |sum, output| sum.checked_add(output.satoshis))
+            .ok_or_else(|| TransactionError::InvalidOutput("payment amount overflow".into()))?;
 
         if total_payment == 0 {
             return Err(TransactionError::InvalidOutput(
@@ -298,111 +383,85 @@ impl TxBuilder {
             ));
         }
 
-        // Estimate fee: we don't know the exact number of inputs yet, so we
-        // estimate with all available UTXOs first, then select.
-        // OP_RETURN output adds 1 extra output (0 satoshis, doesn't count toward payment)
-        let op_return_extra_outputs = if op_return.is_some() { 1 } else { 0 };
-        let num_outputs =
-            outputs.len() + op_return_extra_outputs + if change_address.is_some() { 1 } else { 0 };
+        let estimate = |inputs, reserve_change: bool| {
+            let p2pkh_outputs = outputs.len() + usize::from(reserve_change && change_address.is_some());
+            FeeEstimator::estimate_fee_with_data(inputs, p2pkh_outputs, op_return, fee_rate)
+        };
 
-        // --- Coin selection -------------------------------------------------
-        // Two code paths:
-        //   * strategy == None  -> existing largest-first CoinSelector (default)
-        //   * strategy == Some  -> CoinChooser with the requested Strategy
-        //
-        // Both paths produce a `CoinSelectionResult` with the selected UTXOs,
-        // total input, fee, and change. The iterative fee recalculation below
-        // converges for both paths because the fee depends on the number of
-        // inputs, which can change between iterations.
-        let selection = match strategy {
+        let select = |reserve_change: bool| -> Result<CoinSelectionResult, TransactionError> {
+        Ok(match strategy {
             None => {
-                // Default path: largest-first CoinSelector with iterative fee.
-                let mut fee = FeeEstimator::estimate_fee(1, num_outputs, fee_rate);
-
+                let mut fee = estimate(1, reserve_change);
+                let mut attempts = 0usize;
                 loop {
+                    attempts += 1;
+                    if attempts > 128 { return Err(TransactionError::InvalidOutput("fee calculation did not converge".into())); }
                     let result = CoinSelector::select(utxos, total_payment, fee)?;
-
-                    // Recalculate fee with actual number of inputs
-                    let actual_fee =
-                        FeeEstimator::estimate_fee(result.selected.len(), num_outputs, fee_rate);
-
-                    if actual_fee == fee {
-                        break result;
-                    }
-
-                    // Re-select with the updated fee
+                    let actual_fee = estimate(result.selected.len(), reserve_change);
+                    if actual_fee == fee { break result; }
                     fee = actual_fee;
                 }
             }
             Some(strategy) => {
-                // CoinChooser path: convert UTXOs to Coins, run the chosen
-                // strategy, then map the selected Coins back to SelectedUtxos.
-                let coins: Vec<coinchooser::Coin> =
-                    utxos.iter().map(utxo_to_coin).collect();
-
+                let coins: Vec<coinchooser::Coin> = utxos.iter().map(utxo_to_coin).collect();
                 let chooser = coinchooser::CoinChooser::new(strategy, fee_rate);
-                let result = chooser
-                    .select(&coins, total_payment)
-                    .map_err(|e| match e {
-                        coinchooser::CoinChooserError::InsufficientFunds { needed, available } => {
-                            TransactionError::InsufficientFunds { needed, available }
-                        }
+                let mut lookup = std::collections::HashMap::new();
+                for u in utxos {
+                    if lookup.insert((u.tx_hash_hex.clone(), u.tx_index), u).is_some() {
+                        return Err(TransactionError::InvalidOutput("duplicate UTXO".into()));
+                    }
+                }
+                let mut target = total_payment;
+                let mut attempts = 0usize;
+                loop {
+                    attempts += 1;
+                    if attempts > 128 { return Err(TransactionError::InvalidOutput("fee calculation did not converge".into())); }
+                    let result = chooser.select(&coins, target).map_err(|e| match e {
+                        coinchooser::CoinChooserError::InsufficientFunds { needed, available } => TransactionError::InsufficientFunds { needed, available },
                         coinchooser::CoinChooserError::NoCoins => TransactionError::NoUtxos,
                         other => TransactionError::InvalidOutput(other.to_string()),
                     })?;
-
-                // Map selected Coins back to SelectedUtxos by (tx_hash_hex, tx_index).
-                let mut lookup: std::collections::HashMap<(String, u32), &SelectedUtxo> =
-                    std::collections::HashMap::new();
-                for u in utxos {
-                    lookup.insert((u.tx_hash_hex.clone(), u.tx_index), u);
-                }
-                let mut selected: Vec<SelectedUtxo> = Vec::with_capacity(result.coins.len());
-                for c in &result.coins {
-                    let utxo = lookup
-                        .get(&(c.tx_hash_hex.clone(), c.tx_index))
-                        .ok_or_else(|| {
-                            TransactionError::InvalidOutput(format!(
-                                "CoinChooser selected an unknown UTXO {}:{}",
-                                c.tx_hash_hex, c.tx_index
-                            ))
-                        })?;
-                    selected.push((*utxo).clone());
-                }
-
-                // Recalculate the fee with the proper FeeEstimator so the
-                // change amount is consistent with the largest-first path.
-                // The CoinChooser's internal fee only accounts for inputs +
-                // base size; we add the output byte cost here so the
-                // transaction's actual fee matches the FeeEstimator formula.
-                let actual_fee = FeeEstimator::estimate_fee(
-                    selected.len(),
-                    num_outputs,
-                    fee_rate,
-                );
-                let total_input = result.total_input;
-                let needed = total_payment
-                    .checked_add(actual_fee)
-                    .ok_or_else(|| TransactionError::InvalidOutput("overflow".into()))?;
-                if total_input < needed {
-                    return Err(TransactionError::InsufficientFunds {
-                        needed,
-                        available: total_input,
-                    });
-                }
-                let change = total_input - needed;
-                let total_output = total_payment + change;
-
-                CoinSelectionResult {
-                    selected,
-                    total_input,
-                    total_output,
-                    fee: actual_fee,
-                    change,
+                    let mut selected = Vec::with_capacity(result.coins.len());
+                    for c in &result.coins {
+                        let utxo = lookup.get(&(c.tx_hash_hex.clone(), c.tx_index)).ok_or_else(|| TransactionError::InvalidOutput("coin selection returned an unknown UTXO".into()))?;
+                        selected.push((*utxo).clone());
+                    }
+                    let actual_fee = estimate(selected.len(), reserve_change);
+                    let needed = total_payment.checked_add(actual_fee).ok_or_else(|| TransactionError::InvalidOutput("fee overflow".into()))?;
+                    if result.total_input >= needed {
+                        let change = result.total_input - needed;
+                        break CoinSelectionResult { selected, total_input: result.total_input, total_output: total_payment + change, fee: actual_fee, change };
+                    }
+                    target = target.checked_add(needed - result.total_input).ok_or_else(|| TransactionError::InvalidOutput("fee overflow".into()))?;
                 }
             }
+        })
+        };
+        let selection = match select(change_address.is_some()) {
+            Ok(selection) => selection,
+            Err(original @ TransactionError::InsufficientFunds { .. }) if change_address.is_some() => {
+                let mut without_change = match select(false) { Ok(result) => result, Err(_) => return Err(original) };
+                let change_cost = estimate(without_change.selected.len(), true).saturating_sub(estimate(without_change.selected.len(), false));
+                if without_change.change >= change_cost { return Err(original); }
+                without_change.fee = without_change.fee.checked_add(without_change.change).ok_or_else(|| TransactionError::InvalidOutput("fee overflow".into()))?;
+                without_change.change = 0;
+                without_change.total_output = total_payment;
+                without_change
+            }
+            Err(error) => return Err(error),
         };
 
+        if selection.change > 0 && change_address.is_none() {
+            return Err(TransactionError::InvalidOutput("change address required".into()));
+        }
+        for output in outputs {
+            crate::network::backend::scripthash_from_address(&output.address)
+                .map_err(|e| TransactionError::InvalidOutput(e.to_string()))?;
+        }
+        if let Some(addr) = change_address {
+            crate::network::backend::scripthash_from_address(addr)
+                .map_err(|e| TransactionError::InvalidOutput(e.to_string()))?;
+        }
         // Build the transaction
         let mut tx = Transaction::new();
 
@@ -588,25 +647,91 @@ mod tests {
     #[test]
     fn test_fee_estimator_1_in_2_out() {
         let fee = FeeEstimator::estimate_fee(1, 2, 1);
-        // 10 + 148*1 + 34*2 = 10 + 148 + 68 = 226
-        assert_eq!(fee, 226);
+        // 10 + 149 + 68 = 227
+        assert_eq!(fee, 227);
     }
 
     #[test]
     fn test_fee_estimator_3_in_2_out() {
         let fee = FeeEstimator::estimate_fee(3, 2, 1);
-        // 10 + 148*3 + 34*2 = 10 + 444 + 68 = 522
-        assert_eq!(fee, 522);
+        // 10 + 149*3 + 68 = 525
+        assert_eq!(fee, 525);
     }
 
     #[test]
     fn test_fee_estimator_custom_rate() {
         let fee = FeeEstimator::estimate_fee(1, 1, 2);
-        // 10 + 148 + 34 = 192, * 2 = 384
-        assert_eq!(fee, 384);
+        // (10 + 149 + 34) * 2 = 386
+        assert_eq!(fee, 386);
+    }
+
+    #[test]
+    fn fee_estimator_accounts_for_compact_size_boundaries() {
+        assert_eq!(FeeEstimator::estimate_fee(253, 1, 1) - FeeEstimator::estimate_fee(252, 1, 1), 151);
+        assert_eq!(FeeEstimator::estimate_fee(1, 253, 1) - FeeEstimator::estimate_fee(1, 252, 1), 36);
+    }
+
+    #[test]
+    fn op_return_compact_size_fee_covers_full_serialization() {
+        let utxos = vec![SelectedUtxo { tx_hash_hex: "01".repeat(32), tx_index: 0, satoshis: 100_000, keyinstance_id: 1, subpath: [0,0] }];
+        let outputs = vec![PaymentOutput { address: TEST_ADDRESS_B.into(), satoshis: 10_000 }];
+        for len in [251, 252, 253, 65535, 65536] {
+            let data = vec![7u8; len];
+            let (tx, selection) = TxBuilder::build_unsigned(&utxos, &outputs, Some(TEST_ADDRESS_A), 1, Some(&data), None).unwrap();
+            let unsigned_size = tx.to_hex().unwrap().len() / 2;
+            assert!(selection.fee >= (unsigned_size + 108) as u64);
+        }
+    }
+
+    #[test]
+    fn tightly_funded_payment_can_omit_unaffordable_change() {
+        let utxos = vec![SelectedUtxo { tx_hash_hex: "01".repeat(32), tx_index: 0, satoshis: 1000, keyinstance_id: 1, subpath: [0,0] }];
+        let outputs = vec![PaymentOutput { address: TEST_ADDRESS_B.into(), satoshis: 790 }];
+        for strategy in [None, Some(coinchooser::Strategy::BranchAndBound), Some(coinchooser::Strategy::RandomSubset), Some(coinchooser::Strategy::Privacy)] {
+            let (_, selection) = TxBuilder::build_unsigned(&utxos, &outputs, Some(TEST_ADDRESS_A), 1, None, strategy).unwrap();
+            assert_eq!(selection.change, 0);
+            assert_eq!(selection.fee, 210);
+        }
+    }
+
+    #[test]
+    fn all_strategies_select_enough_for_outputs_and_data() {
+        let utxos = vec![
+            SelectedUtxo { tx_hash_hex: "01".repeat(32), tx_index: 0, satoshis: 1000, keyinstance_id: 1, subpath: [0,0] },
+            SelectedUtxo { tx_hash_hex: "02".repeat(32), tx_index: 0, satoshis: 1000, keyinstance_id: 2, subpath: [0,1] },
+        ];
+        let outputs = vec![PaymentOutput { address: TEST_ADDRESS_B.into(), satoshis: 800 }];
+        for strategy in [None, Some(coinchooser::Strategy::BranchAndBound), Some(coinchooser::Strategy::RandomSubset), Some(coinchooser::Strategy::Privacy)] {
+            let (tx, selection) = TxBuilder::build_unsigned(&utxos, &outputs, Some(TEST_ADDRESS_A), 1, Some(b"test data"), strategy).unwrap();
+            assert_eq!(selection.selected.len(), 2);
+            let unsigned = tx.to_hex().unwrap().len() / 2;
+            // Maximum P2PKH unlocking script is 108 bytes, absent from the unsigned inputs.
+            assert!(selection.fee >= (unsigned + 108 * selection.selected.len()) as u64);
+        }
     }
 
     // --- TxBuilder tests ---
+
+    #[test]
+    fn plan_consistency_rejects_recipient_and_preview_changes() {
+        let outputs = vec![PaymentOutput { address: TEST_ADDRESS_B.into(), satoshis: 50_000 }];
+        let (tx, selection) = TxBuilder::build_unsigned(&make_utxos(), &outputs, Some(TEST_ADDRESS_A), 1, Some(b"message"), None).unwrap();
+        let plan = TxBuilder::create_plan(tx, outputs, selection, Some(TEST_ADDRESS_A.into()), "wallet".into(), 1, 300, Some(b"message".to_vec())).unwrap();
+        validate_plan_consistency(&plan).unwrap();
+        let mut changed = plan.clone();
+        let mut tx = Transaction::from_hex(&changed.unsigned_tx_hex).unwrap();
+        tx.outputs[0].locking_script = P2PKH::from_address(TEST_ADDRESS_A).unwrap().lock().unwrap();
+        changed.unsigned_tx_hex = tx.to_hex().unwrap();
+        assert!(validate_plan_consistency(&changed).is_err());
+        let mut changed = plan.clone(); changed.fee += 1;
+        assert!(validate_plan_consistency(&changed).is_err());
+        let mut changed = plan.clone(); changed.change += 1;
+        assert!(validate_plan_consistency(&changed).is_err());
+        let mut changed = plan.clone(); changed.total_input += 1;
+        assert!(validate_plan_consistency(&changed).is_err());
+        let mut changed = plan.clone(); changed.op_return = Some(b"different".to_vec());
+        assert!(validate_plan_consistency(&changed).is_err());
+    }
 
     #[test]
     fn test_build_unsigned_single_input() {
@@ -637,7 +762,7 @@ mod tests {
         // Send exact amount that leaves no change after fee
         let outputs = vec![PaymentOutput {
             address: TEST_ADDRESS_B.to_string(),
-            satoshis: 99_774, // 100000 - 226 fee (1 input, 2 outputs)
+            satoshis: 99_773, // 100000 - 227 fee (1 input, 2 outputs)
         }];
 
         let (tx, selection) =
@@ -656,13 +781,8 @@ mod tests {
             satoshis: 50_000,
         }];
 
-        // No change address provided — change goes to fee
-        let (tx, selection) = TxBuilder::build_unsigned(&utxos, &outputs, None, 1, None, None).unwrap();
-
-        // 1 output only (no change)
-        assert_eq!(tx.outputs.len(), 1);
-        // Change is "lost" (becomes extra fee)
-        assert!(selection.change > 0);
+        let result = TxBuilder::build_unsigned(&utxos, &outputs, None, 1, None, None);
+        assert!(result.is_err());
     }
 
     #[test]

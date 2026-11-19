@@ -261,6 +261,7 @@ mod tests {
             active_wallet: std::sync::Mutex::new(None),
             network: std::sync::Mutex::new(crate::state::NetworkState::new()),
             pending_plans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wallet_operation: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -280,7 +281,7 @@ mod tests {
         assert!(contacts.is_empty());
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -327,7 +328,7 @@ mod tests {
         assert_eq!(identities[0].system_data, system_data);
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -357,7 +358,7 @@ mod tests {
         assert!(!not_in_use, "unused label should not be in use");
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -386,7 +387,7 @@ mod tests {
         assert_eq!(contact.label, "NewLabel");
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -427,7 +428,7 @@ mod tests {
         assert!(identities.is_empty());
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -448,7 +449,7 @@ mod tests {
         assert!(contact.is_none());
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]

@@ -153,6 +153,7 @@ mod tests {
             active_wallet: std::sync::Mutex::new(None),
             network: std::sync::Mutex::new(crate::state::NetworkState::new()),
             pending_plans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wallet_operation: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -199,7 +200,7 @@ mod tests {
         assert_eq!(label, Some("My Address".to_string()));
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -230,7 +231,7 @@ mod tests {
         assert_eq!(label, None);
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -249,7 +250,7 @@ mod tests {
         assert!(result.is_none(), "nonexistent keyinstance should be None");
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -300,7 +301,7 @@ mod tests {
         assert_eq!(label, Some("Sent".to_string()));
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -390,7 +391,7 @@ mod tests {
         assert_eq!(tx_entry.2, "My Tx");
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -410,6 +411,6 @@ mod tests {
         assert!(tx_labels.is_empty(), "no tx labels expected");
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 }

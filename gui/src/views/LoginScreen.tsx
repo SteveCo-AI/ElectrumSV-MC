@@ -64,7 +64,7 @@ export function LoginScreen() {
       try {
         await api.unlockWalletWithTOTP(openResult.wallet_path, walletPassword, totpCode || undefined);
       } catch (e: any) {
-        if (e.message && e.message.includes('TOTP code required')) {
+        if (String(e?.message || e).includes('TOTP code required')) {
           setTotpRequired(true);
           setTotpChecked(true);
           setLoading(false);
@@ -90,7 +90,7 @@ export function LoginScreen() {
       setAuthenticated(true);
       useStore.getState().setView('main');
     } catch (e: any) {
-      setError(e.message || t.login.loginFailed);
+      setError(e?.message || String(e) || t.login.loginFailed);
     } finally {
       setLoading(false);
     }
@@ -191,11 +191,7 @@ export function LoginScreen() {
         // Skip mnemonic display/confirm for restored wallets
         await loadWalletInfo();
       } else if (restoreMethod === 'wif') {
-        // WIF import: create a new wallet, then import the key
-        const result = await api.createWallet(restorePassword, name);
-        setActiveWalletPath(result.wallet_path);
-        await api.importPrivkey(restoreInput.trim(), restorePassword);
-        await loadWalletInfo();
+        throw new Error('WIF recovery is not yet supported safely. Keep your original private key.');
       }
     } catch (e: any) {
       setError(e.message || t.login.restoreInvalidMnemonic);
@@ -294,6 +290,7 @@ export function LoginScreen() {
             <div className="text-sm text-gray-400">{t.login.restoreDesc}</div>
           </div>
           <div className="bg-void-900 rounded-xl p-6 border border-void-700">
+            <p className="text-warning text-xs mb-4">Recovery uses a 20-address gap. A restored balance can be incomplete. Keep your original seed and do not use this prototype with real funds.</p>
             {!restoreMethod ? (
               <div className="space-y-3">
                 <button onClick={() => setRestoreMethod('mnemonic')} className="w-full text-left rounded-lg border border-void-700 bg-void-800 hover:border-accent px-4 py-3 transition-colors">

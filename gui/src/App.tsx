@@ -46,6 +46,9 @@ function AccountSidebar() {
   const totalBalance = Object.values(balances).reduce<number>((a, b) => a + (b.total || 0), 0);
   const confirmedBalance = Object.values(balances).reduce<number>((a, b) => a + (b.confirmed || 0), 0);
   const unconfirmedBalance = Object.values(balances).reduce<number>((a, b) => a + (b.unconfirmed || 0), 0);
+  const balanceValues = accounts.map(a => balances[String(a.id)]);
+  const reservedBalance = balanceValues.length && balanceValues.every(b => b?.reserved != null) ? balanceValues.reduce((sum, b) => sum + b.reserved!, 0) : null;
+  const availableBalance = balanceValues.length && balanceValues.every(b => b?.available != null) ? balanceValues.reduce((sum, b) => sum + b.available!, 0) : null;
   const [fiatTotal, setFiatTotal] = useState<number | null>(null);
   const [fiatCurrency, setFiatCurrency] = useState('USD');
 
@@ -69,12 +72,15 @@ function AccountSidebar() {
       <div className="p-3 border-b border-void-700">
         <div className="text-xs text-gray-400 mb-1">{t.sidebar.totalBalance}</div>
         <div className="text-lg font-semibold text-yellow-400">{totalBalance.toLocaleString()} sat</div>
+        <div className="text-xs text-gray-400">Last synced balance; refresh by syncing the wallet.</div>
         {fiatTotal !== null && (
           <div className="text-xs text-gray-400 mt-0.5">
             ≈ {fiatTotal.toFixed(2)} {fiatCurrency}
           </div>
         )}
         <div className="mt-2 space-y-1">
+          <div className="flex justify-between text-xs"><span>Reserved</span><span>{reservedBalance == null ? 'unknown' : `${reservedBalance.toLocaleString()} sat`}</span></div>
+          <div className="flex justify-between text-xs"><span>Available</span><span>{availableBalance == null ? 'unknown' : `${availableBalance.toLocaleString()} sat`}</span></div>
           <div className="flex justify-between text-xs">
             <span className="text-gray-400">{t.sidebar.confirmed}</span>
             <span className="text-success">{confirmedBalance.toLocaleString()}</span>
@@ -170,6 +176,7 @@ function MainView() {
                   unconfirmed: bal.unconfirmed ?? 0,
                   unmatured: 0,
                   total: bal.total ?? 0,
+                  reserved: bal.reserved, available: bal.available,
                 });
               })
               .catch((e: Error) => setError(`Balance for account ${acc.id}: ${e.message}`));
@@ -201,6 +208,7 @@ function MainView() {
                 unconfirmed: bal.unconfirmed ?? 0,
                 unmatured: 0,
                 total: bal.total ?? 0,
+                  reserved: bal.reserved, available: bal.available,
               });
             })
             .catch(() => {});
@@ -215,6 +223,7 @@ function MainView() {
             unconfirmed: data.unconfirmed ?? 0,
             unmatured: 0,
             total: data.total ?? 0,
+            reserved: data.reserved, available: data.available,
           });
         }
       });
@@ -249,6 +258,7 @@ function MainView() {
           unconfirmed: bal.unconfirmed ?? 0,
           unmatured: bal.unmatured ?? 0,
           total: bal.total ?? 0,
+                  reserved: bal.reserved, available: bal.available,
         });
       })
       .catch((e: Error) => setError(`Balance refresh: ${e.message}`));

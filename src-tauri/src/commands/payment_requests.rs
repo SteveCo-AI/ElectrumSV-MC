@@ -64,11 +64,8 @@ pub async fn create_payment_request(
     let account_key = ExtendedKey::from_string(&xprv_str)
         .map_err(|e| format!("invalid xprv: {}", e))?;
 
-    let (receiving_count, _) = repositories::get_keyinstance_counts(&pool, acct_id)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let next_index = receiving_count;
+    let next_index = repositories::next_keyinstance_index(&pool, acct_id, 0)
+        .await.map_err(|e| e.to_string())?;
     let derivation_path = format!("0/{}", next_index);
     let child_key = account_key
         .derive(&derivation_path)
@@ -226,6 +223,7 @@ mod tests {
             active_wallet: std::sync::Mutex::new(None),
             network: std::sync::Mutex::new(crate::state::NetworkState::new()),
             pending_plans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wallet_operation: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -245,7 +243,7 @@ mod tests {
         assert!(requests.is_empty());
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -273,7 +271,7 @@ mod tests {
         let err = xprv_opt.ok_or("wallet is locked — unlock first").unwrap_err();
         assert_eq!(err, "wallet is locked — unlock first");
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -326,7 +324,7 @@ mod tests {
         assert_eq!(requests[0].description, Some("Test payment".to_string()));
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     #[test]

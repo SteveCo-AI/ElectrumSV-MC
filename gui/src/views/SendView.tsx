@@ -1,17 +1,16 @@
 // Send view — 3-stage BSV transaction workflow: Prepare → Preview → Sign → Broadcast
 import { useState, useEffect, useCallback } from 'react';
-import { api } from '../api';
+import { api, type SpendPlanStatus } from '../api';
 import { useStore } from '../store';
 
 type SendStep = 'form' | 'preview' | 'result';
 
 export function SendView() {
-  const { activeAccountId, walletPassword, setPlanId } = useStore();
+  const { activeAccountId, setPlanId, updateBalance } = useStore();
   const [step, setStep] = useState<SendStep>('form');
   const [address, setAddress] = useState('');
   const [resolvedAddress, setResolvedAddress] = useState<string | null>(null);
   const [amount, setAmount] = useState('');
-  const [password, setPassword] = useState(walletPassword ?? '');
   const [opReturn, setOpReturn] = useState('');
   const [feeRate, setFeeRate] = useState(10);
   const [feeSourceMapi, setFeeSourceMapi] = useState(false);
@@ -31,6 +30,10 @@ export function SendView() {
   const [txid, setTxid] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [plans, setPlans] = useState<SpendPlanStatus[]>([]);
+  const [unknownPlans, setUnknownPlans] = useState<string[]>([]);
+  const [plansLoaded, setPlansLoaded] = useState(false);
+  const [planState, setPlanState] = useState<SpendPlanStatus['state'] | null>('PREPARED');
   const [contacts, setContacts] = useState<any[]>([]);
 
   // TOTP state — TOTP is mandatory in the Rust backend for sign_tx
@@ -39,7 +42,85 @@ export function SendView() {
 
   // Multisig info (Task 5) — if the active account is a multisig account,
   // show a banner with the m-of-n threshold.
+  const [accountTypeLoaded, setAccountTypeLoaded] = useState(false);
   const [multisigInfo, setMultisigInfo] = useState<{ threshold: number; num_keys: number } | null>(null);
+
+  const refreshPlans = useCallback(async () => {
+    try {
+      setPlans(await api.listSpendPlans());
+      setPlansLoaded(true);
+    } catch (e: any) {
+      setPlansLoaded(false);
+      setStatus(`Could not load payment plans: ${e.message || e}`);
+    }
+  }, []);
+
+  const refreshBalance = useCallback(async () => {
+    if (activeAccountId === null) return;
+    try {
+      updateBalance(String(activeAccountId), { ...await api.getBalance(activeAccountId), unmatured: 0 });
+    } catch {
+      // An unavailable balance must not be replaced with fabricated values.
+    }
+  }, [activeAccountId, updateBalance]);
+
+  useEffect(() => { void refreshPlans(); }, [refreshPlans]);
+
+  const checkPlan = async (id: string) => {
+    setBusy(true);
+    try {
+      const current = await api.getSpendPlanStatus(id);
+      setUnknownPlans(ids => ids.filter(item => item !== id));
+      setPlans(items => items.map(item => item.plan_id === id ? current : item));
+      if (id === planId) {
+        setPlanState(current.state);
+        if (current.txid) setSignedTxid(current.txid);
+        if (current.state === 'BROADCASTED') { setTxid(current.txid); setStep('result'); }
+      }
+      setStatus(`Plan status: ${current.state}`);
+      await Promise.all([refreshPlans(), refreshBalance()]);
+    } catch (e: any) { setStatus(`Could not check plan status: ${e.message || e}`); }
+    finally { setBusy(false); }
+  };
+
+  const cancelPlan = async (id: string) => {
+    setBusy(true);
+    try {
+      await api.cancelSpendPlan(id);
+      if (id === planId) {
+        setStep('form'); setPlanIdState(null); setPlanId(null); setPreview(null);
+        setSignedTxHex(null); setSignedTxid(null);
+      }
+      setStatus('Prepared plan cancelled; its inputs were released.');
+      await Promise.all([refreshPlans(), refreshBalance()]);
+    } catch (e: any) {
+      setStatus(`Could not cancel plan: ${e.message || e}`);
+    } finally { setBusy(false); }
+  };
+
+  const sendPlan = async (id: string, expectedTxid: string, retryUnknown: boolean) => {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const result = await api.broadcastSpendPlan(id, expectedTxid, retryUnknown);
+      setTxid(result); setStep('result'); setPlanState('BROADCASTED');
+      await Promise.all([refreshPlans(), refreshBalance()]);
+    } catch (e: any) {
+      try {
+        const current = await api.getSpendPlanStatus(id);
+        setPlans(items => items.map(item => item.plan_id === id ? current : item));
+        setUnknownPlans(ids => ids.filter(item => item !== id));
+        if (id === planId) { setPlanState(current.state); if (current.txid) setSignedTxid(current.txid); }
+        if (current.state === 'BROADCASTED') { setTxid(current.txid); setStep('result'); }
+        setStatus(`Broadcast failed: ${e.message || e}. Plan status: ${current.state}`);
+      } catch {
+        if (id === planId) setPlanState(null);
+        setUnknownPlans(ids => [...new Set([...ids, id])]);
+        setStatus(`Broadcast failed: ${e.message || e}. Plan status unknown; check status before another action.`);
+      }
+      await refreshBalance();
+    } finally { setBusy(false); }
+  };
 
   // Load contacts for recipient dropdown
   useEffect(() => {
@@ -58,6 +139,7 @@ export function SendView() {
   // Fetch multisig config for the active account (Task 5).
   // If the account is a multisig account, show a banner with the m-of-n info.
   useEffect(() => {
+    setAccountTypeLoaded(false);
     if (activeAccountId === null) {
       setMultisigInfo(null);
       return;
@@ -66,6 +148,7 @@ export function SendView() {
     api.getMultisigConfig(activeAccountId)
       .then(cfg => {
         if (cancelled) return;
+        setAccountTypeLoaded(true);
         if (cfg && cfg.threshold && cfg.num_keys) {
           setMultisigInfo({ threshold: cfg.threshold, num_keys: cfg.num_keys });
         } else {
@@ -171,7 +254,9 @@ export function SendView() {
         num_inputs: r.num_inputs,
         num_outputs: r.num_outputs,
       });
+      setPlanState('PREPARED');
       setStep('preview');
+      await Promise.all([refreshPlans(), refreshBalance()]);
     } catch (e: any) {
       setStatus(`Error: ${e.message || e}`);
     } finally {
@@ -192,34 +277,30 @@ export function SendView() {
       const signResult = await api.signTx(planId, totpCode);
       setSignedTxHex(signResult.signed_tx_hex);
       setSignedTxid(signResult.txid);
+      setPlanState('SIGNED');
+      await refreshPlans();
       setStatus('Transaction signed. Ready to broadcast.');
     } catch (e: any) {
-      setStatus(`Error: ${e.message || e}`);
+      setStatus(`Signing failed: ${e.message || e}. Check plan status before trying again.`);
+      try {
+        const current = await api.getSpendPlanStatus(planId);
+        setPlanState(current.state);
+        if (current.txid) setSignedTxid(current.txid);
+      } catch { setPlanState(null); setStatus(`Signing failed: ${e.message || e}. Plan status unknown; check status before another action.`); }
+      await refreshPlans();
     } finally {
       setBusy(false);
     }
   };
 
-  // Step 3: Broadcast
-  const handleBroadcast = async () => {
-    if (!signedTxHex || !signedTxid) return;
-    setBusy(true);
-    setStatus(null);
-    try {
-      const resultTxid = await api.broadcastTx(signedTxHex, signedTxid);
-      setTxid(resultTxid);
-      setStep('result');
-      setStatus('Transaction broadcast successfully!');
-    } catch (e: any) {
-      setStatus(`Error: ${e.message || e}`);
-    } finally {
-      setBusy(false);
-    }
+  // Every attempt uses the stored plan and the same expected transaction ID.
+  const handleBroadcast = () => {
+    if (planId && signedTxid) void sendPlan(planId, signedTxid, planState === 'BROADCAST_UNKNOWN');
   };
 
-  const canPrepare = address && amount && parseInt(amount, 10) > 0 && activeAccountId !== null;
-  const canSign = planId && totpEnabled && totpCode.length === 6;
-  const canBroadcast = signedTxHex && signedTxid;
+  const canPrepare = plansLoaded && accountTypeLoaded && !multisigInfo && address && amount && parseInt(amount, 10) > 0 && activeAccountId !== null;
+  const canSign = planState === 'PREPARED' && planId && totpEnabled && totpCode.length === 6;
+  const canBroadcast = signedTxid && (planState === 'SIGNED' || planState === 'BROADCAST_UNKNOWN');
 
   return (
     <div className="p-4">
@@ -232,10 +313,12 @@ export function SendView() {
             🔑 Multisig Account ({multisigInfo.threshold}-of-{multisigInfo.num_keys})
           </span>
           <span className="text-gray-400 ml-2">
-            This account requires {multisigInfo.threshold} of {multisigInfo.num_keys} signatures to spend.
+            Multisig signing is not supported in this test build.
           </span>
         </div>
       )}
+
+      {!accountTypeLoaded && activeAccountId !== null && <p className="mb-4 text-sm text-warning">Account type is unavailable or still loading; payment preparation is disabled.</p>}
 
       {/* Step indicator */}
       <div className="flex items-center gap-2 mb-6 text-sm">
@@ -247,6 +330,18 @@ export function SendView() {
       </div>
 
       <div className="space-y-3 max-w-lg">
+        {plans.filter(p => p.plan_id !== planId && p.state !== 'BROADCASTED').map(p => (
+          <div key={p.plan_id} className="bg-void-900 border border-warning/30 rounded-lg p-3 text-sm space-y-2">
+            <div>Payment plan: <span className="font-mono break-all">{p.plan_id}</span></div>
+            <div>Status: {unknownPlans.includes(p.plan_id) ? 'unknown' : p.state}</div>
+            {p.txid && <div>TXID: <span className="font-mono break-all">{p.txid}</span></div>}
+            <button disabled={busy} onClick={() => void checkPlan(p.plan_id)}>Check plan status</button>
+            {!unknownPlans.includes(p.plan_id) && p.state === 'PREPARED' && <><p>Inputs remain reserved. A plan from a previous session may only be cancelled.</p><button disabled={busy} onClick={() => void cancelPlan(p.plan_id)}>Cancel prepared plan and release inputs</button></>}
+            {!unknownPlans.includes(p.plan_id) && p.state === 'SIGNED' && p.txid && <button disabled={busy} onClick={() => void sendPlan(p.plan_id, p.txid!, false)}>Broadcast signed transaction</button>}
+            {!unknownPlans.includes(p.plan_id) && p.state === 'BROADCAST_UNKNOWN' && p.txid && <><p>The transaction may already have been sent. Check the TXID before retrying.</p><button disabled={busy} onClick={() => void sendPlan(p.plan_id, p.txid!, true)}>Retry sending this same transaction</button></>}
+          </div>
+        ))}
+        {!plansLoaded && <button disabled={busy} onClick={() => void refreshPlans()}>Retry loading payment plans</button>}
         {/* ─── Step 1: Form ─── */}
         {step === 'form' && (
           <>
@@ -338,17 +433,6 @@ export function SendView() {
               />
             </div>
 
-            <div>
-              <label className="text-sm text-gray-400 mb-1 block">Wallet password</label>
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="••••••••"
-                className="w-full bg-void-900 border border-void-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:border-accent outline-none"
-              />
-            </div>
-
             <button
               onClick={handlePrepare}
               disabled={busy || !canPrepare}
@@ -396,6 +480,7 @@ export function SendView() {
               )}
             </div>
 
+            <p className="text-sm text-gray-400">Prepared plans can be cancelled. After signing, inputs remain reserved even if you do not broadcast; signed plans cannot be cancelled in this test build.</p>
             {/* TOTP code input — always shown because sign_tx requires it */}
             <div className="bg-void-900 border border-warning/30 rounded-lg p-3">
               <div className="text-xs text-warning mb-2">
@@ -425,15 +510,18 @@ export function SendView() {
               </div>
             )}
 
+            <button disabled={busy} onClick={() => void checkPlan(planId)}>Check plan status</button>
+            <p className="text-sm text-gray-400">Plan status: {planState ?? 'unknown'}</p>
+            {planState === 'BROADCAST_UNKNOWN' && <p className="text-warning text-sm">The transaction may already have been sent. Check the TXID before explicitly retrying the same transaction.</p>}
             <div className="flex gap-3">
               <button
-                onClick={() => { setStep('form'); setPlanIdState(null); setPreview(null); setSignedTxHex(null); setSignedTxid(null); }}
-                disabled={busy}
+                onClick={() => void cancelPlan(planId)}
+                disabled={busy || planState !== 'PREPARED'}
                 className="bg-void-800 hover:bg-void-700 text-gray-300 rounded-lg px-4 py-2 text-sm font-medium transition-colors"
               >
-                ← Back
+                Cancel prepared plan
               </button>
-              {!signedTxHex ? (
+              {planState === 'PREPARED' ? (
                 <button
                   onClick={handleSign}
                   disabled={busy || !canSign}
@@ -441,15 +529,15 @@ export function SendView() {
                 >
                   {busy ? 'Signing…' : 'Sign Transaction'}
                 </button>
-              ) : (
+              ) : (planState === 'SIGNED' || planState === 'BROADCAST_UNKNOWN') ? (
                 <button
                   onClick={handleBroadcast}
                   disabled={busy || !canBroadcast}
                   className="bg-accent hover:bg-accent-hover text-white rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
-                  {busy ? 'Broadcasting…' : 'Broadcast Transaction'}
+                  {busy ? 'Broadcasting…' : planState === 'BROADCAST_UNKNOWN' ? 'Retry sending this same transaction' : 'Broadcast Transaction'}
                 </button>
-              )}
+              ) : null}
             </div>
           </>
         )}
@@ -459,6 +547,7 @@ export function SendView() {
           <>
             <div className="bg-void-900 border border-success rounded-lg p-4 space-y-2">
               <div className="text-sm font-semibold text-success">✓ Transaction Broadcast</div>
+              <p className="text-xs text-gray-400">The total balance reflects the last sync and may not yet include this payment or its change. Sync the wallet to update it.</p>
               {txid && (
                 <div>
                   <div className="text-xs text-gray-400 mb-1">TXID</div>

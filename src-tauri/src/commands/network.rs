@@ -188,6 +188,16 @@ pub async fn connect_server(
         }
     };
 
+    let client = connect_explicit_server(&state, server).await?;
+    let host = client.server_host();
+    crate::commands::events::start_notification_forwarder(app, client);
+    Ok(host)
+}
+
+pub async fn connect_explicit_server(
+    state: &AppState,
+    server: crate::network::server_list::ServerEntry,
+) -> Result<ElectrumXClient, String> {
     log::info!("Connecting to ElectrumX server: {}", server.host);
 
     // Create client and connect
@@ -197,7 +207,21 @@ pub async fn connect_server(
         .await
         .map_err(|e| format!("connection failed: {e}"))?;
 
-    // Update state
+    register_connected_server(state, &server, &client);
+    Ok(client)
+}
+
+#[cfg(test)]
+pub(crate) async fn connect_explicit_server_with_test_roots(
+    state: &AppState, server: crate::network::server_list::ServerEntry, roots: rustls::RootCertStore,
+) -> Result<ElectrumXClient, String> {
+    let client = ElectrumXClient::new(server.clone());
+    client.connect_with_test_roots(roots).await.map_err(|e| format!("connection failed: {e}"))?;
+    register_connected_server(state, &server, &client);
+    Ok(client)
+}
+
+fn register_connected_server(state: &AppState, server: &crate::network::server_list::ServerEntry, client: &ElectrumXClient) {
     {
         let mut net = state.network.lock().unwrap();
         net.server_list.record_success(&server.host, 0);
@@ -206,17 +230,16 @@ pub async fn connect_server(
         net.active_backend = Some(BackendType::ElectrumX);
     }
 
-    // Start notification forwarder — emits "new_block" and "balance_changed"
-    // Tauri events to the frontend from ElectrumX push notifications.
-    crate::commands::events::start_notification_forwarder(app, client.clone());
-
     log::info!("Connected to {}", server.host);
-    Ok(server.host)
 }
 
 /// Disconnect from the current server.
 #[tauri::command]
 pub async fn disconnect_server(state: State<'_, AppState>) -> Result<(), String> {
+    disconnect_server_inner(&state).await
+}
+
+pub async fn disconnect_server_inner(state: &AppState) -> Result<(), String> {
     // Extract client, WoC client, and host without holding lock across await
     let (client_opt, woc_opt, host) = {
         let mut net = state.network.lock().unwrap();
@@ -309,11 +332,186 @@ pub async fn set_network_backend(
 /// 5. Subscribe to scripthash updates for push notifications
 ///
 /// Returns a SyncResult with counts of synced keys and transactions.
+type RawTransactionCache = std::collections::HashMap<String, Option<(Vec<u8>, bsv::transaction::transaction::Transaction)>>;
+const MAX_SYNC_TX_REQUESTS: usize = 4096;
+const MAX_SYNC_HISTORY_ENTRIES: usize = 100_000;
+const MAX_SYNC_RAW_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SYNC_TX_BYTES: usize = 4 * 1024 * 1024;
+
+// Check wire lengths before the SDK allocates vectors from untrusted varints.
+pub(crate) use crate::core::transaction::validate_transaction_wire;
+
+async fn fetch_sync_transaction(client: &ElectrumXClient, txid: &str, cache: &mut RawTransactionCache, total_bytes: &mut usize, optional: bool)
+    -> Result<Option<(Vec<u8>, bsv::transaction::transaction::Transaction)>, String> {
+    fetch_sync_transaction_with(txid, cache, total_bytes, optional, |key| async move {
+        client.call("blockchain.transaction.get", serde_json::json!([key, false])).await
+    }).await
+}
+
+async fn fetch_sync_transaction_with<F, Fut>(txid: &str, cache: &mut RawTransactionCache, total_bytes: &mut usize, optional: bool, fetch: F)
+    -> Result<Option<(Vec<u8>, bsv::transaction::transaction::Transaction)>, String>
+where F: FnOnce(String) -> Fut, Fut: std::future::Future<Output = Result<serde_json::Value, NetworkError>> {
+    let key = txid.to_ascii_lowercase();
+    if let Some(value) = cache.get(&key) { return Ok(value.clone()); }
+    if cache.len() >= MAX_SYNC_TX_REQUESTS { return Err("sync transaction request limit exceeded".into()); }
+    let value = match fetch(key.clone()).await {
+        Ok(value) => value,
+        Err(NetworkError::NotFound(_)) if optional => { cache.insert(key, None); return Ok(None); }
+        Err(error) => return Err(format!("transaction fetch failed: {error}")),
+    };
+    if value.is_null() && optional { cache.insert(key, None); return Ok(None); }
+    let raw = value.as_str().ok_or("server returned invalid transaction data")?;
+    if raw.len() > MAX_SYNC_TX_BYTES * 2 || raw.len() % 2 != 0 { return Err("transaction size limit exceeded or invalid hex".into()); }
+    let bytes = hex::decode(raw).map_err(|e| format!("invalid transaction hex: {e}"))?;
+    *total_bytes = total_bytes.checked_add(bytes.len()).ok_or("sync transaction size overflow")?;
+    if *total_bytes > MAX_SYNC_RAW_BYTES { return Err("sync transaction byte limit exceeded".into()); }
+    validate_transaction_wire(&bytes)?;
+    let parsed = bsv::transaction::transaction::Transaction::from_hex(raw).map_err(|e| format!("invalid transaction: {e}"))?;
+    if !parsed.id().map_err(|e| e.to_string())?.eq_ignore_ascii_case(&key) ||
+        parsed.to_hex().map_err(|e| e.to_string())? != hex::encode(&bytes) { return Err("transaction hash or encoding mismatch".into()); }
+    let result = Some((bytes, parsed));
+    cache.insert(key, result.clone());
+    Ok(result)
+}
+
+fn calculate_history_values(
+    tx: &bsv::transaction::transaction::Transaction,
+    wallet_scripts: &std::collections::HashMap<String, i64>,
+    parents: &RawTransactionCache,
+) -> Result<(std::collections::HashMap<i64, i64>, bool), String> {
+    let mut amounts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for output in &tx.outputs {
+        let hash = crate::network::backend::scripthash_from_script(&hex::encode(output.locking_script.to_binary())).map_err(|e| e.to_string())?;
+        if let Some(key) = wallet_scripts.get(&hash) {
+            let value = i64::try_from(output.satoshis.ok_or("missing output amount")?).map_err(|_| "output amount overflow")?;
+            let amount = amounts.entry(*key).or_default();
+            *amount = amount.checked_add(value).ok_or("history delta overflow")?;
+        }
+    }
+    let mut complete = true;
+    for input in &tx.inputs {
+        let previous = input.source_txid.as_deref().ok_or("missing previous txid")?;
+        if input.source_output_index == u32::MAX && previous.bytes().all(|b| b == b'0') { continue; }
+        let Some(Some((_, prev_tx))) = parents.get(&previous.to_ascii_lowercase()) else { complete = false; continue; };
+        let output = prev_tx.outputs.get(input.source_output_index as usize).ok_or("previous output index out of range")?;
+        let hash = crate::network::backend::scripthash_from_script(&hex::encode(output.locking_script.to_binary())).map_err(|e| e.to_string())?;
+        if let Some(key) = wallet_scripts.get(&hash) {
+            let value = i64::try_from(output.satoshis.ok_or("missing previous output amount")?).map_err(|_| "previous output amount overflow")?;
+            let amount = amounts.entry(*key).or_default();
+            *amount = amount.checked_sub(value).ok_or("history delta overflow")?;
+        }
+    }
+    Ok((amounts, complete))
+}
+
+fn validate_utxo_history(transactions: &[repositories::SyncTransaction], outputs: &[repositories::SyncOutput]) -> Result<(), String> {
+    let hashes: std::collections::HashSet<&[u8]> = transactions.iter().map(|item| item.hash.as_slice()).collect();
+    if outputs.iter().any(|output| !hashes.contains(output.hash.as_slice())) {
+        return Err("server UTXO missing from address history".into());
+    }
+    Ok(())
+}
+
+fn validate_history_membership(amounts: &std::collections::HashMap<i64, i64>, owners: &std::collections::HashSet<i64>, complete: bool) -> Result<(), String> {
+    if amounts.keys().any(|key| !owners.contains(key)) {
+        return Err("server history omitted a wallet key involved in a transaction".into());
+    }
+    if complete && owners.iter().any(|key| !amounts.contains_key(key)) {
+        return Err("server history contains an unrelated transaction".into());
+    }
+    Ok(())
+}
+
+async fn resolve_sync_history<F, Fut>(
+    snapshots: &mut [repositories::SyncKeySnapshot], wallet_scripts: &std::collections::HashMap<String, i64>,
+    tx_cache: &mut RawTransactionCache, raw_bytes: &mut usize, mut fetch: F,
+) -> Result<(), String>
+where F: FnMut(String) -> Fut, Fut: std::future::Future<Output = Result<serde_json::Value, NetworkError>> {
+    let mut resolved = std::collections::HashMap::new();
+    for snapshot in snapshots.iter() {
+        for item in &snapshot.transactions {
+            let id = crate::core::address::hash_to_hex_str(&item.hash);
+            if resolved.contains_key(&id) { continue; }
+            let (raw, tx) = fetch_sync_transaction_with(&id, tx_cache, raw_bytes, false, |key| fetch(key))
+                .await?.ok_or("history transaction unavailable")?;
+            for input in &tx.inputs {
+                let previous = input.source_txid.as_deref().ok_or("missing previous txid")?;
+                if input.source_output_index == u32::MAX && previous.bytes().all(|b| b == b'0') { continue; }
+                fetch_sync_transaction_with(previous, tx_cache, raw_bytes, true, |key| fetch(key)).await?;
+            }
+            let (amounts, complete) = calculate_history_values(&tx, wallet_scripts, tx_cache)?;
+            resolved.insert(id, (std::sync::Arc::<[u8]>::from(raw), amounts, complete));
+        }
+    }
+    let mut listed: std::collections::HashMap<String, std::collections::HashSet<i64>> = std::collections::HashMap::new();
+    for snapshot in snapshots.iter() {
+        for item in &snapshot.transactions {
+            listed.entry(crate::core::address::hash_to_hex_str(&item.hash)).or_default().insert(snapshot.key_id);
+        }
+    }
+    for (id, (_, amounts, complete)) in &resolved {
+        let owners = listed.get(id).ok_or("missing history membership")?;
+        validate_history_membership(amounts, owners, *complete)?;
+    }
+    for snapshot in snapshots.iter_mut() {
+        for item in &mut snapshot.transactions {
+            let id = crate::core::address::hash_to_hex_str(&item.hash);
+            let (raw, amounts, complete) = resolved.get(&id).ok_or("missing resolved transaction")?;
+            item.raw = std::sync::Arc::clone(raw);
+            item.delta = complete.then(|| *amounts.get(&snapshot.key_id).unwrap_or(&0));
+        }
+    }
+
+    Ok(())
+}
+
+async fn discover_used_keys(client: &ElectrumXClient, pool: &sqlx::SqlitePool, account_id: i64, account_key: &ExtendedKey, keys: &[repositories::KeyInstanceRow]) -> Result<Option<Vec<(u64, u64)>>, String> {
+    if keys.iter().any(|key| key.derivation_type != repositories::derivation_type::BIP32) {
+        return Err("imported keys are not supported in synchronization".into());
+    }
+    let marker = format!("address_discovery_v1_{account_id}");
+    if repositories::get_wallet_data(pool, &marker).await.map_err(|e| e.to_string())?.is_some() { return Ok(None); }
+    let mut known = std::collections::HashSet::new();
+    for key in keys {
+        if key.derivation_type != repositories::derivation_type::BIP32 { return Err("imported keys are not supported in synchronization".into()); }
+        let v: serde_json::Value = serde_json::from_slice(&key.derivation_data).map_err(|e| e.to_string())?;
+        let path = v.get("subpath").and_then(|v| v.as_array()).ok_or("invalid key path")?;
+        let chain = path.first().and_then(|v| v.as_u64()).ok_or("invalid chain")?;
+        let index = path.get(1).and_then(|v| v.as_u64()).ok_or("invalid index")?;
+        known.insert((chain, index));
+    }
+    let mut found = Vec::new();
+    for chain in 0u64..=1 {
+        let known_max = known.iter().filter(|(c, _)| *c == chain).map(|(_, i)| *i).max();
+        let mut gap = 0;
+        let mut completed = false;
+        for index in 0u64..10_000 {
+            let child = account_key.derive(&format!("{chain}/{index}")).map_err(|e| e.to_string())?;
+            let public = child.public_key().map_err(|e| e.to_string())?;
+            let addr = address::pubkey_to_p2pkh_address(&public);
+            let hash = crate::network::backend::scripthash_from_address(&addr).map_err(|e| e.to_string())?;
+            let used = !client.get_history(&hash).await.map_err(|e| format!("address discovery failed: {e}"))?.is_empty();
+            if used && !known.contains(&(chain, index)) { found.push((chain, index)); }
+            if used || known.contains(&(chain, index)) { gap = 0; } else { gap += 1; }
+            if gap >= 20 && known_max.is_none_or(|max| index > max) { completed = true; break; }
+        }
+        if !completed { return Err("address discovery reached its safety limit".into()); }
+    }
+    Ok(Some(found))
+}
+
 #[tauri::command]
 pub async fn sync_wallet(
     state: State<'_, AppState>,
     account_id: Option<i64>,
 ) -> Result<SyncResult, String> {
+    sync_wallet_inner(&state, account_id).await
+}
+
+pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Result<SyncResult, String> {
+    // Serialize synchronization across wallets; no state mutex is held over network I/O.
+    static SYNC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _sync_guard = SYNC_LOCK.lock().await;
     // 1. Extract client from network state (without holding lock across awaits)
     let client = {
         let net = state.network.lock().unwrap();
@@ -326,13 +524,15 @@ pub async fn sync_wallet(
     };
 
     // 2. Extract wallet data (pool, account_id, xprv)
-    let (pool, default_acct_id, xprv_opt) = {
+    let (pool, default_acct_id, xprv_opt, wallet_path, wallet_instance) = {
         let guard = state.active_wallet.lock().unwrap();
         let active = guard.as_ref().ok_or("no wallet is currently open")?;
         (
             active.db_pool.clone(),
             active.account_id,
             active.decrypted_xprv.clone(),
+            active.wallet_path.clone(),
+            active.instance_id.clone(),
         )
     };
     let acct_id = account_id.unwrap_or(default_acct_id);
@@ -343,10 +543,23 @@ pub async fn sync_wallet(
 
     log::info!("sync_wallet: account {} — starting full sync", acct_id);
 
-    // 3. Load all KeyInstances for the account
-    let key_instances = repositories::get_keyinstances_for_account(&pool, acct_id)
-        .await
-        .map_err(|e| format!("failed to load keyinstances: {e}"))?;
+    if acct_id != default_acct_id { return Err("only the active account can be synchronized".into()); }
+    let account_key = ExtendedKey::from_string(&xprv_str).map_err(|e| format!("invalid xprv: {e}"))?;
+    let expected_keys = repositories::get_keyinstances_for_account(&pool, acct_id)
+        .await.map_err(|e| format!("failed to load keyinstances: {e}"))?;
+    let discovered = discover_used_keys(&client, &pool, acct_id, &account_key, &expected_keys).await?;
+    let mut key_instances = expected_keys.clone();
+    if let Some(paths) = &discovered {
+        for (index, (chain, child)) in paths.iter().enumerate() {
+            key_instances.push(repositories::KeyInstanceRow {
+                keyinstance_id: -(index as i64) - 1, account_id: acct_id, masterkey_id: None,
+                derivation_type: repositories::derivation_type::BIP32,
+                derivation_data: serde_json::json!({"subpath": [chain, child]}).to_string().into_bytes(),
+                script_type: repositories::script_type::P2PKH, flags: 0, description: None,
+                date_created: 0, date_updated: 0,
+            });
+        }
+    }
 
     if key_instances.is_empty() {
         log::warn!("sync_wallet: no keyinstances found for account {} — generating initial receiving addresses", acct_id);
@@ -358,17 +571,18 @@ pub async fn sync_wallet(
         });
     }
 
-    // Parse the xprv for key derivation
-    let account_key =
-        ExtendedKey::from_string(&xprv_str).map_err(|e| format!("invalid xprv: {e}"))?;
-
     // 4. For each KeyInstance: derive pubkey → compute scripthash → fetch from server
     let mut total_balance_confirmed: u64 = 0;
     let mut total_balance_unconfirmed: i64 = 0;
     let mut total_tx_count: usize = 0;
     let mut total_utxo_count: usize = 0;
     let mut synced_keys: usize = 0;
-    let mut errors: Vec<String> = Vec::new();
+    let mut snapshots = Vec::new();
+    let mut heights = std::collections::HashMap::new();
+    let mut outpoints = std::collections::HashSet::new();
+    let mut wallet_scripts = std::collections::HashMap::new();
+    let mut tx_cache = RawTransactionCache::new();
+    let mut raw_bytes = 0usize;
 
     for ki in &key_instances {
         // Parse derivation_data to get subpath
@@ -427,6 +641,10 @@ pub async fn sync_wallet(
                 )
             })?;
 
+        if wallet_scripts.insert(scripthash.clone(), ki.keyinstance_id).is_some() {
+            return Err("duplicate wallet script".into());
+        }
+
         log::debug!(
             "sync_wallet: keyinstance {} — address {} — scripthash {}",
             ki.keyinstance_id,
@@ -437,112 +655,75 @@ pub async fn sync_wallet(
         // Fetch balance from server
         let balance = match client.get_balance(&scripthash).await {
             Ok(b) => b,
-            Err(e) => {
-                errors.push(format!(
-                    "keyinstance {}: balance error: {e}",
-                    ki.keyinstance_id
-                ));
-                continue;
-            }
+            Err(e) => return Err(format!("keyinstance {}: balance error: {e}", ki.keyinstance_id)),
         };
 
-        total_balance_confirmed += balance.confirmed;
-        total_balance_unconfirmed += balance.unconfirmed;
+        total_balance_confirmed = total_balance_confirmed.checked_add(balance.confirmed).ok_or("confirmed balance overflow")?;
+        total_balance_unconfirmed = total_balance_unconfirmed.checked_add(balance.unconfirmed).ok_or("unconfirmed balance overflow")?;
 
         // Fetch history from server
         let history = match client.get_history(&scripthash).await {
             Ok(h) => h,
-            Err(e) => {
-                errors.push(format!(
-                    "keyinstance {}: history error: {e}",
-                    ki.keyinstance_id
-                ));
-                continue;
-            }
+            Err(e) => return Err(format!("keyinstance {}: history error: {e}", ki.keyinstance_id)),
         };
 
-        total_tx_count += history.len();
+        total_tx_count = total_tx_count.checked_add(history.len()).ok_or("history entry count overflow")?;
+        if total_tx_count > MAX_SYNC_HISTORY_ENTRIES { return Err("sync history entry limit exceeded".into()); }
+        let mut history_ids = std::collections::HashSet::new();
+        if history.iter().any(|item| !history_ids.insert(item.tx_hash.to_ascii_lowercase())) {
+            return Err("duplicate history transaction".into());
+        }
 
         // Fetch UTXOs from server
         let utxos = match client.get_utxos(&scripthash).await {
             Ok(u) => u,
-            Err(e) => {
-                errors.push(format!(
-                    "keyinstance {}: utxos error: {e}",
-                    ki.keyinstance_id
-                ));
-                continue;
-            }
+            Err(e) => return Err(format!("keyinstance {}: utxos error: {e}", ki.keyinstance_id)),
         };
 
+        let mut coinbase_txids = std::collections::HashSet::new();
+        let mut output_scripts = Vec::with_capacity(utxos.len());
+        for utxo in &utxos {
+            let (_, parsed) = fetch_sync_transaction(&client, &utxo.tx_hash, &mut tx_cache, &mut raw_bytes, false)
+                .await?.ok_or("UTXO transaction unavailable")?;
+            let output = parsed.outputs.get(utxo.tx_pos as usize).ok_or("UTXO output index out of range")?;
+            if output.satoshis != Some(utxo.value) || utxo.value > i64::MAX as u64 { return Err("UTXO amount mismatch".into()); }
+            let output_script = hex::encode(output.locking_script.to_binary());
+            if crate::network::backend::scripthash_from_script(&output_script).map_err(|e| e.to_string())? != scripthash {
+                return Err("UTXO locking script mismatch".into());
+            }
+            output_scripts.push(output_script);
+            if parsed.inputs.len() == 1 && parsed.inputs[0].source_output_index == u32::MAX && parsed.inputs[0].source_txid.as_deref().is_some_and(|id| id.len() == 64 && id.bytes().all(|b| b == b'0')) {
+                coinbase_txids.insert(utxo.tx_hash.clone());
+            }
+        }
         total_utxo_count += utxos.len();
 
-        // 5. Store results in DB
-        // Clear old outputs/deltas for this keyinstance
-        repositories::clear_outputs_and_deltas_for_keyinstances(&pool, &[ki.keyinstance_id])
-            .await
-            .map_err(|e| {
-                format!(
-                    "failed to clear old data for keyinstance {}: {e}",
-                    ki.keyinstance_id
-                )
-            })?;
-
-        // Insert/update Transactions from history
-        for tx in &history {
-            // Convert display tx_hash (reversed hex) to internal byte order
-            let tx_hash_bytes = crate::core::address::hex_str_to_hash(&tx.tx_hash)
+        let mut transactions = Vec::new();
+        for item in &history {
+            let hash = crate::core::address::hex_str_to_hash(&item.tx_hash)
                 .map_err(|e| format!("invalid tx_hash hex: {e}"))?;
-
-            let block_height = if tx.height > 0 {
-                Some(tx.height)
-            } else {
-                None // unconfirmed
-            };
-
-            repositories::upsert_transaction(&pool, &tx_hash_bytes, block_height, None)
-                .await
-                .map_err(|e| format!("failed to upsert transaction: {e}"))?;
-
-            // Record a delta for this keyinstance's involvement in the transaction.
-            // We don't know the exact value_delta yet (would need full tx parsing),
-            // but we record a placeholder of 0 for now. The balance is tracked
-            // via TransactionOutputs (UTXOs) which is more precise.
-            repositories::upsert_transaction_delta(&pool, ki.keyinstance_id, &tx_hash_bytes, 0)
-                .await
-                .map_err(|e| format!("failed to upsert transaction delta: {e}"))?;
+            if hash.len() != 32 { return Err("invalid transaction hash length".into()); }
+            let height = (item.height > 0).then_some(item.height);
+            if let Some(previous) = heights.insert(hash.clone(), height) {
+                if previous != height { return Err("inconsistent transaction heights across addresses".into()); }
+            }
+            transactions.push(repositories::SyncTransaction { hash, height, raw: std::sync::Arc::from([]), delta: None });
         }
-
-        // Insert UTXOs as TransactionOutputs
-        for utxo in &utxos {
-            let tx_hash_bytes = crate::core::address::hex_str_to_hash(&utxo.tx_hash)
+        let mut outputs = Vec::new();
+        for (output, script_pubkey) in utxos.iter().zip(output_scripts) {
+            let hash = crate::core::address::hex_str_to_hash(&output.tx_hash)
                 .map_err(|e| format!("invalid utxo tx_hash hex: {e}"))?;
-
-            // Ensure the Transaction row exists (might not be in history if
-            // the UTXO is from a tx not in our history — shouldn't happen but
-            // be defensive)
-            let block_height = if utxo.height > 0 {
-                Some(utxo.height as i64)
-            } else {
-                None
-            };
-            repositories::upsert_transaction(&pool, &tx_hash_bytes, block_height, None)
-                .await
-                .map_err(|e| format!("failed to upsert transaction for utxo: {e}"))?;
-
-            // Insert the output (unspent, no flags)
-            repositories::upsert_transaction_output(
-                &pool,
-                &tx_hash_bytes,
-                utxo.tx_pos as i64,
-                utxo.value as i64,
-                ki.keyinstance_id,
-                0, // flags = 0 (unspent, not coinbase)
-                None, // script_pubkey — WoC backend doesn't provide it here
-            )
-            .await
-            .map_err(|e| format!("failed to upsert transaction output: {e}"))?;
+            if hash.len() != 32 { return Err("invalid UTXO hash length".into()); }
+            if !outpoints.insert((hash.clone(), output.tx_pos)) { return Err("duplicate UTXO outpoint".into()); }
+            let height = (output.height > 0).then_some(output.height as i64);
+            if let Some(previous) = heights.insert(hash.clone(), height) {
+                if previous != height { return Err("inconsistent transaction heights across addresses".into()); }
+            }
+            outputs.push(repositories::SyncOutput { hash, height, index: output.tx_pos as i64,
+                value: output.value as i64, coinbase: coinbase_txids.contains(&output.tx_hash), script_pubkey });
         }
+        validate_utxo_history(&transactions, &outputs)?;
+        snapshots.push(repositories::SyncKeySnapshot { key_id: ki.keyinstance_id, transactions, outputs });
 
         // 6. Subscribe to scripthash updates for push notifications
         // Best-effort — don't fail the sync if subscription fails
@@ -556,25 +737,28 @@ pub async fn sync_wallet(
         synced_keys += 1;
     }
 
-    let message = if errors.is_empty() {
-        format!(
-            "synced {} keys: {} txs, {} utxos, balance {} confirmed + {} unconfirmed",
-            synced_keys,
-            total_tx_count,
-            total_utxo_count,
-            total_balance_confirmed,
-            total_balance_unconfirmed
-        )
-    } else {
-        format!(
-            "synced {} keys with {} errors: {} txs, {} utxos — errors: {}",
-            synced_keys,
-            errors.len(),
-            total_tx_count,
-            total_utxo_count,
-            errors.join("; ")
-        )
-    };
+    resolve_sync_history(&mut snapshots, &wallet_scripts, &mut tx_cache, &mut raw_bytes, |key| {
+        let client = &client;
+        async move { client.call("blockchain.transaction.get", serde_json::json!([key, false])).await }
+    }).await?;
+
+    let _wallet_guard = state.wallet_operation.lock().await;
+    {
+        let active = state.active_wallet.lock().unwrap();
+        if !active.as_ref().is_some_and(|wallet| std::sync::Arc::ptr_eq(&wallet.instance_id, &wallet_instance) && wallet.account_id == acct_id) {
+            return Err("active wallet changed during synchronization".into());
+        }
+    }
+    repositories::replace_sync_snapshot(&pool, acct_id, &expected_keys, discovered.as_deref(), &snapshots)
+        .await.map_err(|e| format!("failed to store sync snapshot: {e}"))?;
+    {
+        let active = state.active_wallet.lock().unwrap();
+        if !active.as_ref().is_some_and(|wallet| std::sync::Arc::ptr_eq(&wallet.instance_id, &wallet_instance) && wallet.account_id == acct_id) {
+            return Err(format!("synchronization saved to {wallet_path}, but active wallet changed"));
+        }
+    }
+    let message = format!("synced wallet {}: {} keys, {} txs, {} utxos, balance {} confirmed + {} unconfirmed",
+        wallet_path, synced_keys, total_tx_count, total_utxo_count, total_balance_confirmed, total_balance_unconfirmed);
 
     log::info!("sync_wallet: account {} — {}", acct_id, message);
 
@@ -888,16 +1072,10 @@ pub async fn verify_transaction_proof(
     // Extract merkle branch hashes (display hex strings)
     let branch: Vec<String> = proof.merkle_branch.iter().map(|(h, _)| h.clone()).collect();
 
-    // We need the transaction position in the block.
-    // The ElectrumX get_merkle response includes "pos" but our MerkleProof
-    // struct doesn't capture it. We'll try pos=0 as a fallback, or
-    // the verify function will fail.
-    // TODO: Add pos to MerkleProof struct in backend.rs
-
-    // For now, use the verify_merkle_proof function directly
-    let verified = store
-        .verify_spv_proof(&tx_hash, block_height, &branch, 0)
-        .await;
+    let verified = match proof.position {
+        Some(position) => store.verify_spv_proof(&tx_hash, block_height, &branch, position).await,
+        None => Err(NetworkError::Protocol("merkle proof lacks transaction position".into())),
+    };
 
     // Put store back
     {
@@ -911,7 +1089,7 @@ pub async fn verify_transaction_proof(
             tx_hash,
             block_height,
             merkle_root: proof.root,
-            message: "transaction verified via SPV merkle proof".to_string(),
+            message: "merkle proof matches the stored header; independent consensus validation is not guaranteed".to_string(),
         }),
         Ok(false) => Ok(VerifyProofResult {
             verified: false,
@@ -952,6 +1130,169 @@ pub struct VerifyProofResult {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn resolver_fetch_snapshot_history_detail_integration() {
+        use bsv::transaction::{transaction::Transaction, transaction_input::TransactionInput, transaction_output::TransactionOutput};
+        use bsv::script::locking_script::LockingScript;
+        use crate::db::{connection, repositories as repo};
+        fn out(value: u64, script: u8) -> TransactionOutput {
+            TransactionOutput { satoshis: Some(value), locking_script: LockingScript::from_binary(&[script]), change: false }
+        }
+        fn coinbase(value: u64, script: u8) -> Transaction {
+            let mut tx = Transaction::new();
+            tx.inputs.push(TransactionInput { source_txid: Some("00".repeat(32)), source_output_index: u32::MAX, ..Default::default() });
+            tx.outputs.push(out(value, script));
+            tx
+        }
+        fn spend(parent: &Transaction, value: u64, script: u8) -> Transaction {
+            let mut tx = Transaction::new();
+            tx.inputs.push(TransactionInput { source_txid: Some(parent.id().unwrap()), source_output_index: 0, ..Default::default() });
+            tx.outputs.push(out(value, script));
+            tx
+        }
+        fn entry(tx: &Transaction) -> repo::SyncTransaction {
+            repo::SyncTransaction { hash: crate::core::address::hex_str_to_hash(&tx.id().unwrap()).unwrap(),
+                height: Some(10), raw: std::sync::Arc::from([]), delta: None }
+        }
+        let path = std::env::temp_dir().join(format!("electrumsv-resolver-{}-{}.sqlite", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        connection::create_wallet_db(path.to_str().unwrap()).await.unwrap();
+        let pool = connection::open_wallet_db(path.to_str().unwrap()).await.unwrap();
+        let master = repo::insert_master_key(&pool, None, repo::derivation_type::BIP32, b"test").await.unwrap();
+        let account = repo::insert_account(&pool, Some(master), repo::script_type::P2PKH, "test").await.unwrap();
+        let a = repo::insert_keyinstance(&pool, account, Some(master), repo::derivation_type::BIP32, br#"{"subpath":[0,0]}"#, repo::script_type::P2PKH, 0, None).await.unwrap();
+        let b = repo::insert_keyinstance(&pool, account, Some(master), repo::derivation_type::BIP32, br#"{"subpath":[0,1]}"#, repo::script_type::P2PKH, 0, None).await.unwrap();
+        let keys = repo::get_keyinstances_for_account(&pool, account).await.unwrap();
+        let scripts = [(crate::network::backend::scripthash_from_script("51").unwrap(), a),
+            (crate::network::backend::scripthash_from_script("52").unwrap(), b)].into_iter().collect();
+        let receive = coinbase(100, 0x51);
+        let transfer = spend(&receive, 90, 0x52);
+        let external = coinbase(7, 0x53);
+        let pending = spend(&external, 5, 0x52);
+        let graphs = [&receive, &transfer, &external, &pending].into_iter()
+            .map(|tx| (tx.id().unwrap(), tx.to_hex().unwrap())).collect::<std::collections::HashMap<_, _>>();
+        let snapshots = || vec![
+            repo::SyncKeySnapshot { key_id: a, transactions: vec![entry(&receive), entry(&transfer)], outputs: vec![] },
+            repo::SyncKeySnapshot { key_id: b, transactions: vec![entry(&transfer), entry(&pending)], outputs: vec![] },
+        ];
+        let find_value = |rows: Vec<repo::TxDeltaHistoryRow>, tx: &Transaction| rows.into_iter().find(|r| r.tx_hash_hex == tx.id().unwrap()).unwrap().value_delta;
+        let missing_id = external.id().unwrap();
+        let mut first = snapshots();
+        super::resolve_sync_history(&mut first, &scripts, &mut super::RawTransactionCache::new(), &mut 0,
+            |id| { let data = if id == missing_id { None } else { graphs.get(&id).cloned() }; async move { Ok(data.map_or(serde_json::Value::Null, |raw| serde_json::json!(raw))) } }).await.unwrap();
+        repo::replace_sync_snapshot(&pool, account, &keys, None, &first).await.unwrap();
+        let history = repo::get_tx_history_for_account(&pool, account, 50, 0).await.unwrap();
+        assert_eq!(find_value(history.clone(), &receive), Some(100));
+        assert_eq!(find_value(history.clone(), &transfer), Some(-10));
+        assert_eq!(find_value(history, &pending), None);
+        let detail = crate::commands::extra::transaction_detail(&pool, account, &transfer.id().unwrap()).await.unwrap();
+        assert!(detail.detail_complete);
+        assert_eq!(detail.inputs.unwrap()[0].prev_tx_hash, receive.id().unwrap());
+        assert_eq!(detail.outputs.unwrap()[0].value, 90);
+        let mut second = snapshots();
+        super::resolve_sync_history(&mut second, &scripts, &mut super::RawTransactionCache::new(), &mut 0,
+            |id| { let data = graphs.get(&id).cloned(); async move { Ok(data.map_or(serde_json::Value::Null, |raw| serde_json::json!(raw))) } }).await.unwrap();
+        repo::replace_sync_snapshot(&pool, account, &keys, None, &second).await.unwrap();
+        let history = repo::get_tx_history_for_account(&pool, account, 50, 0).await.unwrap();
+        assert_eq!(find_value(history, &pending), Some(5));
+        let mut malformed = snapshots();
+        assert!(super::resolve_sync_history(&mut malformed, &scripts, &mut super::RawTransactionCache::new(), &mut 0,
+            |_| { let raw = transfer.to_hex().unwrap(); async move { Ok(serde_json::json!(raw)) } }).await.is_err());
+        let mut omitted = snapshots();
+        omitted[0].transactions.retain(|item| item.hash != entry(&transfer).hash);
+        assert!(super::resolve_sync_history(&mut omitted, &scripts, &mut super::RawTransactionCache::new(), &mut 0,
+            |id| { let data = graphs.get(&id).cloned(); async move { Ok(data.map_or(serde_json::Value::Null, |raw| serde_json::json!(raw))) } }).await.is_err());
+        let unchanged = repo::get_tx_history_for_account(&pool, account, 50, 0).await.unwrap();
+        assert_eq!(find_value(unchanged.clone(), &transfer), Some(-10));
+        assert_eq!(find_value(unchanged, &pending), Some(5));
+        pool.close().await;
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn fake_fetch_distinguishes_missing_server_errors_and_bad_hashes() {
+        use bsv::transaction::{transaction::Transaction, transaction_input::TransactionInput, transaction_output::TransactionOutput};
+        use bsv::script::locking_script::LockingScript;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut tx = Transaction::new();
+        tx.inputs.push(TransactionInput { source_txid: Some(hex::encode((0u8..32).collect::<Vec<_>>())), source_output_index: 1, ..Default::default() });
+        tx.outputs.push(TransactionOutput { satoshis: Some(7), locking_script: LockingScript::from_binary(&[0x51]), change: false });
+        let raw = tx.to_hex().unwrap();
+        let id = tx.id().unwrap();
+        let calls = AtomicUsize::new(0);
+        let mut cache = super::RawTransactionCache::new();
+        let mut bytes = 0;
+        let fetch = |_: String| { calls.fetch_add(1, Ordering::SeqCst); let raw = raw.clone(); async move { Ok(serde_json::json!(raw)) } };
+        let (_, parsed) = super::fetch_sync_transaction_with(&id.to_uppercase(), &mut cache, &mut bytes, false, fetch).await.unwrap().unwrap();
+        assert_eq!(parsed.inputs[0].source_txid.as_deref(), Some(hex::encode((0u8..32).collect::<Vec<_>>()).as_str()));
+        let display = parsed.inputs[0].source_txid.as_ref().unwrap();
+        assert_eq!(crate::core::address::hash_to_hex_str(&crate::core::address::hex_str_to_hash(display).unwrap()), *display);
+        super::fetch_sync_transaction_with(&id, &mut cache, &mut bytes, false, |_| async { panic!("cache was not used") }).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let missing = "ff".repeat(32);
+        assert!(super::fetch_sync_transaction_with(&missing, &mut cache, &mut bytes, true, |_| async { Err(super::NetworkError::NotFound("missing".into())) }).await.unwrap().is_none());
+        let failed = "ee".repeat(32);
+        assert!(super::fetch_sync_transaction_with(&failed, &mut cache, &mut bytes, true, |_| async { Err(super::NetworkError::Server("overloaded".into())) }).await.is_err());
+        let wrong = "dd".repeat(32);
+        assert!(super::fetch_sync_transaction_with(&wrong, &mut cache, &mut bytes, false, |_| async { Ok(serde_json::json!(raw)) }).await.is_err());
+    }
+
+    #[test]
+    fn history_must_include_every_wallet_utxo() {
+        let hash = vec![42; 32];
+        let output = super::repositories::SyncOutput { hash: hash.clone(), height: Some(1), index: 0, value: 100,
+            coinbase: false, script_pubkey: "51".into() };
+        assert!(super::validate_utxo_history(&[], &[output]).is_err());
+        let output = super::repositories::SyncOutput { hash: hash.clone(), height: Some(1), index: 0, value: 100,
+            coinbase: false, script_pubkey: "51".into() };
+        let history = super::repositories::SyncTransaction { hash, height: Some(1), raw: std::sync::Arc::from([]), delta: None };
+        assert!(super::validate_utxo_history(&[history], &[output]).is_ok());
+    }
+
+    #[test]
+    fn history_membership_rejects_omitted_and_unrelated_keys() {
+        let amounts = [(1, -100), (2, 90)].into_iter().collect();
+        let only_b = [2].into_iter().collect();
+        assert!(super::validate_history_membership(&amounts, &only_b, true).is_err());
+        let extra = [1, 2, 3].into_iter().collect();
+        assert!(super::validate_history_membership(&amounts, &extra, true).is_err());
+        assert!(super::validate_history_membership(&amounts, &extra, false).is_ok());
+        let all = [1, 2].into_iter().collect();
+        assert!(super::validate_history_membership(&amounts, &all, true).is_ok());
+    }
+
+    #[test]
+    fn history_graph_computes_wallet_net_and_missing_prevout_is_unknown() {
+        use bsv::transaction::{transaction::Transaction, transaction_input::TransactionInput, transaction_output::TransactionOutput};
+        use bsv::script::locking_script::LockingScript;
+        fn out(value: u64, script: u8) -> TransactionOutput {
+            TransactionOutput { satoshis: Some(value), locking_script: LockingScript::from_binary(&[script]), change: false }
+        }
+        let mut parent = Transaction::new();
+        parent.inputs.push(TransactionInput { source_txid: Some("00".repeat(32)), source_output_index: u32::MAX, ..Default::default() });
+        parent.outputs = vec![out(100_000, 0x51)];
+        let parent_id = parent.id().unwrap();
+        let mut tx = Transaction::new();
+        tx.inputs.push(TransactionInput { source_txid: Some(parent_id.clone()), source_output_index: 0, ..Default::default() });
+        tx.outputs = vec![out(25_000, 0x52), out(74_000, 0x51), out(0, 0x6a)];
+        let scripts = [(crate::network::backend::scripthash_from_script("51").unwrap(), 1),
+            (crate::network::backend::scripthash_from_script("52").unwrap(), 2)].into_iter().collect();
+        let mut cache = super::RawTransactionCache::new();
+        let (_, complete) = super::calculate_history_values(&tx, &scripts, &cache).unwrap();
+        assert!(!complete);
+        cache.insert(parent_id, Some((hex::decode(parent.to_hex().unwrap()).unwrap(), parent)));
+        let (values, complete) = super::calculate_history_values(&tx, &scripts, &cache).unwrap();
+        assert!(complete);
+        assert_eq!(values[&1], -26_000);
+        assert_eq!(values[&2], 25_000);
+        assert_eq!(values.values().sum::<i64>(), -1_000);
+        tx.inputs[0].source_output_index = 99;
+        assert!(super::calculate_history_values(&tx, &scripts, &cache).is_err());
+        let raw = hex::decode(tx.to_hex().unwrap()).unwrap();
+        assert!(super::validate_transaction_wire(&raw).is_ok());
+        assert!(super::validate_transaction_wire(&[1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]).is_err());
+    }
+
     use super::*;
     use crate::network::server_list::ServerList;
 

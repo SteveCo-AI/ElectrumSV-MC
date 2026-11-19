@@ -21,6 +21,15 @@ fn join_path(dir: &str, filename: &str) -> String {
         .to_string()
 }
 
+fn lock_wallet(path: &Path) -> Result<std::fs::File, WalletError> {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).open(lock_path)
+        .map_err(|e| WalletError::Internal(e.into()))?;
+    file.try_lock().map_err(|e| WalletError::Internal(anyhow::anyhow!("wallet is already in use or cannot be locked: {e}")))?;
+    Ok(file)
+}
+
 /// Result of creating a new wallet.
 #[derive(Debug, serde::Serialize)]
 pub struct CreateWalletResult {
@@ -64,6 +73,8 @@ pub enum WalletError {
     WalletNotFound(String),
     #[error("invalid mnemonic: {0}")]
     InvalidMnemonic(String),
+    #[error("wallet operation in progress") ]
+    Busy,
     #[error("no wallet is currently open")]
     NoWalletOpen,
     #[error("wallet is already unlocked")]
@@ -100,6 +111,7 @@ pub async fn create_wallet(
     provided_mnemonic: Option<&str>,
     mnemonic_passphrase: Option<&str>,
 ) -> Result<CreateWalletResult, WalletError> {
+    let _operation = state.wallet_operation.lock().await;
     if password.is_empty() {
         return Err(WalletError::PasswordRequired);
     }
@@ -109,8 +121,12 @@ pub async fn create_wallet(
     } else {
         name
     };
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err(WalletError::Internal(anyhow::anyhow!("invalid wallet name")));
+    }
     let wallet_path = join_path(&state.data_dir, &format!("{}.sqlite", name));
 
+    let wallet_lock = std::sync::Arc::new(lock_wallet(Path::new(&wallet_path))?);
     if Path::new(&wallet_path).exists() {
         return Err(WalletError::WalletAlreadyExists(wallet_path));
     }
@@ -142,7 +158,7 @@ pub async fn create_wallet(
     connection::create_wallet_db(&wallet_path).await?;
 
     // Open the database
-    let pool = connection::open_wallet_db(&wallet_path).await?;
+    let pool = connection::open_wallet_db_locked(&wallet_path, wallet_lock.clone()).await?;
 
     // Insert MasterKey
     let derivation_data = keystore::keystore_data_to_bytes(&ks_data);
@@ -179,6 +195,8 @@ pub async fn create_wallet(
 
     // Set as active wallet in state
     let active = ActiveWallet {
+        instance_id: std::sync::Arc::new(()),
+        wallet_lock,
         wallet_path: wallet_path.clone(),
         wallet_name: name.to_string(),
         db_pool: pool,
@@ -187,6 +205,7 @@ pub async fn create_wallet(
         decrypted_xprv: Some(derived.xprv), // freshly created — already unlocked
     };
 
+    retire_active_wallet(state).await?;
     let mut guard = state.active_wallet.lock().unwrap();
     *guard = Some(active);
 
@@ -213,16 +232,16 @@ pub async fn open_wallet(
     state: &AppState,
     wallet_path: &str,
 ) -> Result<OpenWalletResult, WalletError> {
-    // Normalize path: accept with or without .sqlite extension
-    let wallet_path = if wallet_path.ends_with(".sqlite") {
-        wallet_path.to_string()
-    } else {
-        format!("{}.sqlite", wallet_path)
-    };
-
-    if !Path::new(&wallet_path).exists() {
-        return Err(WalletError::WalletNotFound(wallet_path));
-    }
+    let _operation = state.wallet_operation.lock().await;
+    let name = if wallet_path.ends_with(".sqlite") { wallet_path.to_string() } else { format!("{}.sqlite", wallet_path) };
+    let path = Path::new(&name);
+    let candidate = if path.components().count() == 1 { Path::new(&state.data_dir).join(path) } else { path.to_path_buf() };
+    let meta = std::fs::symlink_metadata(&candidate).map_err(|_| WalletError::WalletNotFound(candidate.to_string_lossy().to_string()))?;
+    if meta.file_type().is_symlink() || !meta.is_file() { return Err(WalletError::Internal(anyhow::anyhow!("wallet must be a regular file"))); }
+    let canonical = candidate.canonicalize().map_err(|e| WalletError::Internal(e.into()))?;
+    let root = Path::new(&state.data_dir).canonicalize().map_err(|e| WalletError::Internal(e.into()))?;
+    if !canonical.starts_with(&root) { return Err(WalletError::Internal(anyhow::anyhow!("wallet must be inside the wallet data directory"))); }
+    let wallet_path = canonical.to_string_lossy().to_string();
 
     // Check if already open
     {
@@ -239,8 +258,9 @@ pub async fn open_wallet(
         }
     }
 
+    let wallet_lock = std::sync::Arc::new(lock_wallet(Path::new(&wallet_path))?);
     // Open DB
-    let pool = connection::open_wallet_db(&wallet_path).await?;
+    let pool = connection::open_wallet_db_locked(&wallet_path, wallet_lock.clone()).await?;
 
     // Read master key
     let mk_row = repositories::get_first_master_key(&pool)
@@ -267,6 +287,8 @@ pub async fn open_wallet(
 
     // Set as active wallet (locked)
     let active = ActiveWallet {
+        instance_id: std::sync::Arc::new(()),
+        wallet_lock,
         wallet_path: wallet_path.clone(),
         wallet_name: wallet_name.clone(),
         db_pool: pool,
@@ -275,6 +297,7 @@ pub async fn open_wallet(
         decrypted_xprv: None, // locked
     };
 
+    retire_active_wallet(state).await?;
     let mut guard = state.active_wallet.lock().unwrap();
     *guard = Some(active);
 
@@ -289,26 +312,27 @@ pub async fn open_wallet(
 }
 
 /// Close the currently open wallet.
-pub fn close_wallet(state: &AppState) -> Result<(), WalletError> {
-    let mut guard = state.active_wallet.lock().unwrap();
-    if guard.is_none() {
-        return Err(WalletError::NoWalletOpen);
+async fn retire_active_wallet(state: &AppState) -> Result<bool, WalletError> {
+    let active = state.active_wallet.lock().unwrap().take();
+    if let Some(wallet) = active {
+        wallet.db_pool.close().await;
+        wallet.wallet_lock.unlock().map_err(|e| WalletError::Internal(e.into()))?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
+}
 
-    let active = guard.take();
-    if let Some(w) = active {
-        // Close the DB pool synchronously — spawn a task if needed
-        // Actually pool.close() is async, but we can just drop it
-        // sqlx will close connections when the pool is dropped
-        drop(w);
-    }
-
+pub async fn close_wallet(state: &AppState) -> Result<(), WalletError> {
+    let _operation = state.wallet_operation.try_lock().map_err(|_| WalletError::Busy)?;
+    if !retire_active_wallet(state).await? { return Err(WalletError::NoWalletOpen); }
     log::info!("Wallet closed");
     Ok(())
 }
 
 /// Unlock the currently open wallet by decrypting the xprv with the password.
 pub fn unlock_wallet(state: &AppState, password: &str) -> Result<(), WalletError> {
+    let _operation = state.wallet_operation.try_lock().map_err(|_| WalletError::Busy)?;
     let mut guard = state.active_wallet.lock().unwrap();
     let active = guard.as_mut().ok_or(WalletError::NoWalletOpen)?;
 
@@ -316,11 +340,37 @@ pub fn unlock_wallet(state: &AppState, password: &str) -> Result<(), WalletError
         return Err(WalletError::AlreadyUnlocked);
     }
 
-    // Decrypt xprv
+    if !keystore::verify_password(&active.keystore_data, password) { return Err(WalletError::WrongPassword); }
     let xprv = keystore::decrypt_xprv(&active.keystore_data, password)?;
     active.decrypted_xprv = Some(xprv);
 
     log::info!("Wallet unlocked: {}", active.wallet_name);
+    Ok(())
+}
+
+/// Unlock only after the same password and TOTP checks used by every frontend.
+pub async fn unlock_wallet_authorized(state: &AppState, password: &str, code: Option<&str>) -> Result<(), String> {
+    let _operation = state.wallet_operation.lock().await;
+    let (pool, instance_id) = {
+        let guard = state.active_wallet.lock().map_err(|_| "wallet state unavailable")?;
+        let active = guard.as_ref().ok_or("no wallet is currently open")?;
+        if !keystore::verify_password(&active.keystore_data, password) { return Err("incorrect password".into()); }
+        (active.db_pool.clone(), active.instance_id.clone())
+    };
+    if let Some(secret) = repositories::load_totp_secret(&pool).await.map_err(|e| e.to_string())? {
+        let code = code.filter(|c| !c.is_empty()).ok_or("TOTP code required")?;
+        let totp = crate::security::totp::TotpInstance::from_secret_bytes(&secret, "ElectrumSV-Mc", "wallet").map_err(|e| e.to_string())?;
+        if !totp.verify_current(code).map_err(|e| e.to_string())? { return Err("invalid TOTP code".into()); }
+    }
+    finish_authorized_unlock(state, &instance_id, password)
+}
+
+fn finish_authorized_unlock(state: &AppState, instance_id: &std::sync::Arc<()>, password: &str) -> Result<(), String> {
+    let mut guard = state.active_wallet.lock().map_err(|_| "wallet state unavailable")?;
+    let active = guard.as_mut().ok_or("no wallet is currently open")?;
+    if !std::sync::Arc::ptr_eq(&active.instance_id, instance_id) { return Err("wallet changed during authentication".into()); }
+    if active.is_unlocked() { return Err("wallet is already unlocked".into()); }
+    active.decrypted_xprv = Some(keystore::decrypt_xprv(&active.keystore_data, password).map_err(|e| e.to_string())?);
     Ok(())
 }
 
@@ -367,7 +417,22 @@ mod tests {
             active_wallet: std::sync::Mutex::new(None),
             network: std::sync::Mutex::new(crate::state::NetworkState::new()),
             pending_plans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wallet_operation: tokio::sync::Mutex::new(()),
         }
+    }
+
+    #[tokio::test]
+    async fn test_authorized_unlock_rejects_changed_wallet_instance() {
+        let state = make_test_state("auth_switch");
+        create_wallet(&state, "a", "same-password", None, None).await.unwrap();
+        let first_id = state.active_wallet.lock().unwrap().as_ref().unwrap().instance_id.clone();
+        close_wallet(&state).await.unwrap();
+        create_wallet(&state, "b", "same-password", None, None).await.unwrap();
+        close_wallet(&state).await.unwrap();
+        open_wallet(&state, "b").await.unwrap();
+        assert!(finish_authorized_unlock(&state, &first_id, "same-password").is_err());
+        assert!(!get_wallet_status(&state).is_unlocked);
+        close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -389,7 +454,7 @@ mod tests {
         assert!(status.is_unlocked);
         assert_eq!(status.wallet_name, Some("test_create".to_string()));
 
-        close_wallet(&state).unwrap();
+        close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -404,7 +469,7 @@ mod tests {
         assert!(!result.is_new_mnemonic);
         assert_eq!(result.mnemonic, mnemonic);
 
-        close_wallet(&state).unwrap();
+        close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -434,7 +499,7 @@ mod tests {
         create_wallet(&state, "test_dup", "password123", None, None)
             .await
             .unwrap();
-        close_wallet(&state).unwrap();
+        close_wallet(&state).await.unwrap();
 
         let result = create_wallet(&state, "test_dup", "password123", None, None).await;
         assert!(result.is_err());
@@ -446,7 +511,7 @@ mod tests {
         create_wallet(&state, "test_open", "password123", None, None)
             .await
             .unwrap();
-        close_wallet(&state).unwrap();
+        close_wallet(&state).await.unwrap();
 
         // Wallet should not be open
         let status = get_wallet_status(&state);
@@ -461,7 +526,25 @@ mod tests {
         assert!(status.is_open);
         assert!(!status.is_unlocked);
 
-        close_wallet(&state).unwrap();
+        close_wallet(&state).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn low_level_unlock_rejects_empty_password_for_encrypted_wallet() {
+        let state = make_test_state("unlock_empty_protected");
+        create_wallet(&state, "protected", "secret", None, None).await.unwrap();
+        close_wallet(&state).await.unwrap();
+        open_wallet(&state, "protected").await.unwrap();
+        let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+        let original = repositories::get_first_master_key(&pool).await.unwrap().unwrap().derivation_data;
+        assert!(unlock_wallet(&state, "").is_err());
+        assert!(!get_wallet_status(&state).is_unlocked);
+        assert!(unlock_wallet_authorized(&state, "", None).await.is_err());
+        assert!(!get_wallet_status(&state).is_unlocked);
+        assert_eq!(repositories::get_first_master_key(&pool).await.unwrap().unwrap().derivation_data, original);
+        drop(pool);
+        unlock_wallet_authorized(&state, "secret", None).await.unwrap();
+        close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -470,7 +553,7 @@ mod tests {
         create_wallet(&state, "test_unlock", "password123", None, None)
             .await
             .unwrap();
-        close_wallet(&state).unwrap();
+        close_wallet(&state).await.unwrap();
 
         let wallet_path = join_path(&state.data_dir, "test_unlock.sqlite");
         open_wallet(&state, &wallet_path).await.unwrap();
@@ -485,7 +568,7 @@ mod tests {
         let status = get_wallet_status(&state);
         assert!(status.is_unlocked);
 
-        close_wallet(&state).unwrap();
+        close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -494,7 +577,7 @@ mod tests {
         create_wallet(&state, "test_wrong_pw", "password123", None, None)
             .await
             .unwrap();
-        close_wallet(&state).unwrap();
+        close_wallet(&state).await.unwrap();
 
         let wallet_path = join_path(&state.data_dir, "test_wrong_pw.sqlite");
         open_wallet(&state, &wallet_path).await.unwrap();
@@ -506,7 +589,7 @@ mod tests {
         let status = get_wallet_status(&state);
         assert!(!status.is_unlocked);
 
-        close_wallet(&state).unwrap();
+        close_wallet(&state).await.unwrap();
     }
 
     #[tokio::test]
@@ -521,7 +604,7 @@ mod tests {
         assert!(get_wallet_status(&state).is_unlocked);
 
         // 2. Close
-        close_wallet(&state).unwrap();
+        close_wallet(&state).await.unwrap();
         assert!(!get_wallet_status(&state).is_open);
 
         // 3. Open
@@ -535,7 +618,7 @@ mod tests {
         assert!(get_wallet_status(&state).is_unlocked);
 
         // 5. Close
-        close_wallet(&state).unwrap();
+        close_wallet(&state).await.unwrap();
         assert!(!get_wallet_status(&state).is_open);
     }
 
@@ -556,7 +639,7 @@ mod tests {
     #[tokio::test]
     async fn test_close_no_wallet_open() {
         let state = make_test_state("close_none");
-        let result = close_wallet(&state);
+        let result = close_wallet(&state).await;
         assert!(result.is_err());
     }
 }

@@ -6,10 +6,9 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::path::Path;
-use std::str::FromStr;
 
 /// Current migration version (matches Python MIGRATION_CURRENT).
-pub const MIGRATION_CURRENT: i64 = 31;
+pub const MIGRATION_CURRENT: i64 = 33;
 
 /// First migration version (matches Python MIGRATION_FIRST).
 pub const MIGRATION_FIRST: i64 = 22;
@@ -35,8 +34,12 @@ const SQL_0030: &str = include_str!("../../migrations/0030_multisig_configs.sql"
 /// SQL for migration 0031 — add script_pubkey to TransactionOutputs.
 const SQL_0031: &str = include_str!("../../migrations/0031_txo_script_pubkey.sql");
 
+const SQL_0032: &str = include_str!("../../migrations/0032_transaction_delta_known.sql");
+
+const SQL_0033: &str = include_str!("../../migrations/0033_spend_reservations.sql");
+
 /// All migration SQL in order.
-const ALL_MIGRATIONS: [(i64, &str); 10] = [
+const ALL_MIGRATIONS: [(i64, &str); 12] = [
     (22, SQL_0022),
     (23, SQL_0023),
     (24, SQL_0024),
@@ -47,6 +50,8 @@ const ALL_MIGRATIONS: [(i64, &str); 10] = [
     (29, SQL_0029),
     (30, SQL_0030),
     (31, SQL_0031),
+    (32, SQL_0032),
+    (33, SQL_0033),
 ];
 
 /// Create a new wallet database file from scratch.
@@ -59,14 +64,21 @@ const ALL_MIGRATIONS: [(i64, &str); 10] = [
 pub async fn create_wallet_db(wallet_path: &str) -> anyhow::Result<()> {
     let path = Path::new(wallet_path);
 
-    if path.exists() {
-        anyhow::bail!("Wallet database already exists: {}", wallet_path);
+    #[cfg(not(unix))]
+    anyhow::bail!("secure wallet creation is not supported on this platform");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+            .map_err(|e| if e.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow::anyhow!("Wallet database already exists: {}", wallet_path)
+            } else { e.into() })?;
     }
 
     log::info!("Creating new wallet database: {}", wallet_path);
 
-    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", wallet_path))?
-        .create_if_missing(true)
+    let options = SqliteConnectOptions::new().filename(path)
+        .create_if_missing(false)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
         .foreign_keys(true)
@@ -134,6 +146,14 @@ pub async fn create_wallet_db(wallet_path: &str) -> anyhow::Result<()> {
 /// # Arguments
 /// * `wallet_path` — Absolute path to the .sqlite file
 pub async fn open_wallet_db(wallet_path: &str) -> anyhow::Result<SqlitePool> {
+    open_wallet_db_inner(wallet_path, None).await
+}
+
+pub async fn open_wallet_db_locked(wallet_path: &str, wallet_lock: std::sync::Arc<std::fs::File>) -> anyhow::Result<SqlitePool> {
+    open_wallet_db_inner(wallet_path, Some(wallet_lock)).await
+}
+
+async fn open_wallet_db_inner(wallet_path: &str, wallet_lock: Option<std::sync::Arc<std::fs::File>>) -> anyhow::Result<SqlitePool> {
     let path = Path::new(wallet_path);
 
     if !path.exists() {
@@ -142,7 +162,7 @@ pub async fn open_wallet_db(wallet_path: &str) -> anyhow::Result<SqlitePool> {
 
     log::info!("Opening wallet database: {}", wallet_path);
 
-    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", wallet_path))?
+    let options = SqliteConnectOptions::new().filename(path)
         .create_if_missing(false)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
@@ -151,6 +171,10 @@ pub async fn open_wallet_db(wallet_path: &str) -> anyhow::Result<SqlitePool> {
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
+        .after_connect(move |_, _| {
+            let lock = wallet_lock.clone();
+            Box::pin(async move { drop(lock); Ok(()) })
+        })
         .connect_with(options)
         .await?;
 
@@ -326,6 +350,50 @@ pub struct WalletFileInfo {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn wallet_paths_are_literal_and_do_not_touch_decoded_neighbors() {
+        let dir = unique_test_dir("literal_paths");
+        std::fs::create_dir(dir.join("a")).unwrap();
+        for (literal, neighbor) in [("a%2Fb.sqlite", "a/b.sqlite"), ("a%3Fb.sqlite", "a?b.sqlite"), ("q.sqlite?mode=rw", "q.sqlite")] {
+            let other = dir.join(neighbor);
+            std::fs::write(&other, b"neighbor sentinel").unwrap();
+            let path = dir.join(literal);
+            super::create_wallet_db(path.to_str().unwrap()).await.unwrap();
+            let pool = super::open_wallet_db(path.to_str().unwrap()).await.unwrap();
+            let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM WalletData").fetch_one(&pool).await.unwrap();
+            assert!(count.0 > 0);
+            pool.close().await;
+            assert_eq!(std::fs::read(&other).unwrap(), b"neighbor sentinel");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn new_wallet_and_wal_are_private_under_permissive_umask() {
+        use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+        const CHILD: &str = "WALLET_MODE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "db::connection::tests::new_wallet_and_wal_are_private_under_permissive_umask", "--nocapture"]).env(CHILD, "1");
+            unsafe { command.pre_exec(|| { libc::umask(0o022); Ok(()) }); }
+            assert!(command.status().unwrap().success());
+            return;
+        }
+        let dir = unique_test_dir("secure_mode");
+        let path = dir.join("wallet.sqlite");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            super::create_wallet_db(path.to_str().unwrap()).await.unwrap();
+            let pool = super::open_wallet_db(path.to_str().unwrap()).await.unwrap();
+            sqlx::query("INSERT INTO WalletData (key,value,date_created,date_updated) VALUES ('mode-test','x',0,0)").execute(&pool).await.unwrap();
+            for suffix in ["", "-wal", "-shm"] {
+                let file = format!("{}{suffix}", path.display());
+                assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+            }
+            pool.close().await;
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -378,6 +446,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_32_marks_legacy_deltas_unknown() {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        for (_, sql) in ALL_MIGRATIONS.iter().filter(|(version, _)| *version <= 31) {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO WalletData VALUES ('migration', '31', 0, 0)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO Accounts VALUES (1, NULL, 2, 'test', 0, 0)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO KeyInstances VALUES (1, 1, NULL, 3, x'00', 2, 0, NULL, 0, 0)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO Transactions (tx_hash, date_created, date_updated) VALUES (x'01', 0, 0)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO TransactionDeltas (keyinstance_id, tx_hash, value_delta, date_created, date_updated) VALUES (1, x'01', 99, 0, 0)").execute(&pool).await.unwrap();
+        ensure_migrations(&pool).await.unwrap();
+        let row: (i64, i64) = sqlx::query_as("SELECT value_delta, value_known FROM TransactionDeltas").fetch_one(&pool).await.unwrap();
+        assert_eq!(row, (99, 0));
+        let version: (String,) = sqlx::query_as("SELECT value FROM WalletData WHERE key = 'migration'").fetch_one(&pool).await.unwrap();
+        assert_eq!(version.0, MIGRATION_CURRENT.to_string());
+        pool.close().await;
+    }
+
+    #[tokio::test]
     async fn test_create_wallet_db_from_scratch() {
         let temp_dir = unique_test_dir("create_db");
         let db_path = temp_dir.join("test_create.sqlite");
@@ -399,7 +486,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(row.0, "31");
+        assert_eq!(row.0, "33");
 
         // Check MasterKeys table exists
         let count: (i64,) = sqlx::query_as("SELECT count(*) FROM MasterKeys")
@@ -464,6 +551,7 @@ mod tests {
         let result = create_wallet_db(db_path.to_str().unwrap()).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"existing");
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }

@@ -43,6 +43,8 @@ pub struct AppState {
     /// Server-side TX plan store: plan_id -> PendingPlan.
     /// Lives outside `active_wallet` so plans survive wallet-close for cleanup.
     pub pending_plans: Mutex<HashMap<String, PendingPlan>>,
+    /// Serializes wallet lifecycle, address allocation, and sync commit.
+    pub wallet_operation: tokio::sync::Mutex<()>,
 }
 
 /// Generate a fresh UUID v4 plan id (RFC 4122 variant, random bits).
@@ -67,6 +69,8 @@ pub fn generate_plan_id() -> String {
 
 /// Represents a loaded wallet in memory.
 pub struct ActiveWallet {
+    pub(crate) instance_id: std::sync::Arc<()>,
+    pub(crate) wallet_lock: std::sync::Arc<std::fs::File>,
     /// Absolute path to the .sqlite file
     pub wallet_path: String,
     /// Wallet name (filename without .sqlite)
@@ -153,6 +157,7 @@ impl AppState {
             active_wallet: Mutex::new(None),
             network: Mutex::new(NetworkState::new()),
             pending_plans: Mutex::new(HashMap::new()),
+            wallet_operation: tokio::sync::Mutex::new(()),
         }
     }
 }

@@ -5,6 +5,8 @@ export interface BalanceInfo {
   unconfirmed: number;
   unmatured: number;
   total: number;
+  reserved?: number;
+  available?: number;
 }
 
 export interface WalletEntry {

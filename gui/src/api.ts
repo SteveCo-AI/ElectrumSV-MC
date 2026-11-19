@@ -27,6 +27,14 @@ export interface BalanceInfo {
   confirmed: number;
   unconfirmed: number;
   total: number;
+  reserved?: number;
+  available?: number;
+}
+
+export interface SpendPlanStatus {
+  plan_id: string;
+  state: 'PREPARED' | 'SIGNED' | 'BROADCAST_UNKNOWN' | 'BROADCASTED' | 'CANCELLED';
+  txid: string | null;
 }
 
 /** UtxoEntry matches Rust `commands::account::UtxoEntry` — wallet UTXO from DB. */
@@ -42,10 +50,22 @@ export interface UtxoEntry {
 /** HistoryEntry matches Rust `commands::account::HistoryEntry` — wallet transaction history. */
 export interface HistoryEntry {
   tx_hash: string;
-  value_delta: number;
+  value_delta: number | null;
   date_created: number;
   block_height: number | null;
   description: string | null;
+}
+
+export interface TransactionDetail {
+  txid: string;
+  status: string;
+  raw_tx: string | null;
+  account_id: number | null;
+  fee: number | null;
+  inputs: { prev_tx_hash: string; prev_vout: number; script_sig: string; sequence: number }[] | null;
+  outputs: { value: number; script_pubkey: string }[] | null;
+  label: string | null;
+  detail_complete: boolean;
 }
 
 /** AccountInfo matches Rust `commands::account::AccountInfo` — account summary. */
@@ -114,8 +134,8 @@ export const api = {
     invoke<any>('sweep_legacy_to_new', { seedWords, newWalletPath, password }),
   unlockWallet: (walletPath: string, password: string) =>
     invoke<any>('unlock_wallet', { password }),
-  unlockWalletWithTOTP: (walletPath: string, password: string, _totpCode?: string) =>
-    invoke<any>('unlock_wallet', { password }),
+  unlockWalletWithTOTP: (walletPath: string, password: string, totpCode?: string) =>
+    invoke<any>('unlock_wallet', { password, totpCode: totpCode ?? null }),
   listWallets: () => invoke<any[]>('list_wallets'),
 
   // Wallet info
@@ -124,7 +144,8 @@ export const api = {
   getBalance: (accountId?: number) =>
     invoke<BalanceInfo>('get_balance', { accountId: accountId ?? null }),
   getHistory: (accountId: number) =>
-    invoke<any[]>('get_history', { accountId, limit: null, offset: null }),
+    invoke<HistoryEntry[]>('get_history', { accountId, limit: null, offset: null }),
+  listReceiveAddresses: (accountId: number) => invoke<any[]>('list_receive_addresses', { accountId }),
   getUtxos: (accountId: number) =>
     invoke<any[]>('get_utxos', { accountId }),
   getKeys: (accountId: number) =>
@@ -143,16 +164,7 @@ export const api = {
       key_id: r?.keyinstance_id ?? null,
     })),
   getTransaction: (txid: string) =>
-    invoke<{
-      txid: string;
-      status: string;
-      raw_tx: string | null;
-      account_id: number | null;
-      fee: number | null;
-      inputs: { prev_tx_hash: string; prev_vout: number; script_sig: string; sequence: number }[];
-      outputs: { value: number; script_pubkey: string }[];
-      label: string | null;
-    }>('get_transaction', { txid }),
+    invoke<TransactionDetail>('get_transaction', { txid }),
 
   // 3-stage transaction workflow
   // AUD-008: prepare_tx returns a plan_id handle + metadata only — the full
@@ -182,6 +194,13 @@ export const api = {
   // broadcast_tx: takes signed hex + expected txid (from sign_tx result)
   broadcastTx: (signedTxHex: string, expectedTxid: string) =>
     invoke<string>('broadcast_tx', { signedTxHex, expectedTxid }),
+
+  getSpendPlanStatus: (planId: string) =>
+    invoke<SpendPlanStatus>('get_spend_plan_status', { planId }),
+  listSpendPlans: () => invoke<SpendPlanStatus[]>('list_spend_plans'),
+  cancelSpendPlan: (planId: string) => invoke<void>('cancel_spend_plan', { planId }),
+  broadcastSpendPlan: (planId: string, expectedTxid: string, retryUnknown = false) =>
+    invoke<string>('broadcast_spend_plan', { planId, expectedTxid, retryUnknown }),
 
   // estimate_fee: returns { fee, num_inputs, num_outputs, fee_rate }
   estimateFee: (outputs: PaymentOutput[], feeRate: number, opReturn?: string) =>
@@ -225,8 +244,8 @@ export const api = {
     invoke<any>('woc_get_tx', { txid }),
 
   // Wallet utilities (extra)
-  backupWallet: (backupPath: string) =>
-    invoke<string>('backup_wallet', { backupPath }),
+  backupWallet: (backupPath: string, password: string) =>
+    invoke<string>('backup_wallet', { backupPath, password }),
   importPrivkey: (wif: string, password: string) =>
     invoke<{ address: string; keyinstance_id: number }>('import_privkey', { wif, password }),
   send: (address: string, amount: number, password: string, totpCode: string, opReturn?: string, feeRate?: number) =>
@@ -298,12 +317,12 @@ export const api = {
     invoke<any>('export_privkey', { password, address: address || null, all: all || false, totpCode: totpCode ?? null }),
   changePassword: (oldPassword: string, newPassword: string) =>
     invoke<any>('change_password', { oldPassword, newPassword }),
-  signMessage: (address: string, message: string, password: string) =>
-    invoke<{ signature: string }>('sign_message', { address, message, password }),
+  signMessage: (address: string, message: string, password: string, totpCode?: string) =>
+    invoke<{ signature: string }>('sign_message', { address, message, password, totpCode: totpCode ?? null }),
   verifyMessage: (address: string, message: string, signature: string) =>
     invoke<{ valid: boolean }>('verify_message', { address, message, signature }),
-  deleteWallet: (walletPath: string) =>
-    invoke<any>('delete_wallet', { walletPath }),
+  deleteWallet: (walletPath: string, password: string) =>
+    invoke<any>('delete_wallet', { walletPath, password }),
 
   // TOTP — simplified model (one-step enable, no scope)
   // Backend: enable_totp() → { otpauth_url, secret_base32 }
@@ -313,14 +332,14 @@ export const api = {
   //          generate_totp_recovery_codes() → string[] (one-time display)
   //          totp_recover(recovery_code) → bool
   // NOTE: totpStatus() was removed — use getTotpStatus() instead.
-  totpEnable: () =>
-    invoke<{ otpauth_url: string; secret_base32: string }>('enable_totp'),
-  totpDisable: () =>
-    invoke<any>('disable_totp'),
+  totpEnable: (password: string) =>
+    invoke<{ otpauth_url: string; secret_base32: string }>('enable_totp', { password }),
+  totpDisable: (password: string, code: string) =>
+    invoke<any>('disable_totp', { password, code }),
   verifyTotp: (code: string) =>
     invoke<boolean>('verify_totp', { code }),
-  generateTotpRecoveryCodes: () =>
-    invoke<string[]>('generate_totp_recovery_codes'),
+  generateTotpRecoveryCodes: (password: string, code: string) =>
+    invoke<string[]>('generate_totp_recovery_codes', { password, code }),
   totpRecover: (recoveryCode: string) =>
     invoke<boolean>('totp_recover', { recoveryCode }),
 

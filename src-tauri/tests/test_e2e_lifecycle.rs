@@ -38,6 +38,7 @@ fn make_test_state(test_name: &str) -> AppState {
         active_wallet: std::sync::Mutex::new(None),
         network: std::sync::Mutex::new(electrumsv_mc_lib::state::NetworkState::new()),
         pending_plans: std::sync::Mutex::new(std::collections::HashMap::new()),
+        wallet_operation: tokio::sync::Mutex::new(()),
     }
 }
 
@@ -264,7 +265,7 @@ async fn test_e2e_wallet_lifecycle() {
     // -----------------------------------------------------------------
     // Step 9: Close wallet — active_wallet must become None
     // -----------------------------------------------------------------
-    wallet_service::close_wallet(&state).expect("close_wallet should succeed");
+    wallet_service::close_wallet(&state).await.expect("close_wallet should succeed");
     {
         let guard = state.active_wallet.lock().unwrap();
         assert!(guard.is_none(), "active_wallet must be None after close");
@@ -312,7 +313,7 @@ async fn test_e2e_wallet_lifecycle() {
     // -----------------------------------------------------------------
     // Step 12: Cleanup — close wallet, remove temp dir
     // -----------------------------------------------------------------
-    wallet_service::close_wallet(&state).expect("final close_wallet should succeed");
+    wallet_service::close_wallet(&state).await.expect("final close_wallet should succeed");
 
     // Extract data_dir before dropping state
     let data_dir = state.data_dir.clone();

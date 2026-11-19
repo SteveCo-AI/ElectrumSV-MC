@@ -482,6 +482,7 @@ impl NetworkBackend for WhatsOnChainClient {
             tx_hash: tx_hash.to_string(),
             block_height,
             merkle_branch,
+            position: resp.get("index").or_else(|| resp.get("pos")).and_then(|v| v.as_u64()),
             root: merkle_root,
         })
     }

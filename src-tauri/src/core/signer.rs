@@ -152,6 +152,55 @@ impl LocalSigner {
         let priv_key = PrivateKey::from_bytes(key_bytes)?;
         Ok(priv_key)
     }
+    /// Verify every selected output against its canonical raw transaction and derived key.
+    pub fn validate_prevouts(&self, inputs: &[SelectedUtxo], raw_prevouts: &[Vec<u8>]) -> Result<(), SignerError> {
+        if inputs.len() != raw_prevouts.len() {
+            return Err(SignerError::SigningFailed("prevout count mismatch".into()));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (utxo, raw) in inputs.iter().zip(raw_prevouts) {
+            if !seen.insert((utxo.tx_hash_hex.to_ascii_lowercase(), utxo.tx_index)) {
+                return Err(SignerError::SigningFailed("duplicate prevout".into()));
+            }
+            if raw.len() > 4 * 1024 * 1024 { return Err(SignerError::SigningFailed("prevout transaction too large".into())); }
+            crate::core::transaction::validate_transaction_wire(raw).map_err(SignerError::SigningFailed)?;
+            let hex = hex::encode(raw);
+            let tx = Transaction::from_hex(&hex)?;
+            if tx.to_hex()? != hex || !tx.id()?.eq_ignore_ascii_case(&utxo.tx_hash_hex) {
+                return Err(SignerError::SigningFailed("prevout transaction hash or encoding mismatch".into()));
+            }
+            let output = tx.outputs.get(utxo.tx_index as usize).ok_or_else(|| SignerError::SigningFailed("prevout index out of range".into()))?;
+            if output.satoshis != Some(utxo.satoshis) { return Err(SignerError::SigningFailed("prevout value mismatch".into())); }
+            let expected = P2PKH::from_private_key(self.derive_private_key(&utxo.subpath)?).lock()?;
+            if output.locking_script.to_binary() != expected.to_binary() { return Err(SignerError::SigningFailed("prevout script does not match wallet key".into())); }
+        }
+        Ok(())
+    }
+
+}
+
+/// Verify the exact final serialized transaction fee before returning a signature.
+pub fn validate_signed_fee(tx: &Transaction, inputs: &[SelectedUtxo], fee_rate: u64) -> Result<(), SignerError> {
+    validate_input_binding(tx, inputs)?;
+    let incoming = inputs.iter().try_fold(0u64, |n, u| n.checked_add(u.satoshis)).ok_or_else(|| SignerError::SigningFailed("input total overflow".into()))?;
+    let outgoing = tx.outputs.iter().try_fold(0u64, |n, o| n.checked_add(o.satoshis?)).ok_or_else(|| SignerError::SigningFailed("output total missing or overflow".into()))?;
+    let fee = incoming.checked_sub(outgoing).ok_or_else(|| SignerError::SigningFailed("outputs exceed inputs".into()))?;
+    let bytes = tx.to_hex()?.len() / 2;
+    let required = (bytes as u64).checked_mul(fee_rate).ok_or_else(|| SignerError::SigningFailed("fee overflow".into()))?;
+    if fee < required { return Err(SignerError::SigningFailed("signed transaction fee below requested rate".into())); }
+    Ok(())
+}
+
+fn validate_input_binding(tx: &Transaction, inputs: &[SelectedUtxo]) -> Result<(), SignerError> {
+    if tx.inputs.len() != inputs.len() { return Err(SignerError::SigningFailed("input count mismatch".into())); }
+    let mut seen = std::collections::HashSet::new();
+    for (input, utxo) in tx.inputs.iter().zip(inputs) {
+        if !seen.insert((utxo.tx_hash_hex.to_ascii_lowercase(), utxo.tx_index)) ||
+            !input.source_txid.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(&utxo.tx_hash_hex)) || input.source_output_index != utxo.tx_index {
+            return Err(SignerError::SigningFailed("transaction input does not match selected prevout".into()));
+        }
+    }
+    Ok(())
 }
 
 impl Signer for LocalSigner {
@@ -176,6 +225,7 @@ impl Signer for LocalSigner {
             });
         }
 
+        validate_input_binding(tx, inputs)?;
         let sighash_type = SIGHASH_ALL | SIGHASH_FORKID; // 0x41
 
         for (i, utxo) in inputs.iter().enumerate() {
@@ -445,6 +495,46 @@ mod tests {
             keyinstance_id: 1,
             subpath: [0, 0],
         }]
+    }
+
+    #[test]
+    fn verified_prevout_signature_and_actual_fee() {
+        use bsv::script::spend::{Spend, SpendParams};
+        use bsv::transaction::{transaction_input::TransactionInput, transaction_output::TransactionOutput};
+        let signer = LocalSigner::new(&get_test_xprv());
+        let locking = P2PKH::from_private_key(signer.derive_private_key(&[0, 0]).unwrap()).lock().unwrap();
+        let mut prev = Transaction::new();
+        prev.add_input(TransactionInput { source_txid: Some("00".repeat(32)), source_output_index: u32::MAX, ..Default::default() });
+        prev.add_output(TransactionOutput { satoshis: Some(100_000), locking_script: locking.clone(), change: false });
+        let raw = hex::decode(prev.to_hex().unwrap()).unwrap();
+        let input = SelectedUtxo { tx_hash_hex: prev.id().unwrap(), tx_index: 0, satoshis: 100_000, keyinstance_id: 1, subpath: [0,0] };
+        signer.validate_prevouts(&[input.clone()], &[raw.clone()]).unwrap();
+        let mut bad = input.clone(); bad.satoshis += 1;
+        assert!(signer.validate_prevouts(&[bad], &[raw.clone()]).is_err());
+        let mut bad = input.clone(); bad.tx_index = 1;
+        assert!(signer.validate_prevouts(&[bad], &[raw.clone()]).is_err());
+        let mut bad = input.clone(); bad.tx_hash_hex = "12".repeat(32);
+        assert!(signer.validate_prevouts(&[bad], &[raw.clone()]).is_err());
+        let mut bad = input.clone(); bad.subpath = [0,1];
+        assert!(signer.validate_prevouts(&[bad], &[raw.clone()]).is_err());
+        assert!(signer.validate_prevouts(&[input.clone(), input.clone()], &[raw.clone(), raw]).is_err());
+        let outputs = vec![PaymentOutput { address: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".into(), satoshis: 50_000 }];
+        let (mut tx, selection) = TxBuilder::build_unsigned(&[input.clone()], &outputs, Some("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"), 1, Some(b"test"), None).unwrap();
+        signer.sign_tx(&mut tx, &[input.clone()]).unwrap();
+        validate_signed_fee(&tx, &[input.clone()], 1).unwrap();
+        assert!(selection.fee >= (tx.to_hex().unwrap().len() / 2) as u64);
+        let verify = |tx: &Transaction| {
+            let input_tx = &tx.inputs[0];
+            Spend::new(SpendParams { locking_script: locking.clone(), unlocking_script: input_tx.unlocking_script.clone().unwrap(),
+                source_txid: input.tx_hash_hex.clone(), source_output_index: input.tx_index as usize, source_satoshis: input.satoshis,
+                transaction_version: tx.version, transaction_lock_time: tx.lock_time, transaction_sequence: input_tx.sequence,
+                other_inputs: vec![], other_outputs: tx.outputs.clone(), input_index: 0 }).validate()
+        };
+        assert!(verify(&tx).unwrap());
+        tx.outputs[0].satoshis = Some(50_001);
+        assert!(!matches!(verify(&tx), Ok(true)));
+        tx.outputs[0].satoshis = Some(99_999);
+        assert!(validate_signed_fee(&tx, &[input], 1).is_err());
     }
 
     #[test]

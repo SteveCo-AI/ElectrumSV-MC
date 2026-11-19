@@ -134,6 +134,14 @@ fn get_wallet_data(
     ))
 }
 
+async fn ensure_change_key(pool: &sqlx::SqlitePool, account_id: i64) -> Result<(), String> {
+    let keys = repositories::get_keyinstances_for_account(pool, account_id).await.map_err(|e| e.to_string())?;
+    if keys.iter().any(|key| serde_json::from_slice::<serde_json::Value>(&key.derivation_data).ok().and_then(|v| v.get("subpath").cloned()) == Some(serde_json::json!([1, 0]))) { return Ok(()); }
+    let master = repositories::get_first_master_key(pool).await.map_err(|e| e.to_string())?.ok_or("missing master key")?;
+    repositories::insert_keyinstance(pool, account_id, Some(master.masterkey_id), repositories::derivation_type::BIP32, br#"{"subpath":[1,0]}"#, repositories::script_type::P2PKH, 0, None).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Derive a change address from the wallet at path 1/0 (change chain, index 0).
 fn derive_change_address(xprv: &str) -> Result<String, TransactionCmdError> {
     let account_key = ExtendedKey::from_string(xprv)?;
@@ -168,331 +176,48 @@ fn parse_strategy(s: &Option<String>) -> Result<Option<Strategy>, String> {
     }
 }
 
-/// Prepare an unsigned transaction.
-///
-/// Selects UTXOs, calculates fees, and creates a TX plan bound to the current wallet.
-/// The plan must be signed (sign_tx) and broadcast (broadcast_tx) in subsequent calls.
+/// Prepare a durable wallet-bound spend plan.
 #[tauri::command]
-pub async fn prepare_tx(
-    state: State<'_, AppState>,
-    outputs: Vec<PaymentOutput>,
-    fee_rate: Option<u64>,
-    op_return: Option<String>,
-    coin_selection_strategy: Option<String>,
-) -> Result<PrepareTxResult, String> {
-    log::info!("prepare_tx — {} outputs", outputs.len());
-
-    let (pool, account_id, wallet_path, xprv_opt) =
-        get_wallet_data(&state).map_err(|e| e.to_string())?;
-
-    let xprv = xprv_opt.ok_or(TransactionCmdError::WalletLocked.to_string())?;
-    let fee_rate = match fee_rate {
-        Some(r) => r,
-        None => crate::features::mapi::fetch_default_fee_rate().await,
-    };
-
-    // Decode op_return: hex (with or without 0x prefix) or UTF-8 text
-    let op_return_bytes: Option<Vec<u8>> = op_return.map(|s| {
-        if s.is_empty() {
-            return Vec::new();
-        }
-        let hex_str = if let Some(stripped) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-            stripped
-        } else {
-            // Try to decode as hex — if valid, use it; otherwise treat as UTF-8
-            if hex::decode(&s).is_ok() {
-                &s
-            } else {
-                // Not valid hex — encode as UTF-8 bytes
-                return s.into_bytes();
-            }
-        };
-        // Decode hex string to bytes
-        match hex::decode(hex_str) {
-            Ok(bytes) => bytes,
-            Err(_) => s.into_bytes(),
-        }
-    });
-
-    // Fetch UTXOs from DB
-    let utxo_infos = repositories::get_utxo_infos_for_account(&pool, account_id)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if utxo_infos.is_empty() {
-        return Err(TransactionError::NoUtxos.to_string());
-    }
-
-    // Convert UTXOs to SelectedUtxo with subpath info
-    let mut selected_utxos = Vec::new();
-    for info in &utxo_infos {
-        // Get the KeyInstance to find the subpath
-        let ki = repositories::get_keyinstance(&pool, info.keyinstance_id)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| {
-                TransactionError::BsvSdk(format!("KeyInstance {} not found", info.keyinstance_id))
-                    .to_string()
-            })?;
-
-        let derivation_data: serde_json::Value =
-            serde_json::from_slice(&ki.derivation_data).map_err(|e| e.to_string())?;
-
-        let subpath = derivation_data
-            .get("subpath")
-            .and_then(|s| s.as_array())
-            .ok_or_else(|| {
-                TransactionError::BsvSdk("missing subpath in derivation_data".to_string())
-                    .to_string()
-            })?;
-
-        let type_idx = subpath[0]
-            .as_u64()
-            .ok_or_else(|| TransactionError::BsvSdk("invalid subpath type index".to_string()).to_string())? as u32;
-        let addr_idx = subpath[1]
-            .as_u64()
-            .ok_or_else(|| TransactionError::BsvSdk("invalid subpath address index".to_string()).to_string())? as u32;
-
-        selected_utxos.push(SelectedUtxo::from_utxo_info(info, [type_idx, addr_idx]));
-    }
-
-    // Derive change address
-    let change_address = derive_change_address(&xprv).map_err(|e| e.to_string())?;
-
-    // Parse coin selection strategy (None/empty -> largest-first default)
-    let strategy = parse_strategy(&coin_selection_strategy)?;
-
-    // Build unsigned transaction
-    let op_return_ref = op_return_bytes.as_deref();
-    let (tx, selection) =
-        TxBuilder::build_unsigned(&selected_utxos, &outputs, Some(&change_address), fee_rate, op_return_ref, strategy)
-            .map_err(|e| e.to_string())?;
-
-    // Create TX plan
-    let plan = TxBuilder::create_plan(
-        tx,
-        outputs,
-        selection,
-        Some(change_address),
-        wallet_path,
-        account_id,
-        TX_PLAN_TTL,
-        op_return_bytes,
-    )
-    .map_err(|e| e.to_string())?;
-
-    log::info!(
-        "TX plan created: {} inputs, {} sat fee, {} sat change, expires in {}s",
-        plan.inputs.len(),
-        plan.fee,
-        plan.change,
-        TX_PLAN_TTL
-    );
-
-    // AUD-008: Store the plan server-side and return only a plan_id handle.
-    // The renderer never sees the unsigned_tx_hex or inputs — it cannot
-    // tamper with the plan that actually gets signed.
-    let plan_id = state::generate_plan_id();
-    let now = chrono::Utc::now().timestamp();
-    let num_inputs = plan.inputs.len();
-    let num_outputs = plan.outputs.len()
-        + if plan.change > 0 { 1 } else { 0 }
-        + if plan.op_return.is_some() { 1 } else { 0 };
-    let fee = plan.fee;
-    let total_input = plan.total_input;
-    let total_output = plan.total_output;
-    let change = plan.change;
-
-    {
-        let mut plans = state.pending_plans.lock().unwrap();
-        // Opportunistic cleanup: remove expired plans before inserting the new one.
-        plans.retain(|_, pp| now - pp.created_at < PLAN_STORE_TTL);
-        plans.insert(
-            plan_id.clone(),
-            crate::state::PendingPlan {
-                plan,
-                created_at: now,
-            },
-        );
-    }
-    log::info!("TX plan stored server-side — plan_id: {}", plan_id);
-
-    Ok(PrepareTxResult {
-        plan_id,
-        fee,
-        total_input,
-        total_output,
-        change,
-        num_inputs,
-        num_outputs,
-    })
+pub async fn prepare_tx(state: State<'_, AppState>, outputs: Vec<PaymentOutput>, fee_rate: Option<u64>, op_return: Option<String>, coin_selection_strategy: Option<String>) -> Result<PrepareTxResult, String> {
+    crate::services::transaction_service::prepare_tx(&state, outputs, fee_rate, op_return, coin_selection_strategy).await
 }
 
-/// Sign a transaction plan.
-///
-/// AUD-007: Requires TOTP verification before signing.
-/// The plan must belong to the current wallet (wallet_path binding).
-/// AUD-008: The plan is fetched server-side by `plan_id` from the plan store
-/// instead of being accepted as a parameter from the renderer. This prevents
-/// a compromised renderer from tampering with inputs/outputs/fee.
 #[tauri::command]
-pub async fn sign_tx(
-    state: State<'_, AppState>,
-    plan_id: String,
-    totp_code: String,
-) -> Result<SignTxResult, String> {
-    log::info!("sign_tx — plan_id: {}", plan_id);
-
-    let (pool, _, wallet_path, xprv_opt) = get_wallet_data(&state).map_err(|e| e.to_string())?;
-
-    let xprv = xprv_opt.ok_or(TransactionCmdError::WalletLocked.to_string())?;
-
-    // AUD-008: Retrieve the plan from the server-side store, and opportunistically
-    // clean up plans older than PLAN_STORE_TTL (1 hour) while we hold the lock.
-    let plan = {
-        let mut plans = state.pending_plans.lock().unwrap();
-        let now = chrono::Utc::now().timestamp();
-        // Cleanup: remove plans older than PLAN_STORE_TTL
-        plans.retain(|_, pp| now - pp.created_at < PLAN_STORE_TTL);
-        // Remove the requested plan (consume on success; stays only on lookup failure)
-        match plans.remove(&plan_id) {
-            Some(pp) => pp.plan,
-            None => return Err(TransactionCmdError::PlanNotFound.to_string()),
-        }
-    };
-
-    log::info!("sign_tx — retrieved plan with {} inputs", plan.inputs.len());
-
-    // AUD-007: Verify wallet binding
-    if plan.wallet_path != wallet_path {
-        return Err(TransactionCmdError::WalletMismatch.to_string());
-    }
-
-    // AUD-007: Verify plan is not expired
-    let now = chrono::Utc::now().timestamp();
-    if now > plan.expires_at {
-        return Err(TransactionCmdError::PlanExpired.to_string());
-    }
-
-    // AUD-007: Verify plan is not already signed
-    if plan.signed {
-        return Err(TransactionCmdError::AlreadySigned.to_string());
-    }
-
-    // AUD-007: TOTP verification — mandatory before signing
-    let totp_enabled = repositories::is_totp_enabled(&pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if !totp_enabled {
-        return Err(TransactionCmdError::TotpNotEnabled.to_string());
-    }
-
-    // Load and decrypt TOTP secret
-    let encrypted_secret = repositories::load_totp_secret(&pool)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or(TransactionCmdError::TotpNotEnabled.to_string())?;
-
-    // For now: use the raw bytes as the TOTP secret
-    let totp = TotpInstance::from_secret_bytes(&encrypted_secret, "ElectrumSV-Mc", "wallet")
-        .map_err(|e| e.to_string())?;
-
-    // AUD-007: Verify the provided TOTP code
-    let valid = totp.verify_current(&totp_code).map_err(|e| e.to_string())?;
-    if !valid {
-        return Err(TransactionCmdError::TotpVerificationFailed.to_string());
-    }
-
-    // Parse the unsigned transaction
-    let mut tx = bsv::transaction::transaction::Transaction::from_hex(&plan.unsigned_tx_hex)
-        .map_err(|e| e.to_string())?;
-
-    // Sign with LocalSigner
-    let signer = LocalSigner::new(&xprv);
-    signer
-        .sign_tx(&mut tx, &plan.inputs)
-        .map_err(|e| e.to_string())?;
-
-    // Get txid and signed hex
-    let txid = tx.id().map_err(|e| e.to_string())?;
-    let signed_hex = tx.to_hex().map_err(|e| e.to_string())?;
-
-    log::info!("TX signed — txid: {}", txid);
-
-    Ok(SignTxResult {
-        txid,
-        signed_tx_hex: signed_hex,
-    })
+pub async fn sign_tx(state: State<'_, AppState>, plan_id: String, totp_code: String) -> Result<SignTxResult, String> {
+    crate::services::transaction_service::sign_tx(&state, plan_id, totp_code).await
 }
 
-/// Broadcast a signed transaction.
-///
-/// AUD-006: Validates the txid returned by the server against the locally computed txid.
 #[tauri::command]
-pub async fn broadcast_tx(
-    state: State<'_, AppState>,
-    signed_tx_hex: String,
-    expected_txid: String,
-) -> Result<String, String> {
-    log::info!("broadcast_tx — expected txid: {}", expected_txid);
+pub async fn broadcast_tx(state: State<'_, AppState>, signed_tx_hex: String, expected_txid: String) -> Result<String, String> {
+    crate::services::transaction_service::broadcast_tx(&state, signed_tx_hex, expected_txid).await
+}
 
-    // Parse the signed TX to compute txid locally (AUD-006)
-    let tx = bsv::transaction::transaction::Transaction::from_hex(&signed_tx_hex)
-        .map_err(|e| e.to_string())?;
+#[tauri::command]
+pub async fn get_spend_plan_status(state: State<'_, AppState>, plan_id: String) -> Result<crate::services::transaction_service::SpendPlanStatus, String> {
+    crate::services::transaction_service::get_spend_plan_status(&state, &plan_id).await
+}
 
-    let local_txid = tx.id().map_err(|e| e.to_string())?;
+#[tauri::command]
+pub async fn cancel_spend_plan(state: State<'_, AppState>, plan_id: String) -> Result<(), String> {
+    crate::services::transaction_service::cancel_spend_plan(&state, &plan_id).await
+}
 
-    // AUD-006: Verify local txid matches expected
-    if local_txid != expected_txid {
-        return Err(format!(
-            "txid mismatch: local={}, expected={}",
-            local_txid, expected_txid
-        ));
-    }
+#[tauri::command]
+pub async fn list_spend_plans(state: State<'_, AppState>) -> Result<Vec<crate::services::transaction_service::SpendPlanStatus>, String> {
+    crate::services::transaction_service::list_spend_plans(&state).await
+}
 
-    // Broadcast via the active backend
-    // Clone the client out of state before awaiting (MutexGuard is not Send)
-    let electrumx_client = {
-        let guard = state.network.lock().unwrap();
-        guard.client.clone()
-    };
+#[tauri::command]
+pub async fn broadcast_spend_plan(state: State<'_, AppState>, plan_id: String, expected_txid: String, retry_unknown: Option<bool>) -> Result<String, String> {
+    crate::services::transaction_service::broadcast_plan(&state, &plan_id, &expected_txid, retry_unknown.unwrap_or(false)).await
+}
 
-    let server_txid = if let Some(client) = electrumx_client {
-        // ElectrumX backend — broadcast_tx takes raw bytes
-        let raw_bytes = hex::decode(&signed_tx_hex).map_err(|e| format!("invalid hex: {}", e))?;
-        let result = client
-            .broadcast_tx(&raw_bytes)
-            .await
-            .map_err(|e| e.to_string())?;
-        result.txid
-    } else {
-        // WoC backend — clone the client out of state
-        let woc_client = {
-            let guard = state.network.lock().unwrap();
-            guard.woc_client.clone()
-        };
-        let woc = woc_client
-            .as_ref()
-            .ok_or(TransactionCmdError::NotConnected.to_string())?;
-        let raw_bytes = hex::decode(&signed_tx_hex).map_err(|e| format!("invalid hex: {}", e))?;
-        let result = woc
-            .broadcast_tx(&raw_bytes)
-            .await
-            .map_err(|e| e.to_string())?;
-        result.txid
-    };
-
-    // AUD-006: Verify server-returned txid matches local txid
-    if server_txid != local_txid {
-        return Err(format!(
-            "server returned different txid: server={}, local={}",
-            server_txid, local_txid
-        ));
-    }
-
-    log::info!("TX broadcast successful — txid: {}", server_txid);
-    Ok(server_txid)
+fn estimate_fee_quote(num_inputs: usize, payment_outputs: usize, fee_rate: u64, op_return: Option<&str>) -> EstimateFeeResult {
+    let data = op_return.map(crate::core::transaction::decode_op_return);
+    let p2pkh_outputs = payment_outputs.saturating_add(1); // reserve change
+    let num_outputs = p2pkh_outputs.saturating_add(usize::from(data.is_some()));
+    let fee = FeeEstimator::estimate_fee_with_data(num_inputs, p2pkh_outputs, data.as_deref(), fee_rate);
+    EstimateFeeResult { fee, num_inputs, num_outputs, fee_rate }
 }
 
 /// Estimate the fee for a transaction without creating it.
@@ -516,20 +241,7 @@ pub async fn estimate_fee(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Estimate: assume all UTXOs are needed (worst case)
-    let num_inputs = utxo_infos.len().max(1);
-    // +1 for change, +1 if OP_RETURN output present
-    let op_return_extra = if op_return.is_some() { 1 } else { 0 };
-    let num_outputs = outputs.len() + 1 + op_return_extra; // +1 for change
-
-    let fee = FeeEstimator::estimate_fee(num_inputs, num_outputs, fee_rate);
-
-    Ok(EstimateFeeResult {
-        fee,
-        num_inputs,
-        num_outputs,
-        fee_rate,
-    })
+    Ok(estimate_fee_quote(utxo_infos.len().max(1), outputs.len(), fee_rate, op_return.as_deref()))
 }
 
 /// Sign a multisig transaction plan.
@@ -543,6 +255,16 @@ pub async fn estimate_fee(
 /// AUD-008: The plan is fetched server-side by `plan_id`.
 #[tauri::command]
 pub async fn sign_multisig_tx(
+    plan_id: String,
+    totp_code: String,
+    local_key_index: usize,
+) -> Result<SignTxResult, String> {
+    let _ = (plan_id, totp_code, local_key_index);
+    Err("multisig signing is not supported by the durable spend ledger".into())
+}
+
+#[allow(dead_code)]
+async fn sign_multisig_tx_legacy(
     state: State<'_, AppState>,
     plan_id: String,
     totp_code: String,
@@ -668,6 +390,7 @@ mod tests {
             active_wallet: std::sync::Mutex::new(None),
             network: std::sync::Mutex::new(crate::state::NetworkState::new()),
             pending_plans: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wallet_operation: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -680,17 +403,19 @@ mod tests {
         let num_outputs = 2;
         let fee_rate = FeeEstimator::DEFAULT_FEE_RATE;
         let fee = FeeEstimator::estimate_fee(num_inputs, num_outputs, fee_rate);
-        // Expected: (10 + 148*1 + 34*2) * 1 = 10 + 148 + 68 = 226 sat
-        assert_eq!(fee, 226, "fee for 1 input, 2 outputs at 1 sat/byte should be 226");
+        // 149 = 32 hash + 4 index + 1 script length + 108 scriptSig + 4 sequence.
+        // Maximal scriptSig = 1 push + 72 DER + 1 hash type + 1 push + 33 pubkey.
+        // Transaction overhead 10 + 149 input + 2*34 P2PKH outputs = 227 sat.
+        assert_eq!(fee, 227, "fee for 1 input, 2 outputs at 1 sat/byte should be 227");
 
         // 2 inputs, 3 outputs
         let fee2 = FeeEstimator::estimate_fee(2, 3, 1);
-        // (10 + 148*2 + 34*3) * 1 = 10 + 296 + 102 = 408
-        assert_eq!(fee2, 408);
+        // 10 + 149*2 + 34*3 = 410
+        assert_eq!(fee2, 410);
 
         // Higher fee rate
         let fee3 = FeeEstimator::estimate_fee(1, 2, 5);
-        assert_eq!(fee3, 226 * 5);
+        assert_eq!(fee3, 227 * 5);
     }
 
     /// estimate_fee: with a wallet open and no UTXOs, num_inputs is max(0,1)=1.
@@ -728,46 +453,48 @@ mod tests {
 
         let fee_rate = FeeEstimator::DEFAULT_FEE_RATE;
         let fee = FeeEstimator::estimate_fee(num_inputs, num_outputs, fee_rate);
-        assert_eq!(fee, 226);
+        assert_eq!(fee, 227);
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
-    /// estimate_fee: with OP_RETURN, an extra output is added.
-    #[tokio::test]
-    async fn test_estimate_fee_with_op_return() {
-        let state = make_test_state("est_fee_opreturn");
-        wallet_service::create_wallet(&state, "test_opreturn", "pw123", None, None)
-            .await
-            .unwrap();
-
-        let (pool, account_id) = {
-            let guard = state.active_wallet.lock().unwrap();
-            let active = guard.as_ref().unwrap();
-            (active.db_pool.clone(), active.account_id)
-        };
-
-        let utxo_infos = repositories::get_utxo_infos_for_account(&pool, account_id)
-            .await
-            .unwrap();
-        let num_inputs = utxo_infos.len().max(1);
-
-        // With OP_RETURN: outputs.len() + 1 (change) + 1 (op_return) = 1 + 1 + 1 = 3
-        let outputs = vec![PaymentOutput {
-            address: "1JwKqU6XJ8zGRV3DVyGF5j1Zz1R5yF5tZJ".to_string(),
-            satoshis: 10000,
-        }];
-        let op_return_extra = 1; // op_return is Some
-        let num_outputs = outputs.len() + 1 + op_return_extra;
-        assert_eq!(num_outputs, 3);
-
-        let fee = FeeEstimator::estimate_fee(num_inputs, num_outputs, 1);
-        // (10 + 148*1 + 34*3) * 1 = 10 + 148 + 102 = 260
-        assert_eq!(fee, 260);
-
-        pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+    #[test]
+    fn test_estimate_fee_with_op_return() {
+        use bsv::script::{inscriptions::op_return_data, locking_script::LockingScript, unlocking_script::UnlockingScript};
+        use bsv::transaction::{transaction::Transaction, transaction_input::TransactionInput, transaction_output::TransactionOutput};
+        // 149 = 32 hash + 4 index + 1 script length + 108 scriptSig + 4 sequence.
+        // The maximal scriptSig has 1 push + 72 DER + 1 hash type + 1 push + 33 pubkey bytes.
+        for len in [0, 1, 75, 76, 249, 250, 252, 253, 500, 65535, 65536] {
+            let bytes = vec![0xab; len];
+            let encoded = format!("0x{}", hex::encode(&bytes));
+            let quote = estimate_fee_quote(1, 1, 1, Some(&encoded));
+            let mut tx = Transaction::new();
+            tx.inputs.push(TransactionInput { source_txid: Some("12".repeat(32)), source_output_index: 0,
+                unlocking_script: Some(UnlockingScript::from_binary(&[0u8; 108])), ..Default::default() });
+            for _ in 0..2 {
+                tx.outputs.push(TransactionOutput { satoshis: Some(1), locking_script: LockingScript::from_binary(&[0x51; 25]), change: false });
+            }
+            tx.outputs.push(TransactionOutput { satoshis: Some(0), locking_script: op_return_data(&bytes), change: false });
+            let serialized_size = tx.to_hex().unwrap().len() / 2;
+            assert_eq!(quote.fee, serialized_size as u64, "payload length {len}");
+            assert_eq!(quote.num_outputs, 3);
+        }
+        assert_eq!(crate::core::transaction::decode_op_return("0x4142"), b"AB");
+        assert_eq!(crate::core::transaction::decode_op_return("4142"), b"AB");
+        assert_eq!(crate::core::transaction::decode_op_return("Hi!"), b"Hi!");
+        assert_eq!(crate::core::transaction::decode_op_return("0xz"), b"0xz");
+        // Three-byte CompactSize output count occurs when the data output is number 253.
+        let quote = estimate_fee_quote(1, 251, 1, Some("a"));
+        let mut tx = Transaction::new();
+        tx.inputs.push(TransactionInput { source_txid: Some("12".repeat(32)), source_output_index: 0,
+            unlocking_script: Some(UnlockingScript::from_binary(&[0u8; 108])), ..Default::default() });
+        for _ in 0..252 {
+            tx.outputs.push(TransactionOutput { satoshis: Some(1), locking_script: LockingScript::from_binary(&[0x51; 25]), change: false });
+        }
+        tx.outputs.push(TransactionOutput { satoshis: Some(0), locking_script: op_return_data(b"a"), change: false });
+        assert_eq!(quote.num_outputs, 253);
+        assert_eq!(quote.fee, (tx.to_hex().unwrap().len() / 2) as u64);
     }
 
     /// prepare_tx: with no wallet open, get_wallet_data returns NoWalletOpen.
@@ -811,7 +538,7 @@ mod tests {
         assert_eq!(err.to_string(), "wallet is locked — unlock first");
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// sign_tx: with no wallet open, returns NoWalletOpen.
@@ -846,7 +573,7 @@ mod tests {
             xprv_opt.as_deref().ok_or(TransactionCmdError::WalletLocked);
         assert!(matches!(result.unwrap_err(), TransactionCmdError::WalletLocked));
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// sign_tx: a plan with wallet_path mismatch returns WalletMismatch.
@@ -888,7 +615,7 @@ mod tests {
             "TX plan wallet mismatch — plan belongs to a different wallet"
         );
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// sign_tx: an expired plan returns PlanExpired.
@@ -927,7 +654,7 @@ mod tests {
         let err = TransactionCmdError::PlanExpired;
         assert_eq!(err.to_string(), "TX plan has expired");
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// sign_tx: an already-signed plan returns AlreadySigned.
@@ -965,7 +692,7 @@ mod tests {
         let err = TransactionCmdError::AlreadySigned;
         assert_eq!(err.to_string(), "TX plan is already signed");
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// sign_tx: on a fresh wallet (TOTP not enabled), returns TotpNotEnabled.
@@ -1010,7 +737,7 @@ mod tests {
         assert_eq!(err.to_string(), "TOTP is not enabled — enable TOTP first");
 
         pool.close().await;
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// broadcast_tx: with no network backend, returns NotConnected.
@@ -1278,7 +1005,7 @@ mod tests {
         assert_eq!(stored.plan.fee, 0);
         assert_eq!(stored.created_at, now);
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// test_sign_tx_with_plan_id: retrieving a stored plan by plan_id yields
@@ -1332,7 +1059,7 @@ mod tests {
         assert_eq!(pp.plan.fee, 100);
         assert_eq!(pp.plan.wallet_path, wallet_path);
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// test_sign_tx_invalid_plan_id: looking up a non-existent plan_id returns
@@ -1407,7 +1134,7 @@ mod tests {
         };
         assert!(second.is_none(), "second lookup should find no plan (consumed)");
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// test_sign_tx_expired_plan: a plan with expires_at in the past triggers
@@ -1445,7 +1172,7 @@ mod tests {
         let err = TransactionCmdError::PlanExpired;
         assert_eq!(err.to_string(), "TX plan has expired");
 
-        wallet_service::close_wallet(&state).unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// test_plan_store_cleanup: plans older than PLAN_STORE_TTL (1 hour) are

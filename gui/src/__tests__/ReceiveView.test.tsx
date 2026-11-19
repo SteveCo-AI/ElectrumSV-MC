@@ -6,6 +6,7 @@ import { ReceiveView } from '../views/ReceiveView';
 vi.mock('../api', () => ({
   api: {
     getReceiveAddress: vi.fn(),
+    listReceiveAddresses: vi.fn().mockResolvedValue([]),
     createPaymentRequest: vi.fn(),
     generateQr: vi.fn().mockResolvedValue({ svg: '<svg></svg>' }),
     parseBip276Uri: vi.fn(),

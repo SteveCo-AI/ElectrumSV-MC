@@ -8,6 +8,7 @@ import { Modal, Field, inputClass, btnPrimary, btnSecondary } from './Modal';
 export function ExportSeedDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { setError } = useStore();
   const [password, setPassword] = useState('');
+  const [totpCode, setTotpCode] = useState('');
   const [mnemonic, setMnemonic] = useState<string | null>(null);
   const [hasSeed, setHasSeed] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
@@ -16,7 +17,7 @@ export function ExportSeedDialog({ open, onClose }: { open: boolean; onClose: ()
     setBusy(true);
     setError(null);
     try {
-      const r = await api.exportSeed(password);
+      const r = await api.exportSeed(password, totpCode || undefined);
       setHasSeed(r.has_seed);
       setMnemonic(r.mnemonic);
     } catch (e: any) {
@@ -28,6 +29,7 @@ export function ExportSeedDialog({ open, onClose }: { open: boolean; onClose: ()
 
   const handleClose = () => {
     setPassword('');
+    setTotpCode('');
     setMnemonic(null);
     setHasSeed(null);
     onClose();
@@ -44,6 +46,7 @@ export function ExportSeedDialog({ open, onClose }: { open: boolean; onClose: ()
             <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
               className={inputClass} placeholder="••••••••" />
           </Field>
+          <Field label="TOTP code (if enabled)"><input value={totpCode} onChange={(e) => setTotpCode(e.target.value)} className={inputClass} /></Field>
           <div className="flex gap-3">
             <button onClick={handleExport} disabled={busy || !password} className={btnPrimary}>
               {busy ? 'Exporting…' : 'Reveal Seed'}
@@ -143,6 +146,7 @@ export function SignMessageDialog({ open, onClose }: { open: boolean; onClose: (
   const [address, setAddress] = useState('');
   const [message, setMessage] = useState('');
   const [password, setPassword] = useState('');
+  const [totpCode, setTotpCode] = useState('');
   const [signature, setSignature] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -150,7 +154,7 @@ export function SignMessageDialog({ open, onClose }: { open: boolean; onClose: (
     setBusy(true);
     setError(null);
     try {
-      const r = await api.signMessage(address, message, password);
+      const r = await api.signMessage(address, message, password, totpCode || undefined);
       setSignature(r.signature);
     } catch (e: any) {
       setError(e.message);
@@ -160,7 +164,7 @@ export function SignMessageDialog({ open, onClose }: { open: boolean; onClose: (
   };
 
   const handleClose = () => {
-    setAddress(''); setMessage(''); setPassword(''); setSignature(null);
+    setAddress(''); setMessage(''); setPassword(''); setTotpCode(''); setSignature(null);
     onClose();
   };
 
@@ -180,6 +184,7 @@ export function SignMessageDialog({ open, onClose }: { open: boolean; onClose: (
             <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
               className={inputClass} placeholder="••••••••" />
           </Field>
+          <Field label="TOTP code (if enabled)"><input value={totpCode} onChange={(e) => setTotpCode(e.target.value)} className={inputClass} /></Field>
           <div className="flex gap-3">
             <button onClick={handleSign} disabled={busy || !address || !message || !password} className={btnPrimary}>
               {busy ? 'Signing…' : 'Sign'}
@@ -266,7 +271,7 @@ export function DeleteWalletDialog({ open, onClose, walletPath, walletName, onDe
   walletName: string;
   onDeleted: () => void;
 }) {
-  const { setError } = useStore();
+  const { setError, walletPassword } = useStore();
   const [confirmName, setConfirmName] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -274,7 +279,7 @@ export function DeleteWalletDialog({ open, onClose, walletPath, walletName, onDe
     setBusy(true);
     setError(null);
     try {
-      await api.deleteWallet(walletPath);
+      await api.deleteWallet(walletPath, walletPassword || '');
       onDeleted();
       onClose();
     } catch (e: any) {
@@ -314,7 +319,7 @@ export function DeleteWalletDialog({ open, onClose, walletPath, walletName, onDe
 
 // ─── Backup Wallet Dialog ───
 export function BackupWalletDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { setError } = useStore();
+  const { setError, walletPassword } = useStore();
   const [backupPath, setBackupPath] = useState('');
   const [busy, setBusy] = useState(false);
   const [success, setSuccess] = useState<string | null>(null);
@@ -324,7 +329,7 @@ export function BackupWalletDialog({ open, onClose }: { open: boolean; onClose: 
     setError(null);
     setSuccess(null);
     try {
-      const result = await api.backupWallet(backupPath);
+      const result = await api.backupWallet(backupPath, walletPassword || '');
       setSuccess(`Wallet backed up to: ${result}`);
     } catch (e: any) {
       setError(e.message || 'Backup failed');

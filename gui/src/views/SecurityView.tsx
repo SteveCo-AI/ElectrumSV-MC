@@ -31,6 +31,7 @@ export function SecurityView() {
 
   // Disable dialog
   const [disableCode, setDisableCode] = useState('');
+  const [recoveryAuthCode, setRecoveryAuthCode] = useState('');
 
   // Recovery codes
   const [recoveryCodes, setRecoveryCodes] = useState<string[] | null>(null);
@@ -97,7 +98,7 @@ export function SecurityView() {
     setSuccess(null);
     setSetupQrSvg(null);
     try {
-      const result = await api.totpEnable();
+      const result = await api.totpEnable(walletPassword || '');
       setSetupSecret(result.secret_base32);
       await generateQR(result.otpauth_url);
       setSetupStep('qr');
@@ -145,7 +146,7 @@ export function SecurityView() {
           return;
         }
       }
-      await api.totpDisable();
+      await api.totpDisable(walletPassword || '', disableCode);
       setTotpEnabled(false);
       setDisableCode('');
       setRecoveryCodes(null);
@@ -163,7 +164,7 @@ export function SecurityView() {
     setError(null);
     setSuccess(null);
     try {
-      const codes = await api.generateTotpRecoveryCodes();
+      const codes = await api.generateTotpRecoveryCodes(walletPassword || '', recoveryAuthCode);
       setRecoveryCodes(codes);
       setSuccess('Recovery codes generated. Save them now — they won\'t be shown again!');
     } catch (e: any) {
@@ -434,11 +435,12 @@ export function SecurityView() {
             be used once.
           </p>
 
+          <input type="text" value={recoveryAuthCode} onChange={(e) => setRecoveryAuthCode(e.target.value)} placeholder="Current 6-digit TOTP code" maxLength={6} className="w-full bg-void-800 border border-void-700 rounded-lg px-3 py-2 text-sm text-gray-100 mb-3" />
           {/* Generate button */}
           {!recoveryCodes && (
             <button
               onClick={handleGenerateRecoveryCodes}
-              disabled={recoveryLoading}
+              disabled={recoveryLoading || recoveryAuthCode.length !== 6}
               className="bg-accent hover:bg-accent-hover text-white rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50 transition-colors"
             >
               {recoveryLoading ? 'Generating…' : 'Generate Recovery Codes'}

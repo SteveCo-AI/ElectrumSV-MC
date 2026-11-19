@@ -2,7 +2,7 @@
 
 A Bitcoin SV (BSV) desktop wallet built with **Rust** (Tauri v2) and **React** (TypeScript).
 
-> **PROTOTYPE NOTICE:** This project is a prototype and has not undergone extensive real-world testing or production use. It is not recommended for storing or transacting significant amounts of BSV. Use at your own risk and always back up your keys.
+> **PROTOTYPE NOTICE:** This reconstructed test build is not release-ready. Do not use it with real funds. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for recovery, synchronization and security limits.
 
 ---
 
@@ -18,7 +18,7 @@ A Bitcoin SV (BSV) desktop wallet built with **Rust** (Tauri v2) and **React** (
 
 ### Transactions
 - 3-stage send workflow: Prepare -> Sign -> Broadcast
-- Server-side TxPlan binding (AUD-008): the renderer receives only a `plan_id` handle, never the unsigned transaction hex — preventing tampering
+- Durable transaction plans and outpoint reservations: prepare, sign, and broadcast are distinct steps; see [agent interface](docs/agent-interface.md) for states and limits.
 - Coin selection strategies: largest-first (default), branch-and-bound, random-subset, privacy
 - mAPI fee estimation with fallback to 1 sat/byte
 - OP_RETURN data output support
@@ -106,21 +106,16 @@ commands/        Tauri IPC commands (90 registered)
 
 ## Testing
 
-| Suite | Count | Status |
-|-------|-------|--------|
-| Rust unit tests | 519 | all passing |
-| E2E lifecycle | 1 | passing |
-| E2E network | 2 | passing |
-| Integration (list_wallets) | 3 | passing |
-| GUI (vitest) | 14 | all passing |
-| **Total** | **539** | |
+Run the backend and frontend suites:
 
 ```bash
-# Run all tests
-cd src-tauri && cargo test          # Rust tests (519 lib + 6 E2E/integration)
-cd src-tauri && cargo test --features qrcode-fallback  # With qrcode fallback backend
-cd gui && npx vitest run            # GUI tests (14)
+(cd src-tauri && cargo test --locked --no-default-features)
+(cd gui && npm ci && npm test -- --run)
 ```
+
+The current Linux offline bundle and release maintenance and payment smokes passed; the separate current TLS loopback and earlier 26 GUI tests are reported with their scope in [START_HIER_DE.md](START_HIER_DE.md#lokale-prüfung). Payment coverage includes SDK script validation, fee checks, mock broadcast and crash-restart persistence. Test fixtures do not add a production RPC. The current release hash and artifact details are recorded there.
+
+An earlier release passed an offline agent smoke and GUI startup/wallet-list IPC smoke. Screenshots, visual interaction, full GUI payment workflows, the GUI startup of the latest build and real broadcast remain unverified. A read-only live TLS smoke on an earlier release against `electrumx.gorillapool.io:50002` completed sync, returned zero balance and 81 history entries, and disconnected cleanly. It did not verify server truth or chain consensus. Do not use real funds.
 
 ### QR Code Round-Trip Verification
 
