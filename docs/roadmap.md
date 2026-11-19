@@ -29,3 +29,10 @@ Bezugsumfang dieser Arbeitsetappe: am 19.11.2026 offene Punkte R1–R3 auf der o
   - [x] R3.4: HeaderStore-Lebensdauer bei abgebrochenem und parallelem Sync reproduzieren und gezielt absichern. Explizite Fehlerrückgabe ersetzt keine Cancellation-Sicherheit; bereits persistierte gültige Präfixe sind kein atomarer Gesamtbatch.
 
 Bereits vor diesem Stichtag implementierte und geprüfte Arbeiten werden nicht in den obigen Fortschrittszähler aufgenommen. Die aktuelle Test- und Risikobeschreibung steht in [KNOWN_ISSUES.md](../KNOWN_ISSUES.md); ein 1.0-Release oder die Eignung für echtes Guthaben ist nicht abgenommen.
+
+## Next stage: UTXO display
+
+Scope from 2026-11-19: **U1** at the top level. Progress: **0/1 (0%)** accepted. Completion of the previous stage does not mean the entire wallet is complete.
+
+- [ ] **U1 – Bind the UTXO display to the active wallet session:** Prevent stale or delayed data from other sessions and distinguish errors or invalid data from a genuinely empty balance. Check safe amount and duplicate handling with targeted regressions. This finding concerns the display and does not establish a signing or spending defect.
+  - Status: **implemented and submitted for review; not accepted**. The implementer reported 28/28 targeted and 165/165 GUI tests and a successful build. Independent review and a yet-unspecified compatibility point remained open at the pause; see the [work handoff](HANDOFF.md).

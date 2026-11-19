@@ -3,14 +3,14 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { NetworkView } from '../views/NetworkView';
 import { UtxoView } from '../views/UtxoView';
 
-vi.mock('../store', () => ({ useStore: () => ({ activeAccountId: 1 }) }));
+vi.mock('../store', () => ({ useStore: () => ({ activeAccountId: 1, activeWalletPath: '/wallet', walletInstanceToken: 'instance' }) }));
 vi.mock('../api', () => ({ api: {
   getNetworkInfo: vi.fn().mockResolvedValue({ connected: false }),
   getServers: vi.fn().mockResolvedValue([{ host: 'example.org', ssl_port: 50002 }]),
   listNetworks: vi.fn().mockResolvedValue([]),
   getHeaderStoreInfo: vi.fn().mockResolvedValue(null),
   connectServer: vi.fn().mockResolvedValue({}),
-  getUtxos: vi.fn().mockResolvedValue([{ tx_hash: 'abc123', tx_index: 4, value: 100, is_coinbase: false }]),
+  getUtxos: vi.fn().mockResolvedValue([{ tx_hash: 'ab'.repeat(32), tx_index: 4, value: 100, keyinstance_id: 1, is_coinbase: false, script_pubkey: '' }]),
 } }));
 import { api } from '../api';
 

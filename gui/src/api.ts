@@ -184,7 +184,7 @@ export const api = {
     invoke<HistoryEntry[]>('get_history', { accountId, limit: null, offset: null }),
   listReceiveAddresses: (accountId: number) => invoke<any[]>('list_receive_addresses', { accountId }),
   getUtxos: (accountId: number) =>
-    invoke<any[]>('get_utxos', { accountId }),
+    invoke<UtxoEntry[]>('get_utxos', { accountId }),
   getKeys: (accountId: number) =>
     invoke<any[]>('get_keys', { accountId }),
   // Multisig account commands (Task 5)
