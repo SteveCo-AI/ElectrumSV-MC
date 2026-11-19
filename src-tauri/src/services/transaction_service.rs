@@ -15,6 +15,10 @@ fn prepared_instances() -> &'static std::sync::Mutex<InstanceMap> {
     INSTANCES.get_or_init(|| std::sync::Mutex::new(InstanceMap::new()))
 }
 
+#[cfg(test)]
+#[path = "transaction_crash_tests.rs"]
+mod transaction_crash_tests;
+
 fn in_flight_broadcasts() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
     static FLIGHTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
     FLIGHTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
@@ -271,9 +275,11 @@ pub async fn sign_tx(state: &AppState, plan_id: String, totp_code: String) -> Re
     if chrono::Utc::now().timestamp() > expires_at { expire_prepared(&pool, chrono::Utc::now().timestamp()).await?; return Err("plan expired".into()); }
     let plan: TxPlan = serde_json::from_str(&plan_json).map_err(|e| e.to_string())?;
     if plan.wallet_path != wallet_path || plan.account_id != account_id { return Err("plan wallet mismatch".into()); }
-    let secret = repositories::load_totp_secret(&pool).await.map_err(|e| e.to_string())?.ok_or("TOTP is not enabled")?;
-    let totp = TotpInstance::from_secret_bytes(&secret, "ElectrumSV-Mc", "wallet").map_err(|e| e.to_string())?;
-    if !totp.verify_current(&totp_code).map_err(|e| e.to_string())? { return Err("TOTP verification failed".into()); }
+    if crate::services::wallet_security::verify_sign_totp_locked(state, &_operation, &totp_code)?.is_none() {
+        let secret = repositories::load_totp_secret(&pool).await.map_err(|e| e.to_string())?.ok_or("TOTP is not enabled")?;
+        let totp = TotpInstance::from_secret_bytes(&secret, "ElectrumSV-Mc", "wallet").map_err(|e| e.to_string())?;
+        if !totp.verify_current(&totp_code).map_err(|e| e.to_string())? { return Err("TOTP verification failed".into()); }
+    }
     let mut raw_prevouts = Vec::with_capacity(plan.inputs.len());
     for input in &plan.inputs {
         let hash = crate::core::address::hex_str_to_hash(&input.tx_hash_hex).map_err(|e| e.to_string())?;
@@ -414,7 +420,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("electrumsv-spend-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
         std::fs::create_dir_all(&dir).unwrap();
         state.data_dir = dir.to_str().unwrap().into();
-        wallet_service::create_wallet(&state, "synthetic", "pw", Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), None).await.unwrap();
+        wallet_service::create_legacy_fixture(&state, "synthetic", "pw", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None).await.unwrap();
         let (pool, account, _, xprv) = get_wallet_data(&state).unwrap();
         let account_key = ExtendedKey::from_string(&xprv.unwrap()).unwrap();
         let child = account_key.derive("0/0").unwrap();
@@ -530,6 +536,25 @@ mod tests {
         let reservations: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM SpendReservations WHERE plan_id=?").bind(&prep.plan_id).fetch_one(&pool).await.unwrap();
         assert_eq!(reservations.0, 1);
         assert_eq!(repositories::get_utxos_for_account(&pool, account).await.unwrap().len(), 1);
+        let mut confirmed_snapshots = snapshots;
+        for item in &mut confirmed_snapshots {
+            for tx in &mut item.transactions { tx.height = Some(20); }
+            for output in &mut item.outputs { output.height = Some(20); }
+        }
+        repositories::replace_sync_snapshot(&pool, account, &keys, None, &confirmed_snapshots).await.unwrap();
+        let confirmed = account_service::get_balance(&state, None).await.unwrap();
+        assert_eq!((confirmed.confirmed, confirmed.unconfirmed, confirmed.available), (refreshed.total, 0, refreshed.total));
+        let original_hash = crate::core::address::hex_str_to_hash(&funding.id().unwrap()).unwrap();
+        let reorg = keys.iter().map(|k| repositories::SyncKeySnapshot {
+            key_id: k.keyinstance_id,
+            transactions: if k.keyinstance_id == key { vec![repositories::SyncTransaction { hash: original_hash.clone(), height: Some(10), raw: raw.clone().into(), delta: Some(100_000) }] } else { vec![] },
+            outputs: if k.keyinstance_id == key { vec![repositories::SyncOutput { hash: original_hash.clone(), height: Some(10), index: 0, value: 100_000, coinbase: false, script_pubkey: hex::encode(funding.outputs[0].locking_script.to_binary()) }] } else { vec![] },
+        }).collect::<Vec<_>>();
+        repositories::replace_sync_snapshot(&pool, account, &keys, None, &reorg).await.unwrap();
+        let reverted = account_service::get_balance(&state, None).await.unwrap();
+        assert_eq!((reverted.total, reverted.reserved, reverted.available), (100_000, 100_000, 0));
+        assert_eq!(get_spend_plan_status(&state, &prep.plan_id).await.unwrap().state, "BROADCASTED");
+        repositories::replace_sync_snapshot(&pool, account, &keys, None, &confirmed_snapshots).await.unwrap();
         sqlx::query("UPDATE TransactionOutputs SET script_pubkey='' WHERE tx_hash=?").bind(&tx_hash).execute(&pool).await.unwrap();
         assert_eq!(account_service::get_balance(&state, None).await.unwrap().available, 0);
         sqlx::query("UPDATE TransactionOutputs SET script_pubkey=? WHERE tx_hash=?").bind(hex::encode(change_script.to_binary())).bind(&tx_hash).execute(&pool).await.unwrap();

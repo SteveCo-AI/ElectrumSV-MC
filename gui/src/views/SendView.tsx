@@ -1,20 +1,30 @@
 // Send view — 3-stage BSV transaction workflow: Prepare → Preview → Sign → Broadcast
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { api, type SpendPlanStatus } from '../api';
 import { useStore } from '../store';
 
 type SendStep = 'form' | 'preview' | 'result';
 
+function parseSatoshis(value: string): number | null {
+  if (!/^[1-9]\d*$/.test(value)) return null;
+  const amount = Number(value);
+  return Number.isSafeInteger(amount) ? amount : null;
+}
+
 export function SendView() {
-  const { activeAccountId, setPlanId, updateBalance } = useStore();
+  const { activeAccountId, activeWalletPath, walletInstanceToken, setPlanId, triggerBalanceRefresh } = useStore();
   const [step, setStep] = useState<SendStep>('form');
   const [address, setAddress] = useState('');
   const [resolvedAddress, setResolvedAddress] = useState<string | null>(null);
   const [amount, setAmount] = useState('');
+  const satoshis = parseSatoshis(amount);
   const [opReturn, setOpReturn] = useState('');
   const [feeRate, setFeeRate] = useState(10);
   const [feeSourceMapi, setFeeSourceMapi] = useState(false);
   const [estimatedFee, setEstimatedFee] = useState<number | null>(null);
+  const feeContext = JSON.stringify([activeWalletPath, walletInstanceToken, activeAccountId, address, amount, feeRate, opReturn]);
+  const feeRequest = useRef({ context: feeContext, generation: 0 });
+  if (feeRequest.current.context !== feeContext) feeRequest.current = { context: feeContext, generation: feeRequest.current.generation + 1 };
   // AUD-008: renderer only holds the plan_id handle + preview metadata.
   const [planId, setPlanIdState] = useState<string | null>(null);
   const [preview, setPreview] = useState<{
@@ -38,7 +48,7 @@ export function SendView() {
 
   // TOTP state — TOTP is mandatory in the Rust backend for sign_tx
   const [totpCode, setTotpCode] = useState('');
-  const [totpEnabled, setTotpEnabled] = useState(false);
+  const [totpEnabled, setTotpEnabled] = useState<boolean | null>(null);
 
   // Multisig info (Task 5) — if the active account is a multisig account,
   // show a banner with the m-of-n threshold.
@@ -56,13 +66,8 @@ export function SendView() {
   }, []);
 
   const refreshBalance = useCallback(async () => {
-    if (activeAccountId === null) return;
-    try {
-      updateBalance(String(activeAccountId), { ...await api.getBalance(activeAccountId), unmatured: 0 });
-    } catch {
-      // An unavailable balance must not be replaced with fabricated values.
-    }
-  }, [activeAccountId, updateBalance]);
+    triggerBalanceRefresh();
+  }, [triggerBalanceRefresh]);
 
   useEffect(() => { void refreshPlans(); }, [refreshPlans]);
 
@@ -133,7 +138,7 @@ export function SendView() {
   useEffect(() => {
     api.getTotpStatus()
       .then(s => setTotpEnabled(s.enabled))
-      .catch(() => setTotpEnabled(false));
+      .catch(() => setTotpEnabled(null));
   }, []);
 
   // Fetch multisig config for the active account (Task 5).
@@ -182,23 +187,25 @@ export function SendView() {
 
   // Debounced fee estimation
   const estimateFee = useCallback(async (rate: number) => {
-    if (!address || !amount) return;
+    if (!address || satoshis === null) { setEstimatedFee(null); return; }
+    const generation = ++feeRequest.current.generation;
     try {
       const r = await api.estimateFee(
-        [{ address, satoshis: parseInt(amount, 10) || 0 }],
+        [{ address, satoshis }],
         rate,
         opReturn || undefined
       );
-      setEstimatedFee(r.fee);
+      if (feeRequest.current.generation === generation) setEstimatedFee(r.fee);
     } catch {
-      setEstimatedFee(null);
+      if (feeRequest.current.generation === generation) setEstimatedFee(null);
     }
-  }, [address, amount, opReturn]);
+  }, [address, satoshis, opReturn]);
 
   useEffect(() => {
+    setEstimatedFee(null);
     const timer = setTimeout(() => estimateFee(feeRate), 400);
-    return () => clearTimeout(timer);
-  }, [feeRate, estimateFee]);
+    return () => { clearTimeout(timer); feeRequest.current.generation++; };
+  }, [feeRate, estimateFee, activeAccountId, activeWalletPath, walletInstanceToken]);
 
   const resetForm = () => {
     setStep('form');
@@ -218,7 +225,7 @@ export function SendView() {
 
   // Step 1: Prepare transaction
   const handlePrepare = async () => {
-    if (activeAccountId === null) return;
+    if (activeAccountId === null || satoshis === null) return;
     setBusy(true);
     setStatus(null);
     try {
@@ -238,7 +245,7 @@ export function SendView() {
       } else {
         setResolvedAddress(null);
       }
-      const outputs = [{ address: resolvedAddr, satoshis: parseInt(amount, 10) }];
+      const outputs = [{ address: resolvedAddr, satoshis }];
       const r = await api.prepareTx({
         outputs,
         feeRate,
@@ -298,7 +305,7 @@ export function SendView() {
     if (planId && signedTxid) void sendPlan(planId, signedTxid, planState === 'BROADCAST_UNKNOWN');
   };
 
-  const canPrepare = plansLoaded && accountTypeLoaded && !multisigInfo && address && amount && parseInt(amount, 10) > 0 && activeAccountId !== null;
+  const canPrepare = plansLoaded && accountTypeLoaded && !multisigInfo && address && satoshis !== null && activeAccountId !== null;
   const canSign = planState === 'PREPARED' && planId && totpEnabled && totpCode.length === 6;
   const canBroadcast = signedTxid && (planState === 'SIGNED' || planState === 'BROADCAST_UNKNOWN');
 
@@ -383,7 +390,8 @@ export function SendView() {
             <div>
               <label className="text-sm text-gray-400 mb-1 block">Amount (satoshis)</label>
               <input
-                type="number"
+                type="text"
+                inputMode="numeric"
                 value={amount}
                 onChange={(e) => setAmount(e.target.value)}
                 placeholder="1000"
@@ -454,7 +462,7 @@ export function SendView() {
               </div>
               <div className="flex justify-between text-sm">
                 <span className="text-gray-400">Amount</span>
-                <span className="text-gray-100">{parseInt(amount).toLocaleString()} sat</span>
+                <span className="text-gray-100">{satoshis?.toLocaleString()} sat</span>
               </div>
               <div className="flex justify-between text-sm">
                 <span className="text-gray-400">Fee ({feeRate} sat/byte)</span>
@@ -486,7 +494,8 @@ export function SendView() {
               <div className="text-xs text-warning mb-2">
                 🔒 TOTP code required to sign this transaction.
               </div>
-              {!totpEnabled && (
+              {totpEnabled === null && <div className="text-xs text-danger mb-2">2FA status unknown; signing is unavailable.</div>}
+              {totpEnabled === false && (
                 <div className="text-xs text-danger mb-2">
                   ⚠ TOTP must be enabled to sign. Enable 2FA in the Security tab first.
                 </div>

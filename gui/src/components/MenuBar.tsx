@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { useStore } from '../store';
 import { useTranslation, type Language } from '../i18n';
-import { ExportSeedDialog, ChangePasswordDialog, SignMessageDialog, VerifyMessageDialog, DeleteWalletDialog } from './WalletDialogs';
+import { ExportSeedDialog, ChangePasswordDialog, SignMessageDialog, VerifyMessageDialog, DeleteWalletDialog, BackupWalletDialog } from './WalletDialogs';
 
 interface MenuItem {
   label: string;
@@ -17,7 +17,7 @@ interface Menu {
   items: MenuItem[];
 }
 
-type DialogType = 'exportSeed' | 'changePassword' | 'signMessage' | 'verifyMessage' | 'deleteWallet' | null;
+type DialogType = 'exportSeed' | 'changePassword' | 'signMessage' | 'verifyMessage' | 'deleteWallet' | 'backupWallet' | null;
 
 export function MenuBar({ onCreateWallet, onDeleteWallet, onQuit }: {
   onCreateWallet?: () => void;
@@ -26,7 +26,8 @@ export function MenuBar({ onCreateWallet, onDeleteWallet, onQuit }: {
 }) {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [activeDialog, setActiveDialog] = useState<DialogType>(null);
-  const { activeWalletPath, walletName, setError } = useStore();
+  const [backupWalletIdentity, setBackupWalletIdentity] = useState<{ path: string; token: string } | null>(null);
+  const { activeWalletPath, walletInstanceToken, walletName, setError } = useStore();
   const { t, language, setLanguage } = useTranslation();
 
   const handleAbout = () => {
@@ -51,6 +52,7 @@ export function MenuBar({ onCreateWallet, onDeleteWallet, onQuit }: {
     {
       label: t.menu.wallet,
       items: [
+        { label: t.menu.backupWallet, action: () => { if (activeWalletPath && walletInstanceToken) { setBackupWalletIdentity({ path: activeWalletPath, token: walletInstanceToken }); setActiveDialog('backupWallet'); } }, disabled: !activeWalletPath || !walletInstanceToken },
         { label: t.menu.deleteWallet, action: () => setActiveDialog('deleteWallet'), disabled: !activeWalletPath },
         { label: t.menu.changePassword, action: () => setActiveDialog('changePassword'), disabled: !activeWalletPath },
         { label: t.menu.exportSeed, action: () => setActiveDialog('exportSeed'), disabled: !activeWalletPath },
@@ -123,6 +125,7 @@ export function MenuBar({ onCreateWallet, onDeleteWallet, onQuit }: {
       </div>
 
       {/* Dialogs */}
+      <BackupWalletDialog open={activeDialog === 'backupWallet'} identity={backupWalletIdentity} onClose={() => { setBackupWalletIdentity(null); setActiveDialog(null); }} />
       <ExportSeedDialog open={activeDialog === 'exportSeed'} onClose={() => setActiveDialog(null)} />
       <ChangePasswordDialog open={activeDialog === 'changePassword'} onClose={() => setActiveDialog(null)} />
       <SignMessageDialog open={activeDialog === 'signMessage'} onClose={() => setActiveDialog(null)} />

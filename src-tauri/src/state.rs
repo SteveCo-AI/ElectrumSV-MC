@@ -70,6 +70,7 @@ pub fn generate_plan_id() -> String {
 /// Represents a loaded wallet in memory.
 pub struct ActiveWallet {
     pub(crate) instance_id: std::sync::Arc<()>,
+    pub(crate) instance_token: String,
     pub(crate) wallet_lock: std::sync::Arc<std::fs::File>,
     /// Absolute path to the .sqlite file
     pub wallet_path: String,
@@ -83,12 +84,47 @@ pub struct ActiveWallet {
     pub account_id: i64,
     /// Decrypted xprv (None = locked, Some = unlocked)
     pub decrypted_xprv: Option<String>,
+    pub(crate) secure_wallet: Option<SecureWallet>,
+    pub(crate) legacy_pending_totp: Option<PendingTotp>,
+    #[cfg(test)]
+    pub(crate) commit_barrier: Option<TestCommitBarrier>,
+    #[cfg(test)]
+    pub(crate) migration_write_fail: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct TestCommitBarrier {
+    pub after_commit: bool,
+    pub started: tokio::sync::oneshot::Sender<()>,
+    pub resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+pub(crate) struct SecureWallet {
+    pub context: crate::security::envelope::WalletContext,
+    pub envelope: Vec<u8>,
+    pub bundle: Option<crate::security::wallet_bundle::WalletBundle>,
+    pub generation: u64,
+    pub needs_reopen: bool,
+    pub pending_totp: Option<PendingTotp>,
+}
+
+pub(crate) struct PendingTotp {
+    pub secret: zeroize::Zeroizing<Vec<u8>>,
+    pub expires: std::time::Instant,
+    pub generation: u64,
 }
 
 impl ActiveWallet {
     /// Whether the wallet is unlocked (decrypted xprv available).
     pub fn is_unlocked(&self) -> bool {
         self.decrypted_xprv.is_some()
+    }
+}
+
+impl Drop for ActiveWallet {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(xprv) = &mut self.decrypted_xprv { xprv.zeroize(); }
     }
 }
 

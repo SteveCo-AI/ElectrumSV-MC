@@ -1,13 +1,20 @@
 // History view — transaction history list with TX detail panel
 // Enhanced: decodes on-chain data (Ordinals, OP_RETURN, STAS tokens)
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, type DecodedOutput, type HistoryEntry, type TransactionDetail } from '../api';
 import { useStore } from '../store';
 
 export function HistoryView() {
-  const { activeAccountId, setError, historyRefreshKey } = useStore();
+  const { activeAccountId, activeWalletPath, walletInstanceToken, setError, historyRefreshKey } = useStore();
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [historyError, setHistoryError] = useState(false);
+  const [retry, setRetry] = useState(0);
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  const historyKey = JSON.stringify([activeWalletPath, walletInstanceToken, activeAccountId]);
+  const detailGeneration = useRef(0);
+  const detailContext = useRef(historyKey);
+  if (detailContext.current !== historyKey) { detailContext.current = historyKey; detailGeneration.current++; }
   const [selectedTx, setSelectedTx] = useState<TransactionDetail | null>(null);
   const [txLoading, setTxLoading] = useState(false);
   const [txLabel, setTxLabel] = useState('');
@@ -16,45 +23,54 @@ export function HistoryView() {
   const [decoding, setDecoding] = useState(false);
 
   useEffect(() => {
-    if (activeAccountId === null) return;
+    let cancelled = false;
+    setHistory([]);
+    detailGeneration.current++;
+    setSelectedTx(null);
+    setDecodedOutputs([]);
+    setTxLoading(false);
+    setDecoding(false);
+    setHistoryError(false);
+    setLoadedKey(null);
+    if (activeAccountId === null) { setLoading(false); return () => { cancelled = true; detailGeneration.current++; }; }
     setLoading(true);
     api.getHistory(activeAccountId)
-      .then(setHistory)
-      .catch((e: Error) => {
-        setError(`History: ${e.message}`);
-        setHistory([]);
-      })
-      .finally(() => setLoading(false));
-  }, [activeAccountId, setError, historyRefreshKey]);
+      .then(result => { if (!Array.isArray(result) || result.some(tx => !tx || typeof tx.tx_hash !== 'string' || !(tx.value_delta === null || Number.isSafeInteger(tx.value_delta)) || !(tx.block_height === null || Number.isSafeInteger(tx.block_height)))) throw new Error('Invalid history'); if (!cancelled) { setHistory(result); setLoadedKey(historyKey); } })
+      .catch(() => { if (!cancelled) setHistoryError(true); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; detailGeneration.current++; };
+  }, [activeAccountId, activeWalletPath, walletInstanceToken, historyRefreshKey, retry]);
 
   const handleTxClick = async (txHash: string) => {
+    const generation = ++detailGeneration.current;
+    const context = historyKey;
+    const current = () => detailGeneration.current === generation && detailContext.current === context;
     setTxLoading(true);
     setSelectedTx(null);
     setDecodedOutputs([]);
+    setDecoding(false);
     setLabelSaved(false);
     try {
       const detail = await api.getTransaction(txHash);
+      if (!current()) return;
       setSelectedTx(detail);
       setTxLabel(detail.label ?? '');
 
-      // Decode outputs for on-chain data
       if (detail.detail_complete && detail.raw_tx !== null && detail.inputs !== null && detail.outputs !== null && detail.outputs.length > 0) {
         setDecoding(true);
-        const outputs = detail.outputs;
         try {
-          const decoded = await api.decodeTxOutputs(outputs);
-          setDecodedOutputs(decoded);
+          const decoded = await api.decodeTxOutputs(detail.outputs);
+          if (current()) setDecodedOutputs(decoded);
         } catch (e) {
-          // Decoding is best-effort — don't fail the whole view
-          console.error('Decode failed:', e);
+          if (current()) console.error('Decode failed:', e);
         } finally {
-          setDecoding(false);
+          if (current()) setDecoding(false);
         }
       }
     } catch (e: unknown) {
-      setError(`TX detail: ${e instanceof Error ? e.message : String(e)}`);
+      if (current()) setError(`TX detail: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
-      setTxLoading(false);
+      if (current()) setTxLoading(false);
     }
   };
 
@@ -141,7 +157,9 @@ export function HistoryView() {
 
   const hasCompleteDetails = selectedTx !== null && selectedTx.detail_complete && selectedTx.raw_tx !== null && selectedTx.inputs !== null && selectedTx.outputs !== null;
 
-  if (loading) return <div className="p-4 text-gray-400">Loading history...</div>;
+  if (activeAccountId === null) return <div className="p-4 text-gray-400">Select an account to view history.</div>;
+  if (loading || (!historyError && loadedKey !== historyKey)) return <div className="p-4 text-gray-400">Loading history...</div>;
+  if (historyError) return <div className="p-4" role="alert">History unavailable. <button onClick={() => setRetry(n => n + 1)}>Retry history</button></div>;
   if (!history.length) return <div className="p-4 text-gray-400">No transactions yet.</div>;
 
   return (
@@ -197,7 +215,7 @@ export function HistoryView() {
           <div className="flex justify-between items-center mb-4">
             <h3 className="text-sm font-semibold text-accent">Transaction Details</h3>
             <button
-              onClick={() => setSelectedTx(null)}
+              onClick={() => { detailGeneration.current++; setSelectedTx(null); setDecodedOutputs([]); setTxLoading(false); setDecoding(false); }}
               className="text-gray-400 hover:text-gray-100 text-sm"
             >
               Close

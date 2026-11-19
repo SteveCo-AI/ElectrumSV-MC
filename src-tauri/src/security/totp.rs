@@ -20,6 +20,8 @@ pub enum TotpError {
     Generation(String),
     #[error("system time error: {0}")]
     SystemTime(String),
+    #[error("recovery code generation failed")]
+    RecoveryGeneration,
 }
 
 /// TOTP configuration — standard RFC 6238 settings.
@@ -137,27 +139,26 @@ impl TotpInstance {
 /// Charset for recovery codes: uppercase alphanumeric (no ambiguous chars).
 const RECOVERY_CODE_CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
-/// Generate `count` random recovery codes in format "XXXX-XXXX".
-///
-/// Each code is 8 characters (uppercase alphanumeric, no ambiguous chars like
-/// 0/O/1/I) split by a dash in the middle. Uses `OsRng` for cryptographic randomness.
-pub fn generate_recovery_codes(count: usize) -> Vec<String> {
-    use rand::Rng;
+/// Generate up to ten independent 160-bit recovery codes.
+pub fn generate_recovery_codes(count: usize) -> Result<Vec<String>, TotpError> {
+    generate_recovery_codes_with_rng(count, &mut rand::rngs::OsRng)
+}
 
-    let mut rng = rand::rngs::OsRng;
-    let charset_len = RECOVERY_CODE_CHARSET.len();
-
-    (0..count)
-        .map(|_| {
-            let mut chars = [0u8; 8];
-            for i in 0..8 {
-                chars[i] = RECOVERY_CODE_CHARSET[rng.gen_range(0..charset_len)];
-            }
-            let part1 = std::str::from_utf8(&chars[0..4]).unwrap();
-            let part2 = std::str::from_utf8(&chars[4..8]).unwrap();
-            format!("{}-{}", part1, part2)
-        })
-        .collect()
+fn generate_recovery_codes_with_rng(count: usize, rng: &mut (impl rand::RngCore + rand::CryptoRng)) -> Result<Vec<String>, TotpError> {
+    if count > 10 { return Err(TotpError::RecoveryGeneration); }
+    let mut codes = zeroize::Zeroizing::new(Vec::<String>::with_capacity(count));
+    for _ in 0..count {
+        let mut random = zeroize::Zeroizing::new([0u8; 32]);
+        rng.try_fill_bytes(&mut *random).map_err(|_| TotpError::RecoveryGeneration)?;
+        let mut code = String::with_capacity(39);
+        for (index, byte) in random.iter().enumerate() {
+            if index > 0 && index % 4 == 0 { code.push('-'); }
+            code.push(RECOVERY_CODE_CHARSET[(byte & 31) as usize] as char);
+        }
+        if codes.iter().any(|previous| previous == &code) { use zeroize::Zeroize; code.zeroize(); return Err(TotpError::RecoveryGeneration); }
+        codes.push(code);
+    }
+    Ok(std::mem::take(&mut *codes))
 }
 
 /// Hash a recovery code with SHA256 and return the hex digest.
@@ -175,6 +176,31 @@ pub fn hash_recovery_code(code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestRng { fail: bool }
+    impl rand::CryptoRng for TestRng {}
+    impl rand::RngCore for TestRng {
+        fn next_u32(&mut self) -> u32 { unreachable!() }
+        fn next_u64(&mut self) -> u64 { unreachable!() }
+        fn fill_bytes(&mut self, dest: &mut [u8]) { self.try_fill_bytes(dest).unwrap(); }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+            if self.fail { return Err(rand::Error::new(std::io::Error::other("synthetic RNG failure"))); }
+            for (index, value) in dest.iter_mut().enumerate() { *value = index as u8; }
+            Ok(())
+        }
+    }
+    #[test]
+    fn recovery_code_entropy_mapping_and_hash_vectors() {
+        let code = generate_recovery_codes_with_rng(1, &mut TestRng { fail: false }).unwrap().pop().unwrap();
+        assert_eq!(code, "ABCD-EFGH-JKLM-NPQR-STUV-WXYZ-2345-6789");
+        assert_eq!(hash_recovery_code(&code), "ac6fc1175029a387e4638a6edacd5af4883f9c4e653e24fe5e677e80bf0d5224");
+        assert_eq!(hash_recovery_code("ABCD-EFGH"), "fc83f19a14cf51776f2520dfa572b08b093af1e22b3f28d2fe1edf8097198c65");
+        assert_ne!(hash_recovery_code(&code.to_lowercase()), hash_recovery_code(&code));
+        assert_ne!(hash_recovery_code(&code.replace('-', "")), hash_recovery_code(&code));
+        assert!(generate_recovery_codes_with_rng(1, &mut TestRng { fail: true }).is_err());
+        assert!(generate_recovery_codes_with_rng(2, &mut TestRng { fail: false }).is_err());
+        assert!(generate_recovery_codes(11).is_err());
+    }
 
     // RFC 6238 test vector: secret = "12345678901234567890" (ASCII)
     // Time = 59 → TOTP = 94287082 (8 digits with SHA-1)

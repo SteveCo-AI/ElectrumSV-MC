@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { HistoryView } from '../views/HistoryView';
 
 // Mock api
@@ -62,6 +62,73 @@ describe('HistoryView', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('reports an error instead of claiming empty history and retries explicitly', async () => {
+    mockApi.getHistory.mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce([]);
+    render(<HistoryView />);
+    expect(await screen.findByText(/History unavailable/)).toBeTruthy();
+    expect(screen.queryByText('No transactions yet.')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Retry history' }));
+    expect(await screen.findByText('No transactions yet.')).toBeTruthy();
+  });
+
+  it('ignores a previous wallet response even when the account id is the same', async () => {
+    let resolveOld!: (value: typeof SAMPLE_HISTORY) => void;
+    mockApi.getHistory.mockReturnValueOnce(new Promise(resolve => { resolveOld = resolve; })).mockResolvedValueOnce([]);
+    setupStore({ activeWalletPath: '/old' });
+    const view = render(<HistoryView />);
+    setupStore({ activeWalletPath: '/new' });
+    view.rerender(<HistoryView />);
+    await screen.findByText('No transactions yet.');
+    resolveOld(SAMPLE_HISTORY);
+    await waitFor(() => expect(screen.queryByText(/abc123def456/)).toBeNull());
+  });
+
+  it.each([{}, null, [{ tx_hash: 'x' }]])('rejects malformed history responses', async result => {
+    mockApi.getHistory.mockResolvedValueOnce(result as any);
+    render(<HistoryView />);
+    expect(await screen.findByText(/History unavailable/)).toBeTruthy();
+    expect(screen.queryByText('No transactions yet.')).toBeNull();
+  });
+
+  it('ignores a pending detail from a previous wallet instance with the same account', async () => {
+    let resolve!: (value: typeof SAMPLE_TX_DETAIL) => void;
+    mockApi.getTransaction.mockReturnValueOnce(new Promise(r => { resolve = r; }));
+    setupStore({ activeWalletPath: '/same', walletInstanceToken: 'a' });
+    const view = render(<HistoryView />);
+    await screen.findByText(/abc123def456/);
+    fireEvent.click(findTxRow('abc123def456')!);
+    setupStore({ activeWalletPath: '/same', walletInstanceToken: 'b' });
+    view.rerender(<HistoryView />);
+    await act(async () => resolve(SAMPLE_TX_DETAIL));
+    expect(screen.queryByText('Transaction Details')).toBeNull();
+  });
+
+  it('ignores a pending decode after selecting another transaction', async () => {
+    let resolve!: (value: any[]) => void;
+    mockApi.decodeTxOutputs.mockReturnValueOnce(new Promise(r => { resolve = r; })).mockResolvedValueOnce([]);
+    render(<HistoryView />);
+    await screen.findByText(/abc123def456/);
+    fireEvent.click(findTxRow('abc123def456')!);
+    await screen.findByText('Transaction Details');
+    fireEvent.click(findTxRow('xyz789ghi012')!);
+    await waitFor(() => expect(mockApi.getTransaction).toHaveBeenCalledTimes(2));
+    await act(async () => resolve([{ output_index: 0, value: 4500, script_pubkey_hex: 'old', kind: { type: 'op_return_protocol', protocol: 'OLD', data: 'stale' } }]));
+    expect(screen.queryByText(/OLD Protocol/)).toBeNull();
+  });
+
+  it('ignores pending decoding after the detail panel is closed', async () => {
+    let resolve!: (value: any[]) => void;
+    mockApi.decodeTxOutputs.mockReturnValueOnce(new Promise(r => { resolve = r; }));
+    render(<HistoryView />);
+    await screen.findByText(/abc123def456/);
+    fireEvent.click(findTxRow('abc123def456')!);
+    await screen.findByText('Transaction Details');
+    fireEvent.click(screen.getByText('Close'));
+    await act(async () => resolve([{ output_index: 0, value: 4500, script_pubkey_hex: 'old', kind: { type: 'op_return_protocol', protocol: 'OLD', data: 'stale' } }]));
+    expect(screen.queryByText('Transaction Details')).toBeNull();
+    expect(screen.queryByText(/OLD Protocol/)).toBeNull();
   });
 
   it('renders transactions after loading', async () => {

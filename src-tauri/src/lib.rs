@@ -50,10 +50,13 @@ pub fn run() {
             // Wallet commands
             commands::wallet::list_wallets,
             commands::wallet::create_wallet,
+            commands::wallet::restore_bip39_wallet,
             commands::wallet::open_wallet,
             commands::wallet::close_wallet,
             commands::wallet::unlock_wallet,
             commands::wallet::get_wallet_status,
+            commands::wallet::preview_migration,
+            commands::wallet::migrate_wallet,
             // Account commands (Milestone 3)
             commands::account::get_balance,
             commands::account::get_history,
@@ -89,6 +92,10 @@ pub fn run() {
             commands::wallet::disable_totp,
             commands::wallet::verify_totp,
             commands::wallet::is_totp_enabled_cmd,
+            commands::wallet::begin_totp_setup,
+            commands::wallet::confirm_totp_setup,
+            commands::wallet::cancel_totp_setup,
+            commands::wallet::recover_totp,
             // TOTP Recovery codes (Milestone 8-C)
             commands::wallet::generate_totp_recovery_codes,
             commands::wallet::totp_recover,

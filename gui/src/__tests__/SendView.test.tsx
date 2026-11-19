@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { SendView } from '../views/SendView';
 
-vi.mock('../store', () => ({ useStore: () => ({ activeAccountId: 1, setPlanId: vi.fn(), updateBalance: vi.fn() }) }));
+const storeMocks = vi.hoisted(() => ({ refresh: vi.fn(), token: 'instance-a' }));
+vi.mock('../store', () => ({ useStore: () => ({ activeAccountId: 1, activeWalletPath: 'wallet-a', walletInstanceToken: storeMocks.token, setPlanId: vi.fn(), triggerBalanceRefresh: storeMocks.refresh }) }));
 vi.mock('../api', () => ({ api: {
   getContacts: vi.fn(), getTotpStatus: vi.fn(), getMultisigConfig: vi.fn(), getMapiFeeQuote: vi.fn(),
   listSpendPlans: vi.fn(), getSpendPlanStatus: vi.fn(), cancelSpendPlan: vi.fn(),
@@ -12,6 +13,7 @@ import { api } from '../api';
 
 beforeEach(() => {
   vi.resetAllMocks();
+  storeMocks.token = 'instance-a';
   vi.mocked(api.getContacts).mockResolvedValue([]);
   vi.mocked(api.getTotpStatus).mockResolvedValue({ enabled: true, scope: '', recovery_codes_remaining: 0 });
   vi.mocked(api.getMultisigConfig).mockResolvedValue(null);
@@ -22,6 +24,61 @@ beforeEach(() => {
 });
 
 describe('payment plans', () => {
+  it('rejects exponent and fractional satoshi amounts rather than truncating them', async () => {
+    render(<SendView />);
+    fireEvent.change(screen.getByPlaceholderText(/1A1z/), { target: { value: 'recipient' } });
+    const amount = screen.getByPlaceholderText('1000');
+    fireEvent.change(amount, { target: { value: '1000' } });
+    await waitFor(() => expect(screen.getByText('Prepare Transaction')).not.toBeDisabled());
+    for (const invalid of ['1e3', '1.5', '0', '-1', '01', '9007199254740992']) {
+      fireEvent.change(amount, { target: { value: invalid } });
+      expect(screen.getByText('Prepare Transaction')).toBeDisabled();
+      fireEvent.click(screen.getByText('Prepare Transaction'));
+    }
+    expect(api.prepareTx).not.toHaveBeenCalled();
+    expect(api.signTx).not.toHaveBeenCalled();
+  });
+
+  it('uses the same valid integer for fee estimation and preparation', async () => {
+    vi.mocked(api.prepareTx).mockResolvedValue({ plan_id: 'valid', fee: 100, total_input: 2000, total_output: 1000, change: 900, num_inputs: 1, num_outputs: 2 });
+    render(<SendView />);
+    fireEvent.change(screen.getByPlaceholderText(/1A1z/), { target: { value: 'recipient' } });
+    fireEvent.change(screen.getByPlaceholderText('1000'), { target: { value: '1000' } });
+    await waitFor(() => expect(api.estimateFee).toHaveBeenCalledWith([{ address: 'recipient', satoshis: 1000 }], expect.any(Number), undefined));
+    await waitFor(() => expect(screen.getByText('Prepare Transaction')).not.toBeDisabled());
+    fireEvent.click(screen.getByText('Prepare Transaction'));
+    await screen.findByText('Transaction Preview');
+    expect(api.prepareTx).toHaveBeenCalledWith(expect.objectContaining({ outputs: [{ address: 'recipient', satoshis: 1000 }] }));
+    expect(screen.getByText('1,000 sat')).toBeInTheDocument();
+  });
+
+  it('does not replace a newer fee quote with an older response', async () => {
+    let finishOld!: (value: any) => void;
+    vi.mocked(api.estimateFee).mockReset().mockReturnValueOnce(new Promise(resolve => { finishOld = resolve; })).mockResolvedValueOnce({ fee: 200, num_inputs: 1, num_outputs: 2, fee_rate: 1 });
+    render(<SendView />);
+    fireEvent.change(screen.getByPlaceholderText(/1A1z/), { target: { value: 'recipient' } });
+    const amount = screen.getByPlaceholderText('1000');
+    fireEvent.change(amount, { target: { value: '1000' } });
+    await waitFor(() => expect(api.estimateFee).toHaveBeenCalledTimes(1));
+    fireEvent.change(amount, { target: { value: '2000' } });
+    await screen.findByText(/≈ 200 sat total/);
+    await act(async () => finishOld({ fee: 100, num_inputs: 1, num_outputs: 2, fee_rate: 1 }));
+    expect(screen.getByText(/≈ 200 sat total/)).toBeInTheDocument();
+    expect(screen.queryByText(/≈ 100 sat total/)).not.toBeInTheDocument();
+  });
+
+  it('discards a fee quote after reopening the same wallet path', async () => {
+    let finishOld!: (value: any) => void;
+    vi.mocked(api.estimateFee).mockReset().mockReturnValueOnce(new Promise(resolve => { finishOld = resolve; })).mockResolvedValueOnce({ fee: 200, num_inputs: 1, num_outputs: 2, fee_rate: 1 });
+    const { rerender } = render(<SendView />);
+    fireEvent.change(screen.getByPlaceholderText(/1A1z/), { target: { value: 'recipient' } });
+    fireEvent.change(screen.getByPlaceholderText('1000'), { target: { value: '1000' } });
+    await waitFor(() => expect(api.estimateFee).toHaveBeenCalledTimes(1));
+    storeMocks.token = 'instance-b'; rerender(<SendView />);
+    await screen.findByText(/≈ 200 sat total/);
+    await act(async () => finishOld({ fee: 100, num_inputs: 1, num_outputs: 2, fee_rate: 1 }));
+    expect(screen.getByText(/≈ 200 sat total/)).toBeInTheDocument();
+  });
   it('blocks payment preparation for a multisig account', async () => {
     vi.mocked(api.getMultisigConfig).mockResolvedValue({ account_id: 1, threshold: 2, num_keys: 3, public_keys: [] });
     render(<SendView />);
@@ -118,6 +175,8 @@ describe('payment plans', () => {
     fireEvent.click(screen.getByText('Cancel prepared plan and release inputs'));
     await waitFor(() => expect(api.cancelSpendPlan).toHaveBeenCalledWith('old'));
     expect(api.cancelSpendPlan).toHaveBeenCalledTimes(1);
+    expect(storeMocks.refresh).toHaveBeenCalled();
+    expect(api.getBalance).not.toHaveBeenCalled();
     expect(screen.getByText('Retry sending this same transaction')).toBeInTheDocument();
   });
 });

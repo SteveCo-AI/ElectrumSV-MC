@@ -37,6 +37,21 @@ export interface SpendPlanStatus {
   txid: string | null;
 }
 
+export interface MigrationPreview {
+  from_version: 33;
+  to_version: 34;
+  policy: {
+    legacy_totp_enabled: boolean;
+    legacy_wallet_scope: 'unspecified' | 'login' | 'tx';
+    legacy_record_scope: 'login' | 'tx' | null;
+    target_policy_id: string;
+    newly_require_totp: string[];
+  };
+  confirmation_token: string;
+  expires_in_seconds: number;
+}
+export interface MigrationSuccess { backup_path: string; from_version: 33; to_version: 34; reopen_required: true }
+
 /** UtxoEntry matches Rust `commands::account::UtxoEntry` — wallet UTXO from DB. */
 export interface UtxoEntry {
   tx_hash: string;
@@ -115,6 +130,13 @@ export interface ServerInfo {
   note?: string;
 }
 
+// These exact backend errors occur before any TOTP policy write. All other
+// failures, including transport errors, leave the operation outcome uncertain.
+export function isDefiniteTotpAuthFailure(error: unknown): boolean {
+  const message = typeof error === 'string' ? error : error instanceof Error ? error.message : '';
+  return ['incorrect password', 'wallet authentication failed', 'invalid TOTP code', 'TOTP code required', 'invalid recovery code'].includes(message);
+}
+
 export const api = {
   // App
   getAppVersion: () => invoke<string>('get_app_version'),
@@ -122,6 +144,8 @@ export const api = {
   // Wallet lifecycle
   createWallet: (password: string, walletName?: string, mnemonic?: string) =>
     invoke<any>('create_wallet', { name: walletName || 'default_wallet', password, mnemonic: mnemonic || null, passphrase: null }),
+  restoreBip39Wallet: (name: string, password: string, mnemonic: string, passphrase: string, mode: 'standard_bip39' | 'historical_mc') =>
+    invoke<any>('restore_bip39_wallet', { name, password, mnemonic, passphrase, mode }),
   openWallet: (walletPath: string) =>
     invoke<any>('open_wallet', { walletPath }),
   closeWallet: (walletPath: string) =>
@@ -137,6 +161,11 @@ export const api = {
   unlockWalletWithTOTP: (walletPath: string, password: string, totpCode?: string) =>
     invoke<any>('unlock_wallet', { password, totpCode: totpCode ?? null }),
   listWallets: () => invoke<any[]>('list_wallets'),
+
+  previewMigration: (password: string, totpCode?: string) =>
+    invoke<MigrationPreview>('preview_migration', { password, totpCode: totpCode ?? null }),
+  migrateWallet: (password: string, totpCode: string | undefined, backupPath: string, confirmationToken: string) =>
+    invoke<MigrationSuccess>('migrate_wallet', { password, totpCode: totpCode ?? null, backupPath, confirmationToken }),
 
   // Wallet info
   getWalletInfo: () => invoke<any>('get_wallet_status'),
@@ -244,8 +273,8 @@ export const api = {
     invoke<any>('woc_get_tx', { txid }),
 
   // Wallet utilities (extra)
-  backupWallet: (backupPath: string, password: string) =>
-    invoke<string>('backup_wallet', { backupPath, password }),
+  backupWallet: (backupPath: string, password: string, totpCode: string | undefined, expectedInstanceToken: string) =>
+    invoke<string>('backup_wallet', { backupPath, password, totpCode: totpCode ?? null, expectedInstanceToken }),
   importPrivkey: (wif: string, password: string) =>
     invoke<{ address: string; keyinstance_id: number }>('import_privkey', { wif, password }),
   send: (address: string, amount: number, password: string, totpCode: string, opReturn?: string, feeRate?: number) =>
@@ -256,7 +285,7 @@ export const api = {
 
   // TOTP scope management
   getTotpStatus: () =>
-    invoke<{ enabled: boolean; scope: string; recovery_codes_remaining: number }>('get_totp_status'),
+    invoke<{ enabled: boolean | null; scope: string; recovery_codes_remaining: number; scope_editable?: boolean }>('get_totp_status'),
   setTotpScope: (password: string, scope: string, code?: string) =>
     invoke<string>('set_totp_scope', { password, scope, code: code ?? null }),
 
@@ -304,8 +333,8 @@ export const api = {
     invoke<any>('set_tx_label', { txHash, label }),
 
   // Payment Requests
-  createPaymentRequest: (accountId: number, amount: number, label?: string) =>
-    invoke<{ uri: string; address: string; amount: number; label: string | null; paymentrequest_id: number }>(
+  createPaymentRequest: (accountId: number, amount: number | null, label?: string) =>
+    invoke<{ uri: string; address: string; amount: number | null; label: string | null; paymentrequest_id: number }>(
       'create_payment_request', { accountId, amount, label: label || null }
     ),
   listPaymentRequests: () => invoke<any[]>('list_payment_requests'),
@@ -315,33 +344,30 @@ export const api = {
     invoke<any>('export_seed', { password, totpCode: totpCode ?? null }),
   exportPrivkey: (password: string, address?: string, all?: boolean, totpCode?: string) =>
     invoke<any>('export_privkey', { password, address: address || null, all: all || false, totpCode: totpCode ?? null }),
-  changePassword: (oldPassword: string, newPassword: string) =>
-    invoke<any>('change_password', { oldPassword, newPassword }),
+  changePassword: (oldPassword: string, newPassword: string, totpCode?: string) =>
+    invoke<any>('change_password', { oldPassword, newPassword, totpCode: totpCode ?? null }),
   signMessage: (address: string, message: string, password: string, totpCode?: string) =>
     invoke<{ signature: string }>('sign_message', { address, message, password, totpCode: totpCode ?? null }),
   verifyMessage: (address: string, message: string, signature: string) =>
     invoke<{ valid: boolean }>('verify_message', { address, message, signature }),
-  deleteWallet: (walletPath: string, password: string) =>
-    invoke<any>('delete_wallet', { walletPath, password }),
+  deleteWallet: (walletPath: string, password: string, totpCode?: string) =>
+    invoke<void>('delete_wallet', { walletPath, password, totpCode: totpCode ?? null }),
 
-  // TOTP — simplified model (one-step enable, no scope)
-  // Backend: enable_totp() → { otpauth_url, secret_base32 }
-  //          disable_totp() → ()
-  //          verify_totp(code) → bool
-  //          is_totp_enabled_cmd() → bool
-  //          generate_totp_recovery_codes() → string[] (one-time display)
-  //          totp_recover(recovery_code) → bool
-  // NOTE: totpStatus() was removed — use getTotpStatus() instead.
+  // Setup remains pending until confirmation; recovery leaves the wallet locked.
   totpEnable: (password: string) =>
-    invoke<{ otpauth_url: string; secret_base32: string }>('enable_totp', { password }),
+    invoke<{ otpauth_url: string; secret_base32: string }>('begin_totp_setup', { password }),
+  confirmTotpSetup: (password: string, code: string) =>
+    invoke<void>('confirm_totp_setup', { password, code }),
+  cancelTotpSetup: () => invoke<void>('cancel_totp_setup'),
+  isTotpEnabled: () => invoke<boolean | null>('is_totp_enabled_cmd'),
   totpDisable: (password: string, code: string) =>
     invoke<any>('disable_totp', { password, code }),
   verifyTotp: (code: string) =>
     invoke<boolean>('verify_totp', { code }),
   generateTotpRecoveryCodes: (password: string, code: string) =>
     invoke<string[]>('generate_totp_recovery_codes', { password, code }),
-  totpRecover: (recoveryCode: string) =>
-    invoke<boolean>('totp_recover', { recoveryCode }),
+  totpRecover: (password: string, recoveryCode: string) =>
+    invoke<void>('recover_totp', { password, recoveryCode }),
 
   // Hardware wallet
   setHardwareWalletEnabled: (enabled: boolean) =>

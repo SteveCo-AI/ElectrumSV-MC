@@ -21,6 +21,14 @@ fn join_path(dir: &str, filename: &str) -> String {
         .to_string()
 }
 
+fn new_instance_token() -> Result<String, WalletError> {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.try_fill_bytes(&mut bytes)
+        .map_err(|_| WalletError::Internal(anyhow::anyhow!("random generation failed")))?;
+    Ok(hex::encode(bytes))
+}
+
 fn lock_wallet(path: &Path) -> Result<std::fs::File, WalletError> {
     let mut lock_path = path.as_os_str().to_os_string();
     lock_path.push(".lock");
@@ -33,6 +41,7 @@ fn lock_wallet(path: &Path) -> Result<std::fs::File, WalletError> {
 /// Result of creating a new wallet.
 #[derive(Debug, serde::Serialize)]
 pub struct CreateWalletResult {
+    pub wallet_instance_token: String,
     /// The BIP39 mnemonic phrase (only returned on creation, never stored in plaintext)
     pub mnemonic: String,
     /// Absolute path to the .sqlite file
@@ -46,6 +55,7 @@ pub struct CreateWalletResult {
 /// Result of opening an existing wallet.
 #[derive(Debug, serde::Serialize)]
 pub struct OpenWalletResult {
+    pub wallet_instance_token: String,
     pub wallet_path: String,
     pub wallet_name: String,
     pub account_name: String,
@@ -55,11 +65,14 @@ pub struct OpenWalletResult {
 /// Result of getting wallet status.
 #[derive(Debug, serde::Serialize)]
 pub struct WalletStatus {
+    pub wallet_instance_token: Option<String>,
     pub is_open: bool,
     pub wallet_name: Option<String>,
     pub is_unlocked: bool,
     pub account_id: Option<i64>,
     pub xpub: Option<String>,
+    /// Loaded format marker; this is not an authentication result.
+    pub wallet_format: Option<u32>,
 }
 
 /// Error type for wallet operations.
@@ -99,11 +112,34 @@ impl From<bsv::compat::error::CompatError> for WalletError {
     }
 }
 
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bip39RestoreMode {
+    StandardBip39,
+    HistoricalMc,
+}
+
+/// Restore a valid BIP39 mnemonic using an explicitly chosen passphrase convention.
+pub async fn restore_bip39_wallet(
+    state: &AppState, name: &str, password: &str, phrase: &str, passphrase: &str,
+    mode: Bip39RestoreMode,
+) -> Result<CreateWalletResult, WalletError> {
+    use unicode_normalization::UnicodeNormalization;
+    use zeroize::Zeroizing;
+    bsv::compat::bip39::Mnemonic::from_string(phrase, bsv::compat::bip39::Language::English)
+        .map_err(|_| WalletError::InvalidMnemonic("valid BIP39 checksum required".into()))?;
+    let effective = Zeroizing::new(match mode {
+        Bip39RestoreMode::StandardBip39 => passphrase.nfkd().collect::<String>(),
+        Bip39RestoreMode::HistoricalMc => passphrase.to_owned(),
+    });
+    create_wallet(state, name, password, Some(phrase), Some(&effective)).await
+}
+
 /// Create a new wallet with a BIP32 account from a BIP39 mnemonic.
 ///
 /// If no mnemonic is provided, a new 12-word mnemonic is generated.
-/// The mnemonic is returned to the caller — it is NEVER stored in plaintext.
-/// Only the derived xprv is stored (AES-CBC encrypted with the password).
+/// The mnemonic is returned to the caller. The new wallet stores the mnemonic,
+/// passphrase and derived xprv together in an encrypted authenticated bundle.
 pub async fn create_wallet(
     state: &AppState,
     name: &str,
@@ -125,6 +161,8 @@ pub async fn create_wallet(
         return Err(WalletError::Internal(anyhow::anyhow!("invalid wallet name")));
     }
     let wallet_path = join_path(&state.data_dir, &format!("{}.sqlite", name));
+
+    let instance_token = new_instance_token()?;
 
     let wallet_lock = std::sync::Arc::new(lock_wallet(Path::new(&wallet_path))?);
     if Path::new(&wallet_path).exists() {
@@ -150,52 +188,32 @@ pub async fn create_wallet(
         .map_err(|e| WalletError::BsvSdk(e.to_string()))?;
     let derived = keystore::derive_keys_from_seed(&seed)?;
 
-    // Create keystore data (encrypts xprv, seed, passphrase with password)
-    let ks_data =
-        keystore::create_keystore_data(&mnemonic_str, mnemonic_passphrase, password, &derived);
-
-    // Create the database file (all migrations + initial WalletData entries)
+    // New wallets use one authenticated bundle. Legacy wallets are not converted here.
+    use rand::RngCore;
+    let mut wallet_id = [0u8; 16];
+    rand::rngs::OsRng.try_fill_bytes(&mut wallet_id).map_err(|_| WalletError::Internal(anyhow::anyhow!("random generation failed")))?;
+    let context = crate::security::envelope::WalletContext { wallet_id, xpub: derived.xpub.clone(), derivation: keystore::DERIVATION_PATH.into() };
+    let bundle = crate::security::wallet_bundle::WalletBundle { version: 1, xprv: derived.xprv.clone(), mnemonic: mnemonic_str.clone(), passphrase: mnemonic_passphrase.unwrap_or("").into(), totp: None };
+    let envelope = crate::security::wallet_bundle::seal(password, &context, &bundle).await.map_err(|e| WalletError::Internal(anyhow::anyhow!(e)))?;
+    let record = crate::services::wallet_security::StoredWallet::encode(&context, &envelope).map_err(|e| WalletError::Internal(anyhow::anyhow!(e)))?;
+    let ks_data = keystore::KeyStoreData { xpub: derived.xpub.clone(), xprv: String::new(), seed_type: "bundle-v1".into(), derivation: context.derivation.clone(), seed: String::new(), passphrase: None };
     connection::create_wallet_db(&wallet_path).await?;
-
-    // Open the database
     let pool = connection::open_wallet_db_locked(&wallet_path, wallet_lock.clone()).await?;
-
-    // Insert MasterKey
-    let derivation_data = keystore::keystore_data_to_bytes(&ks_data);
-    let masterkey_id = repositories::insert_master_key(
-        &pool,
-        None,
-        keystore::DERIVATION_TYPE_BIP32,
-        &derivation_data,
-    )
-    .await?;
-
-    // Insert Account (Standard account, P2PKH)
-    let account_id = repositories::insert_account(
-        &pool,
-        Some(masterkey_id),
-        repositories::script_type::P2PKH,
-        "Standard account",
-    )
-    .await?;
-
-    // Store password-token in WalletData (for password verification)
-    let random_bytes = {
-        use rand::RngCore;
-        let mut buf = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut buf);
-        hex::encode(buf)
-    };
-    let encrypted_token = encryption::pw_encode(&random_bytes, password);
-    repositories::set_wallet_data(&pool, "password-token", &encrypted_token).await?;
-
-    // Update next_* counters
-    repositories::set_wallet_data(&pool, "next_masterkey_id", "2").await?;
-    repositories::set_wallet_data(&pool, "next_account_id", "2").await?;
-
+    let mut tx = pool.begin().await.map_err(|e| WalletError::Internal(e.into()))?;
+    let now = chrono::Utc::now().timestamp();
+    let masterkey_id = sqlx::query("INSERT INTO MasterKeys (parent_masterkey_id, derivation_type, derivation_data, date_created, date_updated) VALUES (NULL, ?, ?, ?, ?)")
+        .bind(keystore::DERIVATION_TYPE_BIP32).bind(record).bind(now).bind(now).execute(&mut *tx).await.map_err(|e| WalletError::Internal(e.into()))?.last_insert_rowid();
+    let account_id = sqlx::query("INSERT INTO Accounts (default_masterkey_id, default_script_type, account_name, date_created, date_updated) VALUES (?, ?, ?, ?, ?)")
+        .bind(masterkey_id).bind(repositories::script_type::P2PKH).bind("Standard account").bind(now).bind(now).execute(&mut *tx).await.map_err(|e| WalletError::Internal(e.into()))?.last_insert_rowid();
+    sqlx::query("INSERT INTO WalletData(key,value,date_created,date_updated) VALUES('crypto-format','wallet-envelope-v1',?,?)").bind(now).bind(now).execute(&mut *tx).await.map_err(|e| WalletError::Internal(e.into()))?;
+    for (key, value) in [("migration", "34"), ("next_masterkey_id", "2"), ("next_account_id", "2")] {
+        sqlx::query("UPDATE WalletData SET value=?,date_updated=? WHERE key=?").bind(value).bind(now).bind(key).execute(&mut *tx).await.map_err(|e| WalletError::Internal(e.into()))?;
+    }
+    tx.commit().await.map_err(|e| WalletError::Internal(e.into()))?;
     // Set as active wallet in state
     let active = ActiveWallet {
         instance_id: std::sync::Arc::new(()),
+        instance_token: instance_token.clone(),
         wallet_lock,
         wallet_path: wallet_path.clone(),
         wallet_name: name.to_string(),
@@ -203,6 +221,10 @@ pub async fn create_wallet(
         keystore_data: ks_data,
         account_id,
         decrypted_xprv: Some(derived.xprv), // freshly created — already unlocked
+        secure_wallet: Some(crate::state::SecureWallet { context, envelope, bundle: Some(bundle), generation: 0, needs_reopen: false, pending_totp: None }),
+        legacy_pending_totp: None,
+        #[cfg(test)] commit_barrier: None,
+        #[cfg(test)] migration_write_fail: false,
     };
 
     retire_active_wallet(state).await?;
@@ -217,6 +239,7 @@ pub async fn create_wallet(
     );
 
     Ok(CreateWalletResult {
+        wallet_instance_token: instance_token,
         mnemonic: mnemonic_str,
         wallet_path,
         account_id,
@@ -249,6 +272,7 @@ pub async fn open_wallet(
         if let Some(ref active) = *guard {
             if active.wallet_path == wallet_path {
                 return Ok(OpenWalletResult {
+                    wallet_instance_token: active.instance_token.clone(),
                     wallet_path: active.wallet_path.clone(),
                     wallet_name: active.wallet_name.clone(),
                     account_name: "Standard account".to_string(),
@@ -258,6 +282,7 @@ pub async fn open_wallet(
         }
     }
 
+    let instance_token = new_instance_token()?;
     let wallet_lock = std::sync::Arc::new(lock_wallet(Path::new(&wallet_path))?);
     // Open DB
     let pool = connection::open_wallet_db_locked(&wallet_path, wallet_lock.clone()).await?;
@@ -267,9 +292,30 @@ pub async fn open_wallet(
         .await?
         .ok_or_else(|| WalletError::Internal(anyhow::anyhow!("No master key found in wallet")))?;
 
-    let ks_data = keystore::keystore_data_from_bytes(&mk_row.derivation_data).map_err(|e| {
-        WalletError::Internal(anyhow::anyhow!("Failed to parse keystore data: {}", e))
-    })?;
+    let version = repositories::get_wallet_data(&pool, "migration").await?.ok_or_else(|| WalletError::Internal(anyhow::anyhow!("missing wallet version")))?;
+    let (ks_data, secure_wallet) = if version == "34" {
+        let counts: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM MasterKeys), (SELECT count(*) FROM Accounts), (SELECT count(*) FROM KeyInstances WHERE derivation_type != 3 OR masterkey_id IS NULL OR account_id != (SELECT account_id FROM Accounts LIMIT 1) OR masterkey_id != (SELECT masterkey_id FROM MasterKeys LIMIT 1)), (SELECT count(*) FROM MultisigConfigs)").fetch_one(&pool).await.map_err(|e| WalletError::Internal(e.into()))?;
+        let account_ref: (Option<i64>, i32) = sqlx::query_as("SELECT default_masterkey_id, default_script_type FROM Accounts").fetch_one(&pool).await.map_err(|e| WalletError::Internal(e.into()))?;
+        if counts != (1, 1, 0, 0) || mk_row.derivation_type != keystore::DERIVATION_TYPE_BIP32 || mk_row.parent_masterkey_id.is_some() || account_ref != (Some(mk_row.masterkey_id), repositories::script_type::P2PKH) || mk_row.derivation_data.len() > 140_000 { return Err(WalletError::Internal(anyhow::anyhow!("unsupported wallet key inventory"))); }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct KnownKeyPath { subpath: [u32; 2] }
+        let (key_count, invalid_count): (i64, i64) = sqlx::query_as("SELECT count(*), COALESCE(sum(CASE WHEN script_type != 2 OR length(derivation_data) > 256 THEN 1 ELSE 0 END),0) FROM KeyInstances").fetch_one(&pool).await.map_err(|e| WalletError::Internal(e.into()))?;
+        if key_count > 100_000 || invalid_count != 0 { return Err(WalletError::Internal(anyhow::anyhow!("unsupported wallet key inventory"))); }
+        let paths: Vec<(Vec<u8>,)> = sqlx::query_as("SELECT derivation_data FROM KeyInstances").fetch_all(&pool).await.map_err(|e| WalletError::Internal(e.into()))?;
+        for (data,) in paths {
+            let path: KnownKeyPath = serde_json::from_slice(&data).map_err(|_| WalletError::Internal(anyhow::anyhow!("unsupported wallet key path")))?;
+            if path.subpath[0] > 1 || path.subpath[1] >= (1 << 31) { return Err(WalletError::Internal(anyhow::anyhow!("unsupported wallet key path"))); }
+        }
+        let record: crate::services::wallet_security::StoredWallet = serde_json::from_slice(&mk_row.derivation_data).map_err(|_| WalletError::Internal(anyhow::anyhow!("invalid secure wallet record")))?;
+        if record.format != "wallet-envelope-v1" { return Err(WalletError::Internal(anyhow::anyhow!("unsupported wallet format"))); }
+        let context = crate::security::envelope::WalletContext { wallet_id: record.wallet_id, xpub: record.xpub.clone(), derivation: record.derivation.clone() };
+        let ks = keystore::KeyStoreData { xpub: record.xpub, xprv: String::new(), seed_type: "bundle-v1".into(), derivation: record.derivation, seed: String::new(), passphrase: None };
+        (ks, Some(crate::state::SecureWallet { context, envelope: record.envelope.into_bytes(), bundle: None, generation: 0, needs_reopen: false, pending_totp: None }))
+    } else {
+        let ks = keystore::keystore_data_from_bytes(&mk_row.derivation_data).map_err(|e| WalletError::Internal(anyhow::anyhow!("Failed to parse keystore data: {}", e)))?;
+        (ks, None)
+    };
 
     // Read account
     let account = repositories::get_first_account(&pool).await?;
@@ -288,6 +334,7 @@ pub async fn open_wallet(
     // Set as active wallet (locked)
     let active = ActiveWallet {
         instance_id: std::sync::Arc::new(()),
+        instance_token: instance_token.clone(),
         wallet_lock,
         wallet_path: wallet_path.clone(),
         wallet_name: wallet_name.clone(),
@@ -295,6 +342,10 @@ pub async fn open_wallet(
         keystore_data: ks_data,
         account_id,
         decrypted_xprv: None, // locked
+        secure_wallet,
+        legacy_pending_totp: None,
+        #[cfg(test)] commit_barrier: None,
+        #[cfg(test)] migration_write_fail: false,
     };
 
     retire_active_wallet(state).await?;
@@ -304,6 +355,7 @@ pub async fn open_wallet(
     log::info!("Wallet opened: {} (locked)", wallet_path);
 
     Ok(OpenWalletResult {
+        wallet_instance_token: instance_token,
         wallet_path,
         wallet_name: wallet_name.clone(),
         account_name,
@@ -336,6 +388,7 @@ pub fn unlock_wallet(state: &AppState, password: &str) -> Result<(), WalletError
     let mut guard = state.active_wallet.lock().unwrap();
     let active = guard.as_mut().ok_or(WalletError::NoWalletOpen)?;
 
+    if active.secure_wallet.is_some() { return Err(WalletError::Internal(anyhow::anyhow!("secure wallets require authorized async unlock"))); }
     if active.is_unlocked() {
         return Err(WalletError::AlreadyUnlocked);
     }
@@ -351,6 +404,7 @@ pub fn unlock_wallet(state: &AppState, password: &str) -> Result<(), WalletError
 /// Unlock only after the same password and TOTP checks used by every frontend.
 pub async fn unlock_wallet_authorized(state: &AppState, password: &str, code: Option<&str>) -> Result<(), String> {
     let _operation = state.wallet_operation.lock().await;
+    if crate::services::wallet_security::unlock_locked(state, &_operation, password, code).await?.is_some() { return Ok(()); }
     let (pool, instance_id) = {
         let guard = state.active_wallet.lock().map_err(|_| "wallet state unavailable")?;
         let active = guard.as_ref().ok_or("no wallet is currently open")?;
@@ -379,18 +433,22 @@ pub fn get_wallet_status(state: &AppState) -> WalletStatus {
     let guard = state.active_wallet.lock().unwrap();
     match &*guard {
         None => WalletStatus {
+            wallet_instance_token: None,
             is_open: false,
             wallet_name: None,
             is_unlocked: false,
             account_id: None,
             xpub: None,
+            wallet_format: None,
         },
         Some(active) => WalletStatus {
+            wallet_instance_token: Some(active.instance_token.clone()),
             is_open: true,
             wallet_name: Some(active.wallet_name.clone()),
             is_unlocked: active.is_unlocked(),
             account_id: Some(active.account_id),
             xpub: Some(active.keystore_data.xpub.clone()),
+            wallet_format: Some(if active.secure_wallet.is_some() { 34 } else { 33 }),
         },
     }
 }
@@ -563,7 +621,7 @@ mod tests {
         assert!(!status.is_unlocked);
 
         // Unlock
-        unlock_wallet(&state, "password123").unwrap();
+        unlock_wallet_authorized(&state, "password123", None).await.unwrap();
 
         let status = get_wallet_status(&state);
         assert!(status.is_unlocked);
@@ -614,7 +672,7 @@ mod tests {
         assert!(!get_wallet_status(&state).is_unlocked);
 
         // 4. Unlock
-        unlock_wallet(&state, "mypass").unwrap();
+        unlock_wallet_authorized(&state, "mypass", None).await.unwrap();
         assert!(get_wallet_status(&state).is_unlocked);
 
         // 5. Close
@@ -642,4 +700,255 @@ mod tests {
         let result = close_wallet(&state).await;
         assert!(result.is_err());
     }
+}
+
+#[cfg(test)]
+mod secure_wallet_lifecycle_tests {
+    use super::*;
+    async fn raw_pool(path: &std::path::Path) -> sqlx::SqlitePool {
+        sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(path).create_if_missing(false)).await.unwrap()
+    }
+    #[tokio::test]
+    async fn new_secure_wallet_reopens_and_unlocks() {
+        let dir = std::env::temp_dir().join(format!("wallet-secure-test-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = AppState::new(); state.data_dir = dir.to_string_lossy().into();
+        create_wallet(&state, "synthetic", "password", Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), Some("passphrase")).await.unwrap();
+        let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+        assert_eq!(repositories::get_wallet_data(&pool, "migration").await.unwrap().as_deref(), Some("34"));
+        close_wallet(&state).await.unwrap();
+        open_wallet(&state, "synthetic").await.unwrap();
+        assert!(unlock_wallet_authorized(&state, "wrong", None).await.is_err());
+        assert!(!get_wallet_status(&state).is_unlocked);
+        unlock_wallet_authorized(&state, "password", None).await.unwrap();
+        assert!(get_wallet_status(&state).is_unlocked);
+        close_wallet(&state).await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_marker_changed_metadata_and_unknown_key_inventory() {
+        let dir = std::env::temp_dir().join(format!("wallet-secure-mutation-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = AppState::new(); state.data_dir = dir.to_string_lossy().into();
+        create_wallet(&state, "synthetic", "password", Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), None).await.unwrap();
+        close_wallet(&state).await.unwrap();
+        let pool = raw_pool(&dir.join("synthetic.sqlite")).await;
+        sqlx::query("DELETE FROM WalletData WHERE key='crypto-format'").execute(&pool).await.unwrap();
+        assert!(open_wallet(&state, "synthetic").await.is_err());
+        sqlx::query("INSERT INTO WalletData(key,value,date_created,date_updated) VALUES('crypto-format','wallet-envelope-v1',0,0)").execute(&pool).await.unwrap();
+        let (original,): (Vec<u8>,) = sqlx::query_as("SELECT derivation_data FROM MasterKeys").fetch_one(&pool).await.unwrap();
+        let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        record["xpub"] = serde_json::json!("changed-public-key");
+        sqlx::query("UPDATE MasterKeys SET derivation_data=?").bind(serde_json::to_vec(&record).unwrap()).execute(&pool).await.unwrap();
+        open_wallet(&state, "synthetic").await.unwrap();
+        assert!(unlock_wallet_authorized(&state, "password", None).await.is_err());
+        close_wallet(&state).await.unwrap();
+        sqlx::query("UPDATE MasterKeys SET derivation_data=?").bind(original).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE Accounts SET default_script_type=999").execute(&pool).await.unwrap();
+        assert!(open_wallet(&state, "synthetic").await.is_err());
+        sqlx::query("UPDATE Accounts SET default_script_type=2").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO KeyInstances(account_id,masterkey_id,derivation_type,derivation_data,script_type,flags,date_created,date_updated) VALUES(1,1,3,?,2,0,0,0)").bind(br#"{"subpath":[0,7]}"#.as_slice()).execute(&pool).await.unwrap();
+        open_wallet(&state, "synthetic").await.unwrap();
+        close_wallet(&state).await.unwrap();
+        sqlx::query("UPDATE KeyInstances SET script_type=999").execute(&pool).await.unwrap();
+        assert!(open_wallet(&state, "synthetic").await.is_err());
+        sqlx::query("UPDATE KeyInstances SET script_type=2,derivation_data=?").bind(br#"{"subpath":[0,7],"unexpected":true}"#.as_slice()).execute(&pool).await.unwrap();
+        assert!(open_wallet(&state, "synthetic").await.is_err());
+        sqlx::query("UPDATE KeyInstances SET derivation_data=?").bind(br#"{"subpath":[2,7]}"#.as_slice()).execute(&pool).await.unwrap();
+        assert!(open_wallet(&state, "synthetic").await.is_err());
+        pool.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn secure_setup_backup_rotation_and_locked_recovery() {
+        use crate::commands::{wallet, extra};
+        let dir = std::env::temp_dir().join(format!("wallet-secure-flow-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = AppState::new(); state.data_dir = dir.to_string_lossy().into();
+        create_wallet(&state, "synthetic", "old", Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), None).await.unwrap();
+        let setup = wallet::begin_totp_setup_inner(&state, "old").await.unwrap();
+        let secret = totp_rs::Secret::Encoded(setup.secret_base32).to_bytes().unwrap();
+        let totp = crate::security::totp::TotpInstance::from_secret_bytes(&secret, "ElectrumSV-Mc", "wallet").unwrap();
+        let fresh_code = || totp.generate_current().unwrap();
+        assert!(wallet::confirm_totp_setup_inner(&state, "old", "invalid").await.is_err());
+        let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+        sqlx::query("CREATE TRIGGER reject_secure_update BEFORE UPDATE ON MasterKeys BEGIN SELECT RAISE(ABORT,'test failure'); END").execute(&pool).await.unwrap();
+        assert!(wallet::confirm_totp_setup_inner(&state, "old", &fresh_code()).await.is_err());
+        sqlx::query("DROP TRIGGER reject_secure_update").execute(&pool).await.unwrap();
+        wallet::confirm_totp_setup_inner(&state, "old", &fresh_code()).await.unwrap();
+        assert!(wallet::begin_totp_setup_inner(&state, "old").await.is_err());
+        let codes = wallet::generate_totp_recovery_codes_inner(&state, "old".into(), fresh_code()).await.unwrap();
+        assert_eq!(codes.len(), 10);
+        let backup = dir.join("backup.sqlite").to_string_lossy().to_string();
+        assert!(extra::backup_wallet_authorized(&state, backup.clone(), "old".into(), None).await.is_err());
+        extra::backup_wallet_authorized(&state, backup, "old".into(), Some(fresh_code())).await.unwrap();
+        assert!(wallet::change_password_authorized(&state, "old", "new", None).await.is_err());
+        wallet::change_password_authorized(&state, "old", "new", Some(&fresh_code())).await.unwrap();
+        close_wallet(&state).await.unwrap(); open_wallet(&state, "synthetic").await.unwrap();
+        assert!(unlock_wallet_authorized(&state, "old", Some(&fresh_code())).await.is_err());
+        assert!(unlock_wallet_authorized(&state, "new", None).await.is_err());
+        assert!(wallet::recover_totp_inner(&state, "wrong", &codes[0]).await.is_err());
+        wallet::recover_totp_inner(&state, "new", &codes[0]).await.unwrap();
+        assert!(!get_wallet_status(&state).is_unlocked);
+        assert!(wallet::recover_totp_inner(&state, "new", &codes[0]).await.is_err());
+        unlock_wallet_authorized(&state, "new", None).await.unwrap();
+        close_wallet(&state).await.unwrap();
+        open_wallet(&state, "backup").await.unwrap();
+        assert!(unlock_wallet_authorized(&state, "new", Some(&fresh_code())).await.is_err());
+        unlock_wallet_authorized(&state, "old", Some(&fresh_code())).await.unwrap();
+        {
+            let guard = state.wallet_operation.lock().await;
+            assert_eq!(crate::services::wallet_security::status_locked(&state, &guard).unwrap(), Some(Some(true)));
+            assert_eq!(crate::services::wallet_security::recovery_count_locked(&state, &guard).unwrap(), Some(Some(10)));
+        }
+        close_wallet(&state).await.unwrap();
+        open_wallet(&state, "synthetic").await.unwrap();
+        assert!(unlock_wallet_authorized(&state, "old", None).await.is_err());
+        unlock_wallet_authorized(&state, "new", None).await.unwrap();
+        close_wallet(&state).await.unwrap(); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_new_setup_and_locked_recovery_keep_schema_33() {
+        use crate::commands::wallet;
+        let dir = std::env::temp_dir().join(format!("wallet-legacy-flow-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = AppState::new(); state.data_dir = dir.to_string_lossy().into();
+        create_legacy_fixture(&state, "synthetic", "pw", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None).await.unwrap();
+        let setup = wallet::begin_totp_setup_inner(&state, "pw").await.unwrap();
+        let secret = totp_rs::Secret::Encoded(setup.secret_base32).to_bytes().unwrap();
+        let code = crate::security::totp::TotpInstance::from_secret_bytes(&secret, "ElectrumSV-Mc", "wallet").unwrap().generate_current().unwrap();
+        assert!(wallet::confirm_totp_setup_inner(&state, "pw", "invalid").await.is_err());
+        wallet::confirm_totp_setup_inner(&state, "pw", &code).await.unwrap();
+        assert!(wallet::begin_totp_setup_inner(&state, "pw").await.is_err());
+        let codes = wallet::generate_totp_recovery_codes_inner(&state, "pw".into(), code).await.unwrap();
+        let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+        assert_eq!(repositories::get_wallet_data(&pool, "migration").await.unwrap().as_deref(), Some("33"));
+        close_wallet(&state).await.unwrap(); open_wallet(&state, "synthetic").await.unwrap();
+        assert!(wallet::recover_totp_inner(&state, "wrong", &codes[0]).await.is_err());
+        wallet::recover_totp_inner(&state, "pw", &codes[0]).await.unwrap();
+        assert!(!get_wallet_status(&state).is_unlocked);
+        assert!(wallet::recover_totp_inner(&state, "pw", &codes[0]).await.is_err());
+        unlock_wallet_authorized(&state, "pw", None).await.unwrap();
+        close_wallet(&state).await.unwrap(); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_secure_rotation_requires_reopen_and_uses_committed_db() {
+        use crate::commands::wallet;
+        for after_commit in [false, true] {
+            let dir = std::env::temp_dir().join(format!("wallet-commit-{}-{}-{after_commit}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut s = AppState::new(); s.data_dir = dir.to_string_lossy().into();
+            let state = std::sync::Arc::new(s);
+            create_wallet(&state, "synthetic", "old", Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), None).await.unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (_resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            state.active_wallet.lock().unwrap().as_mut().unwrap().commit_barrier = Some(crate::state::TestCommitBarrier { after_commit, started: started_tx, resume: resume_rx });
+            let worker = state.clone();
+            let task = tokio::spawn(async move { wallet::change_password_authorized(&worker, "old", "new", None).await });
+            tokio::time::timeout(std::time::Duration::from_secs(90), started_rx).await.unwrap().unwrap();
+            task.abort(); let _ = task.await;
+            assert!(!get_wallet_status(&state).is_unlocked);
+            assert!(unlock_wallet_authorized(&state, "old", None).await.unwrap_err().contains("reopen"));
+            close_wallet(&state).await.unwrap(); open_wallet(&state, "synthetic").await.unwrap();
+            let (correct, wrong) = if after_commit { ("new", "old") } else { ("old", "new") };
+            assert!(unlock_wallet_authorized(&state, wrong, None).await.is_err());
+            unlock_wallet_authorized(&state, correct, None).await.unwrap();
+            close_wallet(&state).await.unwrap(); std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_legacy_confirm_locks_session_and_reopen_reads_database() {
+        use crate::commands::wallet;
+        for after_commit in [false, true] {
+            let dir = std::env::temp_dir().join(format!("wallet-legacy-commit-{}-{}-{after_commit}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut s = AppState::new(); s.data_dir = dir.to_string_lossy().into();
+            let state = std::sync::Arc::new(s);
+            create_legacy_fixture(&state, "synthetic", "pw", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None).await.unwrap();
+            let setup = wallet::begin_totp_setup_inner(&state, "pw").await.unwrap();
+            let secret = totp_rs::Secret::Encoded(setup.secret_base32).to_bytes().unwrap();
+            let code = crate::security::totp::TotpInstance::from_secret_bytes(&secret, "ElectrumSV-Mc", "wallet").unwrap().generate_current().unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel(); let (_resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            state.active_wallet.lock().unwrap().as_mut().unwrap().commit_barrier = Some(crate::state::TestCommitBarrier { after_commit, started: started_tx, resume: resume_rx });
+            let worker = state.clone(); let task = tokio::spawn(async move { wallet::confirm_totp_setup_inner(&worker, "pw", &code).await });
+            tokio::time::timeout(std::time::Duration::from_secs(30), started_rx).await.unwrap().unwrap();
+            task.abort(); let _ = task.await;
+            assert!(!get_wallet_status(&state).is_unlocked);
+            close_wallet(&state).await.unwrap(); open_wallet(&state, "synthetic").await.unwrap();
+            assert_eq!(wallet::is_totp_enabled_inner(&state).await.unwrap(), Some(after_commit));
+            close_wallet(&state).await.unwrap(); std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_setup_cancel_expiry_switch_and_password_change() {
+        use crate::commands::wallet;
+        let dir = std::env::temp_dir().join(format!("wallet-pending-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap(); let mut state = AppState::new(); state.data_dir = dir.to_string_lossy().into();
+        create_wallet(&state, "one", "old", Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), None).await.unwrap();
+        wallet::begin_totp_setup_inner(&state, "old").await.unwrap();
+        wallet::cancel_totp_setup_inner(&state).await.unwrap();
+        assert!(wallet::confirm_totp_setup_inner(&state, "old", "000000").await.is_err());
+        wallet::begin_totp_setup_inner(&state, "old").await.unwrap();
+        state.active_wallet.lock().unwrap().as_mut().unwrap().secure_wallet.as_mut().unwrap().pending_totp.as_mut().unwrap().expires = std::time::Instant::now();
+        assert!(wallet::confirm_totp_setup_inner(&state, "old", "000000").await.unwrap_err().contains("expired"));
+        wallet::begin_totp_setup_inner(&state, "old").await.unwrap();
+        wallet::change_password_authorized(&state, "old", "new", None).await.unwrap();
+        assert!(wallet::confirm_totp_setup_inner(&state, "new", "000000").await.is_err());
+        wallet::begin_totp_setup_inner(&state, "new").await.unwrap();
+        create_wallet(&state, "two", "pw", Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), None).await.unwrap();
+        open_wallet(&state, "one").await.unwrap();
+        assert!(wallet::confirm_totp_setup_inner(&state, "new", "000000").await.is_err());
+        close_wallet(&state).await.unwrap(); std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_authenticated_snapshot_cannot_replace_database_record() {
+        let dir = std::env::temp_dir().join(format!("wallet-cas-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));
+        std::fs::create_dir_all(&dir).unwrap(); let mut state = AppState::new(); state.data_dir = dir.to_string_lossy().into();
+        create_wallet(&state, "one", "old", Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"), None).await.unwrap();
+        let guard = state.wallet_operation.lock().await;
+        let auth = crate::services::wallet_security::authenticate_locked(&state, &guard, "old", None, true).await.unwrap().unwrap();
+        let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+        let (mut record,): (Vec<u8>,) = sqlx::query_as("SELECT derivation_data FROM MasterKeys").fetch_one(&pool).await.unwrap();
+        record.push(b' ');
+        sqlx::query("UPDATE MasterKeys SET derivation_data=?").bind(&record).execute(&pool).await.unwrap();
+        assert!(crate::services::wallet_security::rotate_password_locked(&state, &guard, auth, "new").await.is_err());
+        let (after,): (Vec<u8>,) = sqlx::query_as("SELECT derivation_data FROM MasterKeys").fetch_one(&pool).await.unwrap(); assert_eq!(after, record);
+        drop(guard); close_wallet(&state).await.unwrap(); open_wallet(&state, "one").await.unwrap();
+        unlock_wallet_authorized(&state, "old", None).await.unwrap();
+        close_wallet(&state).await.unwrap(); std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+/// Synthetic legacy fixtures for compatibility tests; never used by production creation.
+#[cfg(test)]
+pub(crate) async fn create_legacy_fixture(state: &AppState, name: &str, password: &str, phrase: &str, passphrase: Option<&str>) -> Result<CreateWalletResult, WalletError> {
+    let _operation = state.wallet_operation.lock().await;
+    if password.is_empty() { return Err(WalletError::PasswordRequired); }
+    mnemonic::validate_mnemonic(phrase).map_err(|e| WalletError::InvalidMnemonic(e.to_string()))?;
+    let wallet_path = join_path(&state.data_dir, &format!("{name}.sqlite"));
+    let wallet_lock = std::sync::Arc::new(lock_wallet(Path::new(&wallet_path))?);
+    let seed = mnemonic::mnemonic_to_seed(phrase, passphrase.unwrap_or("")).map_err(|e| WalletError::BsvSdk(e.to_string()))?;
+    let derived = keystore::derive_keys_from_seed(&seed)?;
+    let ks_data = keystore::create_keystore_data(phrase, passphrase, password, &derived);
+    connection::create_wallet_db(&wallet_path).await?;
+    let pool = connection::open_wallet_db_locked(&wallet_path, wallet_lock.clone()).await?;
+    let masterkey_id = repositories::insert_master_key(&pool, None, keystore::DERIVATION_TYPE_BIP32, &keystore::keystore_data_to_bytes(&ks_data)).await?;
+    let account_id = repositories::insert_account(&pool, Some(masterkey_id), repositories::script_type::P2PKH, "Standard account").await?;
+    repositories::set_wallet_data(&pool, "password-token", &encryption::pw_encode("synthetic-token", password)).await?;
+    repositories::set_wallet_data(&pool, "next_masterkey_id", "2").await?;
+    repositories::set_wallet_data(&pool, "next_account_id", "2").await?;
+    let instance_token = new_instance_token()?;
+    let active = ActiveWallet { instance_id: std::sync::Arc::new(()), instance_token: instance_token.clone(), wallet_lock, wallet_path: wallet_path.clone(), wallet_name: name.into(), db_pool: pool, keystore_data: ks_data, account_id, decrypted_xprv: Some(derived.xprv), secure_wallet: None, legacy_pending_totp: None, commit_barrier: None, migration_write_fail: false };
+    retire_active_wallet(state).await?;
+    *state.active_wallet.lock().unwrap() = Some(active);
+    Ok(CreateWalletResult { wallet_instance_token: instance_token, mnemonic: phrase.into(), wallet_path, account_id, is_new_mnemonic: false })
 }

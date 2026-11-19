@@ -224,6 +224,15 @@ async fn ensure_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
         }
     };
 
+    // Version 34 is created explicitly and must never be reached by legacy migrations.
+    let crypto: Option<(String,)> = sqlx::query_as("SELECT value FROM WalletData WHERE key='crypto-format'").fetch_optional(pool).await?;
+    if current_version == 34 {
+        if crypto.as_ref().map(|v| v.0.as_str()) != Some("wallet-envelope-v1") {
+            anyhow::bail!("wallet crypto format/version mismatch");
+        }
+        return Ok(());
+    }
+    if crypto.is_some() { anyhow::bail!("wallet crypto format/version mismatch"); }
     // Reject future/unknown versions — fail-closed
     if current_version > MIGRATION_CURRENT {
         anyhow::bail!(

@@ -1,5 +1,5 @@
 // Wallet dialog components — Export Seed, Change Password, Sign/Verify Message, Delete Wallet
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { useStore } from '../store';
 import { Modal, Field, inputClass, btnPrimary, btnSecondary } from './Modal';
@@ -82,6 +82,7 @@ export function ChangePasswordDialog({ open, onClose }: { open: boolean; onClose
   const [oldPwd, setOldPwd] = useState('');
   const [newPwd, setNewPwd] = useState('');
   const [confirmPwd, setConfirmPwd] = useState('');
+  const [totpCode, setTotpCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [success, setSuccess] = useState(false);
 
@@ -93,7 +94,8 @@ export function ChangePasswordDialog({ open, onClose }: { open: boolean; onClose
     setBusy(true);
     setError(null);
     try {
-      await api.changePassword(oldPwd, newPwd);
+      await api.changePassword(oldPwd, newPwd, totpCode || undefined);
+      setOldPwd(''); setNewPwd(''); setConfirmPwd(''); setTotpCode('');
       setSuccess(true);
     } catch (e: any) {
       setError(e.message);
@@ -103,7 +105,7 @@ export function ChangePasswordDialog({ open, onClose }: { open: boolean; onClose
   };
 
   const handleClose = () => {
-    setOldPwd(''); setNewPwd(''); setConfirmPwd(''); setSuccess(false);
+    setOldPwd(''); setNewPwd(''); setConfirmPwd(''); setTotpCode(''); setSuccess(false);
     onClose();
   };
 
@@ -123,6 +125,7 @@ export function ChangePasswordDialog({ open, onClose }: { open: boolean; onClose
             <input type="password" value={confirmPwd} onChange={(e) => setConfirmPwd(e.target.value)}
               className={inputClass} placeholder="••••••••" />
           </Field>
+          <Field label="TOTP code (if enabled)"><input value={totpCode} onChange={e => setTotpCode(e.target.value)} className={inputClass} /></Field>
           <div className="flex gap-3">
             <button onClick={handleChange} disabled={busy || !oldPwd || !newPwd || !confirmPwd} className={btnPrimary}>
               {busy ? 'Changing…' : 'Change Password'}
@@ -271,31 +274,39 @@ export function DeleteWalletDialog({ open, onClose, walletPath, walletName, onDe
   walletName: string;
   onDeleted: () => void;
 }) {
-  const { setError, walletPassword } = useStore();
+  const { setError } = useStore();
+  const [password, setPassword] = useState('');
+  const [totpCode, setTotpCode] = useState('');
   const [confirmName, setConfirmName] = useState('');
   const [busy, setBusy] = useState(false);
+  const deleteInFlight = useRef(false);
 
   const handleDelete = async () => {
+    if (deleteInFlight.current) return;
+    deleteInFlight.current = true;
     setBusy(true);
     setError(null);
     try {
-      await api.deleteWallet(walletPath, walletPassword || '');
+      await api.deleteWallet(walletPath, password, totpCode || undefined);
+      setConfirmName(''); setPassword(''); setTotpCode('');
       onDeleted();
       onClose();
     } catch (e: any) {
-      setError(e.message);
+      setError(e?.message || String(e));
     } finally {
+      deleteInFlight.current = false;
       setBusy(false);
     }
   };
 
   const handleClose = () => {
-    setConfirmName('');
+    if (deleteInFlight.current) return;
+    setConfirmName(''); setPassword(''); setTotpCode('');
     onClose();
   };
 
   return (
-    <Modal title="Delete Wallet" open={open} onClose={handleClose}>
+    <Modal title="Delete Wallet" open={open} onClose={handleClose} disableClose={busy}>
       <p className="text-sm text-error mb-3">
         ⚠ This will permanently delete the wallet file. This action cannot be undone.
       </p>
@@ -306,61 +317,95 @@ export function DeleteWalletDialog({ open, onClose, walletPath, walletName, onDe
         <input type="text" value={confirmName} onChange={(e) => setConfirmName(e.target.value)}
           className={inputClass} placeholder={walletName} />
       </Field>
+      <Field label="Wallet password"><input type="password" value={password} onChange={e => setPassword(e.target.value)} className={inputClass} /></Field>
+      <Field label="TOTP code (if enabled)"><input value={totpCode} onChange={e => setTotpCode(e.target.value)} placeholder="TOTP code (if enabled)" className={inputClass} /></Field>
       <div className="flex gap-3">
-        <button onClick={handleDelete} disabled={busy || confirmName !== walletName}
+        <button onClick={handleDelete} disabled={busy || !password || confirmName !== walletName}
           className="bg-error hover:bg-red-700 text-white rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
           {busy ? 'Deleting…' : 'Delete Permanently'}
         </button>
-        <button onClick={handleClose} className={btnSecondary}>Cancel</button>
+        <button onClick={handleClose} disabled={busy} className={btnSecondary}>Cancel</button>
       </div>
     </Modal>
   );
 }
 
 // ─── Backup Wallet Dialog ───
-export function BackupWalletDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { setError, walletPassword } = useStore();
+export function BackupWalletDialog({ open, onClose, identity }: { open: boolean; onClose: () => void; identity: { path: string; token: string } | null }) {
+  const { activeWalletPath, walletInstanceToken } = useStore();
+  const walletPath = identity?.path ?? null;
+  const token = identity?.token ?? null;
+  const [password, setPassword] = useState('');
+  const [totpCode, setTotpCode] = useState('');
   const [backupPath, setBackupPath] = useState('');
   const [busy, setBusy] = useState(false);
+  const inFlight = useRef(false);
   const [success, setSuccess] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [unknown, setUnknown] = useState(false);
+  const [walletInvalidated, setWalletInvalidated] = useState(false);
+  const invalidated = useRef(false);
+  const walletChanged = open && (walletInvalidated || !walletPath || !token || activeWalletPath !== walletPath || walletInstanceToken !== token);
+
+  useEffect(() => {
+    if (!open) return;
+    const observe = (path: string | null, currentToken: string | null) => {
+      if (path !== walletPath || currentToken !== token) {
+        invalidated.current = true; setWalletInvalidated(true); setPassword(''); setTotpCode('');
+      }
+    };
+    observe(useStore.getState().activeWalletPath, useStore.getState().walletInstanceToken);
+    return useStore.subscribe(state => observe(state.activeWalletPath, state.walletInstanceToken));
+  }, [open, walletPath, token]);
 
   const handleBackup = async () => {
-    setBusy(true);
-    setError(null);
-    setSuccess(null);
+    if (inFlight.current || invalidated.current || unknown || success || !backupPath.trim() || !password || !walletPath || !token || useStore.getState().activeWalletPath !== walletPath || useStore.getState().walletInstanceToken !== token) return;
+    inFlight.current = true;
+    setBusy(true); setError(null);
     try {
-      const result = await api.backupWallet(backupPath, walletPassword || '');
+      const result = await api.backupWallet(backupPath, password, totpCode || undefined, token);
+      if (typeof result !== 'string' || result !== backupPath || invalidated.current || useStore.getState().activeWalletPath !== walletPath || useStore.getState().walletInstanceToken !== token) throw new Error('Invalid or uncertain backup response');
       setSuccess(`Wallet backed up to: ${result}`);
-    } catch (e: any) {
-      setError(e.message || 'Backup failed');
+    } catch (e: unknown) {
+      const message = typeof e === 'string' ? e : e instanceof Error ? e.message : '';
+      if (!invalidated.current && useStore.getState().activeWalletPath === walletPath && useStore.getState().walletInstanceToken === token && ['incorrect password', 'wallet authentication failed', 'invalid TOTP code', 'TOTP code required'].includes(message)) {
+        setError(message);
+      } else {
+        setUnknown(true);
+        setError('Backup outcome is unknown. The destination may already exist. Check it before trying again with a new name.');
+      }
     } finally {
-      setBusy(false);
+      setPassword(''); setTotpCode('');
+      inFlight.current = false; setBusy(false);
     }
   };
 
   const handleClose = () => {
-    setBackupPath('');
-    setSuccess(null);
+    if (inFlight.current) return;
+    setBackupPath(''); setPassword(''); setTotpCode('');
+    setSuccess(null); setError(null); setUnknown(false); setWalletInvalidated(false); invalidated.current = false;
     onClose();
   };
 
   return (
-    <Modal title="Backup Wallet" open={open} onClose={handleClose}>
+    <Modal title="Backup Wallet" open={open} onClose={handleClose} disableClose={busy}>
       <p className="text-sm text-gray-400 mb-3">
-        Create a backup copy of your wallet database file.
+        Choose a new file inside the wallet data directory. Existing files are not overwritten. The backup contains wallet secrets.
       </p>
       <Field label="Backup file path">
         <input type="text" value={backupPath} onChange={(e) => setBackupPath(e.target.value)}
-          className={inputClass} placeholder="/path/to/wallet_backup.sqlite" />
+          className={inputClass} placeholder="/path/to/wallet_backup.sqlite" disabled={busy || unknown || !!success} />
       </Field>
-      {success && (
-        <div className="text-sm text-success mb-3 p-3 bg-success/10 rounded-lg">{success}</div>
-      )}
+      <Field label="Wallet password"><input type="password" value={password} onChange={e => setPassword(e.target.value)} className={inputClass} placeholder="Wallet password" disabled={busy || unknown || !!success} /></Field>
+      <Field label="TOTP code (if enabled)"><input value={totpCode} onChange={e => setTotpCode(e.target.value)} className={inputClass} placeholder="TOTP code (if enabled)" disabled={busy || unknown || !!success} /></Field>
+      {walletChanged && <div role="alert">Wallet changed. Close this dialog and open it for the current wallet.</div>}
+      {error && <div role="alert" className="text-sm text-danger mb-3">{error}</div>}
+      {success && <div role="status" className="text-sm text-success mb-3 p-3 bg-success/10 rounded-lg">{success}</div>}
       <div className="flex gap-3">
-        <button onClick={handleBackup} disabled={busy || !backupPath} className={btnPrimary}>
+        <button onClick={handleBackup} disabled={busy || unknown || !!success || walletChanged || !backupPath.trim() || !password} className={btnPrimary}>
           {busy ? 'Backing up…' : 'Backup'}
         </button>
-        <button onClick={handleClose} className={btnSecondary}>Close</button>
+        <button onClick={handleClose} disabled={busy} className={btnSecondary}>Close</button>
       </div>
     </Modal>
   );
@@ -368,7 +413,7 @@ export function BackupWalletDialog({ open, onClose }: { open: boolean; onClose: 
 
 // ─── Import Private Key Dialog ───
 export function ImportPrivkeyDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { walletPassword, setError } = useStore();
+  const { setError } = useStore();
   const [wif, setWif] = useState('');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
@@ -378,7 +423,8 @@ export function ImportPrivkeyDialog({ open, onClose }: { open: boolean; onClose:
     setBusy(true);
     setError(null);
     try {
-      const r = await api.importPrivkey(wif, password || walletPassword || '');
+      const r = await api.importPrivkey(wif, password);
+      setPassword(''); setWif('');
       setResult(r);
     } catch (e: any) {
       setError(e.message || 'Import failed');
@@ -407,10 +453,10 @@ export function ImportPrivkeyDialog({ open, onClose }: { open: boolean; onClose:
           </Field>
           <Field label="Wallet password">
             <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
-              className={inputClass} placeholder={walletPassword ? '(stored password)' : '••••••••'} />
+              className={inputClass} placeholder="••••••••" />
           </Field>
           <div className="flex gap-3">
-            <button onClick={handleImport} disabled={busy || !wif} className={btnPrimary}>
+            <button onClick={handleImport} disabled={busy || !wif || !password} className={btnPrimary}>
               {busy ? 'Importing…' : 'Import Key'}
             </button>
             <button onClick={handleClose} className={btnSecondary}>Cancel</button>

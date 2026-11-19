@@ -14,7 +14,9 @@
 use electrumsv_mc_lib::core::keystore;
 use electrumsv_mc_lib::core::transaction::{PaymentOutput, SelectedUtxo, TxBuilder, TransactionError};
 use electrumsv_mc_lib::db::repositories;
-use electrumsv_mc_lib::security::encryption;
+use electrumsv_mc_lib::security::envelope::{self, WalletContext};
+use std::io::{BufRead, BufReader, Write};
+use serde_json::{json, Value};
 use electrumsv_mc_lib::services::wallet_service;
 use electrumsv_mc_lib::state::AppState;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -171,96 +173,40 @@ async fn test_e2e_wallet_lifecycle() {
         result
     );
 
-    // -----------------------------------------------------------------
-    // Step 7: Change password — decrypt xprv, re-encrypt with new password
-    // -----------------------------------------------------------------
-    let (_, _, ks_data, _) = grab_active_wallet(&state);
-
-    // Decrypt xprv with old password — should succeed
-    let decrypted_xprv = keystore::decrypt_xprv(&ks_data, password)
-        .expect("decrypt_xprv with old password should succeed");
-
-    // Decrypt mnemonic with old password
-    let decrypted_mnemonic = keystore::decrypt_mnemonic(&ks_data, password)
-        .expect("decrypt_mnemonic with old password should succeed");
-
-    // Re-encrypt xprv and mnemonic with the new password
-    let new_xprv_enc = encryption::pw_encode(&decrypted_xprv, new_password);
-    let new_seed_enc = encryption::pw_encode(&decrypted_mnemonic, new_password);
-
-    // Build updated keystore data
-    let new_ks_data = keystore::KeyStoreData {
-        xpub: ks_data.xpub.clone(),
-        xprv: new_xprv_enc,
-        seed_type: ks_data.seed_type.clone(),
-        derivation: ks_data.derivation.clone(),
-        seed: new_seed_enc,
-        passphrase: ks_data.passphrase.clone(),
-    };
-
-    // Verify old password now FAILS to decrypt the new xprv
-    let old_pw_result = keystore::decrypt_xprv(&new_ks_data, password);
-    assert!(old_pw_result.is_err(), "old password must fail after change_password");
-
-    // Verify new password SUCCEEDS to decrypt the new xprv
-    let new_pw_result = keystore::decrypt_xprv(&new_ks_data, new_password)
-        .expect("new password must decrypt the re-encrypted xprv");
-    assert_eq!(new_pw_result, decrypted_xprv, "decrypted xprv must be unchanged");
-
-    // Update the in-memory active wallet's keystore_data + decrypted_xprv
-    // (mirrors what change_password command does internally)
+    // Change the password through the actual maintenance RPC, not a replicated CBC path.
+    wallet_service::close_wallet(&state).await.unwrap();
     {
-        let mut guard = state.active_wallet.lock().unwrap();
-        if let Some(ref mut active) = *guard {
-            active.keystore_data = new_ks_data.clone();
-            // Keep decrypted_xprv as-is (already unlocked) — but verify it still works
-            // by re-checking against the new keystore data below.
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard { fn drop(&mut self) { if self.0.try_wait().ok().flatten().is_none() { let _=self.0.kill(); let _=self.0.wait(); } } }
+        let mut child=ChildGuard(std::process::Command::new(env!("CARGO_BIN_EXE_electrumsv-mc"))
+            .args(["--agent","--data-dir"]).arg(&state.data_dir).arg("--enable-wallet-maintenance")
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap());
+        let mut input=child.0.stdin.take().unwrap(); let stdout=child.0.stdout.take().unwrap();
+        let (tx,rx)=std::sync::mpsc::channel();
+        std::thread::spawn(move || { for line in BufReader::new(stdout).lines() { if tx.send(line).is_err() { break; } } });
+        for (id,method,params) in [(1,"open_wallet",json!({"wallet_path":"e2e_test"})),(2,"change_password",json!({"old_password":password,"new_password":new_password})),(3,"close_wallet",json!({}))] {
+            writeln!(input,"{}",json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})).unwrap();input.flush().unwrap();
+            let line=rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap_or_else(|_| panic!("agent timeout: {method}")).unwrap();
+            let response:Value=serde_json::from_str(&line).unwrap();assert_eq!(response["id"],id);assert!(response.get("error").is_none(),"RPC failed: {method}");
         }
+        drop(input);assert!(child.0.wait().unwrap().success());
     }
-
-    // Also persist the new keystore to the DB (like the real change_password command)
-    {
-        let (pool, _, _, _) = grab_active_wallet(&state);
-        let new_ks_bytes = keystore::keystore_data_to_bytes(&new_ks_data);
-        let mk_row = repositories::get_first_master_key(&pool)
-            .await
-            .expect("get_first_master_key should succeed")
-            .expect("master key must exist");
-        let now = chrono::Utc::now().timestamp();
-        sqlx::query(
-            "UPDATE MasterKeys SET derivation_data = ?, date_updated = ? WHERE masterkey_id = ?",
-        )
-        .bind(&new_ks_bytes)
-        .bind(now)
-        .bind(mk_row.masterkey_id)
-        .execute(&pool)
-        .await
-        .expect("UPDATE MasterKeys should succeed");
-
-        // Clear legacy password-token (matching the real command's behaviour)
-        repositories::set_wallet_data(&pool, "password-token", "")
-            .await
-            .expect("set_wallet_data should succeed");
-    }
-
-    // -----------------------------------------------------------------
-    // Step 8: Export seed — decrypt mnemonic, verify it matches the original
-    // -----------------------------------------------------------------
-    let (_, _, ks_data, _) = grab_active_wallet(&state);
-    // Verify password
-    assert!(
-        keystore::verify_password(&ks_data, new_password),
-        "new password must verify against updated keystore"
-    );
-    assert!(
-        !keystore::verify_password(&ks_data, password),
-        "old password must NOT verify against updated keystore"
-    );
-
-    // Decrypt mnemonic with the new password
-    let exported_mnemonic = keystore::decrypt_mnemonic(&ks_data, new_password)
-        .expect("decrypt_mnemonic with new password should succeed");
-    assert_eq!(exported_mnemonic, KNOWN_MNEMONIC, "exported mnemonic must match original");
+    wallet_service::open_wallet(&state, &wallet_path).await.unwrap();
+    let (pool, _, _, _) = grab_active_wallet(&state);
+    let row=repositories::get_first_master_key(&pool).await.unwrap().unwrap();
+    let record:Value=serde_json::from_slice(&row.derivation_data).unwrap();
+    assert_eq!(record["format"],"wallet-envelope-v1");
+    let context=WalletContext { wallet_id:serde_json::from_value(record["wallet_id"].clone()).unwrap(), xpub:record["xpub"].as_str().unwrap().into(), derivation:record["derivation"].as_str().unwrap().into() };
+    let serialized=record["envelope"].as_str().unwrap().as_bytes();
+    assert!(envelope::open(password,&context,serialized).await.is_err());
+    let decrypted=envelope::open(new_password,&context,serialized).await.unwrap();
+    let payload:Value=serde_json::from_slice(&decrypted).unwrap();
+    assert_eq!(payload["mnemonic"],KNOWN_MNEMONIC);
+    let seed=electrumsv_mc_lib::core::mnemonic::mnemonic_to_seed(KNOWN_MNEMONIC, "").unwrap();
+    let expected=keystore::derive_keys_from_seed(&seed).unwrap();
+    assert_eq!(context.xpub,expected.xpub);
+    assert_eq!(payload["xprv"],expected.xprv);
+    drop(pool);
 
     // -----------------------------------------------------------------
     // Step 9: Close wallet — active_wallet must become None
@@ -290,7 +236,7 @@ async fn test_e2e_wallet_lifecycle() {
     // Step 11: Unlock wallet with the NEW password — must succeed
     // -----------------------------------------------------------------
     // First verify old password fails on the reopened wallet
-    let old_pw_unlock = wallet_service::unlock_wallet(&state, password);
+    let old_pw_unlock = wallet_service::unlock_wallet_authorized(&state, password, None).await;
     assert!(old_pw_unlock.is_err(), "old password must fail to unlock the reopened wallet");
 
     // Still locked after a failed unlock attempt
@@ -301,7 +247,7 @@ async fn test_e2e_wallet_lifecycle() {
     }
 
     // Now unlock with the new password
-    wallet_service::unlock_wallet(&state, new_password)
+    wallet_service::unlock_wallet_authorized(&state, new_password, None).await
         .expect("unlock_wallet with new password should succeed");
     {
         let guard = state.active_wallet.lock().unwrap();

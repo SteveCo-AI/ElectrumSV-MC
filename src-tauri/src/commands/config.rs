@@ -7,12 +7,22 @@ use crate::db::repositories;
 use crate::state::AppState;
 use tauri::State;
 
+fn is_internal_key(key: &str) -> bool {
+    key == "migration" || key.starts_with("next_") || key == "password-token"
+        || key == "hardware_wallet_enabled" || key.starts_with("crypto-")
+        || key.starts_with("totp_") || key.starts_with("address_discovery_v1_")
+}
+
 /// Get all configuration values from WalletData.
 ///
 /// Returns a JSON object mapping config keys to their string values.
 /// Excludes internal keys (migration, next_*, password-token).
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    get_config_inner(&state).await
+}
+
+async fn get_config_inner(state: &AppState) -> Result<serde_json::Value, String> {
     log::info!("get_config");
 
     let pool = {
@@ -33,11 +43,7 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<serde_json::Value,
     let mut config = serde_json::Map::new();
     for (key, value) in rows {
     // Skip internal keys
-    if key == "migration"
-        || key.starts_with("next_")
-        || key == "password-token"
-        || key == "hardware_wallet_enabled"
-    {
+    if is_internal_key(&key) {
         continue;
     }
     config.insert(key, serde_json::Value::String(value));
@@ -55,10 +61,14 @@ pub async fn update_config(
     key: String,
     value: String,
 ) -> Result<(), String> {
+    update_config_inner(&state, key, value).await
+}
+
+async fn update_config_inner(state: &AppState, key: String, value: String) -> Result<(), String> {
     log::info!("update_config — key: {}", key);
 
     // Reject internal keys
-    if key == "migration" || key.starts_with("next_") || key == "password-token" {
+    if is_internal_key(&key) {
         return Err("cannot modify internal configuration keys".to_string());
     }
 
@@ -129,13 +139,44 @@ mod tests {
                 key == "migration"
                     || key.starts_with("next_")
                     || key == "password-token"
-                    || key == "hardware_wallet_enabled",
+                    || key == "hardware_wallet_enabled"
+                    || key == "crypto-format",
                 "unexpected non-internal key in new wallet: {}",
                 key
             );
         }
 
+        assert!(get_config_inner(&state).await.unwrap().get("crypto-format").is_none());
+        assert!(update_config_inner(&state, "crypto-format".into(), "tampered".into()).await.is_err());
+        assert_eq!(repositories::get_wallet_data(&pool, "crypto-format").await.unwrap().as_deref(), Some("wallet-envelope-v1"));
+
         pool.close().await;
+        wallet_service::close_wallet(&state).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_cannot_inject_legacy_recovery_or_discovery_state() {
+        let state = make_test_state("cfg_recovery_injection");
+        wallet_service::create_legacy_fixture(&state, "legacy", "pw", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None).await.unwrap();
+        let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+        repositories::store_totp_secret(&pool, &[7; 20]).await.unwrap();
+        let legit = crate::security::totp::hash_recovery_code("VALID-CODE");
+        repositories::store_recovery_codes(&pool, &[legit.clone()]).await.unwrap();
+        let forged = crate::security::totp::hash_recovery_code("FAKE-CODE");
+        assert!(update_config_inner(&state, repositories::TOTP_RECOVERY_CODES_KEY.into(), serde_json::json!([forged]).to_string()).await.is_err());
+        assert!(update_config_inner(&state, "totp_scope".into(), "login".into()).await.is_err());
+        repositories::set_wallet_data(&pool, "address_discovery_v1_1", "original").await.unwrap();
+        assert!(update_config_inner(&state, "address_discovery_v1_1".into(), "done".into()).await.is_err());
+        assert_eq!(repositories::get_wallet_data(&pool, "address_discovery_v1_1").await.unwrap().as_deref(), Some("original"));
+        assert!(get_config_inner(&state).await.unwrap().get("address_discovery_v1_1").is_none());
+        assert!(get_config_inner(&state).await.unwrap().get(repositories::TOTP_RECOVERY_CODES_KEY).is_none());
+        assert!(!crate::commands::wallet::totp_recover_inner(&state, "FAKE-CODE").await.unwrap());
+        assert_eq!(repositories::load_recovery_codes(&pool).await.unwrap(), vec![legit]);
+        assert!(repositories::is_totp_enabled(&pool).await.unwrap());
+        assert!(crate::commands::wallet::totp_recover_inner(&state, "VALID-CODE").await.unwrap());
+        assert!(!repositories::is_totp_enabled(&pool).await.unwrap());
+        update_config_inner(&state, "currency".into(), "USD".into()).await.unwrap();
+        assert_eq!(get_config_inner(&state).await.unwrap()["currency"], "USD");
         wallet_service::close_wallet(&state).await.unwrap();
     }
 

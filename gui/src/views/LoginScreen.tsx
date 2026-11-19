@@ -2,9 +2,9 @@
 // Three modes:
 //   "login"  — Open existing wallet: name + password (+ TOTP code if enabled)
 //   "create" — New wallet: name + password → show mnemonic → confirm mnemonic → main
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useStore } from '../store';
-import { api } from '../api';
+import { api, isDefiniteTotpAuthFailure } from '../api';
 import { useTranslation, interp } from '../i18n';
 
 type Mode = 'login' | 'create' | 'restore';
@@ -13,8 +13,8 @@ type RestoreMethod = 'mnemonic' | 'wif' | null;
 
 export function LoginScreen() {
   const { setAuthenticated, setWalletInfo, setAccounts, setActiveAccount,
-           selectedWallet, setView, setActiveWalletPath,
-           setWalletPassword } = useStore();
+           selectedWallet, setView, setActiveWalletIdentity,
+           requireWalletReopen } = useStore();
   const { t } = useTranslation();
   const [walletName, setWalletName] = useState(selectedWallet ?? '');
   const [walletPassword, setWalletPasswordState] = useState('');
@@ -24,6 +24,10 @@ export function LoginScreen() {
 
   const [totpRequired, setTotpRequired] = useState(false);
   const [totpCode, setTotpCode] = useState('');
+  const [openedPath, setOpenedPath] = useState<string | null>(null);
+  const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
+  const [recoveryMode, setRecoveryMode] = useState(false);
+  const [recoveryCode, setRecoveryCode] = useState('');
   const [totpChecked, setTotpChecked] = useState(false);
 
   const [createStep, setCreateStep] = useState<CreateStep>('form');
@@ -35,6 +39,15 @@ export function LoginScreen() {
   const [restoreInput, setRestoreInput] = useState('');
   const [restoreName, setRestoreName] = useState('');
   const [restorePassword, setRestorePassword] = useState('');
+  const [restorePassphrase, setRestorePassphrase] = useState('');
+  const [restoreDerivationMode, setRestoreDerivationMode] = useState<'standard_bip39' | 'historical_mc'>('standard_bip39');
+  const mounted = useRef(false);
+  const restorePending = useRef(false);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
   // Legacy ElectrumSV (1.3.x) migration state
   const [legacyMode, setLegacyMode] = useState(false);
@@ -58,11 +71,18 @@ export function LoginScreen() {
       const walletPath = selectedWallet
         ? `${selectedWallet}`
         : walletName;
-      const openResult = await api.openWallet(walletPath);
-      setActiveWalletPath(openResult.wallet_path);
+      let path = openedPath;
+      if (!path) {
+        const opened = await api.openWallet(walletPath);
+        if (typeof opened.wallet_path !== 'string' || !opened.wallet_path) throw new Error('Invalid wallet path');
+        path = opened.wallet_path;
+        setActiveWalletIdentity(path!, opened.wallet_instance_token ?? null);
+        setOpenedPath(path);
+      }
 
+      if (!path) throw new Error('Invalid wallet path');
       try {
-        await api.unlockWalletWithTOTP(openResult.wallet_path, walletPassword, totpCode || undefined);
+        await api.unlockWalletWithTOTP(path, walletPassword, totpCode || undefined);
       } catch (e: any) {
         if (String(e?.message || e).includes('TOTP code required')) {
           setTotpRequired(true);
@@ -72,7 +92,8 @@ export function LoginScreen() {
         }
         throw e;
       }
-      setWalletPassword(walletPassword);
+      setWalletPasswordState('');
+      setTotpCode('');
 
       const wi = await api.getWalletInfo();
       setWalletInfo({ walletName: wi.wallet_name ?? selectedWallet ?? '', walletLoaded: true });
@@ -96,13 +117,40 @@ export function LoginScreen() {
     }
   };
 
+  const handleRecovery = async () => {
+    setLoading(true); setError(null);
+    try {
+      let path = openedPath;
+      if (!path) {
+        const opened = await api.openWallet(selectedWallet || walletName);
+        if (typeof opened.wallet_path !== 'string' || !opened.wallet_path) throw new Error('Invalid wallet path');
+        path = opened.wallet_path;
+        setActiveWalletIdentity(path!, opened.wallet_instance_token ?? null);
+        setOpenedPath(path);
+      }
+      if (!path) throw new Error('Invalid wallet path');
+      try {
+        await api.totpRecover(walletPassword, recoveryCode);
+      } catch (e: any) {
+        if (isDefiniteTotpAuthFailure(e)) throw e;
+        setRecoveryCode(''); setWalletPasswordState(''); setTotpCode(''); setRecoveryNotice(null);
+        requireWalletReopen('The 2FA recovery outcome is unknown. Close and reopen the wallet to check its protection status before retrying.', path);
+        return;
+      }
+      setRecoveryCode(''); setWalletPasswordState(''); setTotpCode('');
+      setTotpRequired(false); setRecoveryMode(false);
+      setRecoveryNotice('Recovery completed. 2FA and all recovery codes were removed. Unlock with your password and set up 2FA again before signing transactions.');
+    } catch (e: any) { setError(e?.message || String(e)); }
+    finally { setLoading(false); }
+  };
+
   const handleCreate = async () => {
     setLoading(true);
     setError(null);
     try {
       const name = walletName.trim() || 'default_wallet';
       const result = await api.createWallet(walletPassword, name);
-      setActiveWalletPath(result.wallet_path);
+      setActiveWalletIdentity(result.wallet_path, result.wallet_instance_token ?? null);
       setMnemonic(result.mnemonic);
       setCreateStep('mnemonic');
     } catch (e: any) {
@@ -126,13 +174,16 @@ export function LoginScreen() {
     loadWalletInfo();
   };
 
-  const loadWalletInfo = async () => {
+  const loadWalletInfo = async (restoredIdentity?: { path: string; token: string | null }) => {
     setLoading(true);
     setError(null);
     try {
       const wi = await api.getWalletInfo();
-      setWalletInfo({ walletName: wi.wallet_name ?? walletName, walletLoaded: true });
+      if (!mounted.current) return;
       const accounts: any = await api.getAccounts();
+      if (!mounted.current) return;
+      if (restoredIdentity) setActiveWalletIdentity(restoredIdentity.path, restoredIdentity.token);
+      setWalletInfo({ walletName: wi.wallet_name ?? walletName, walletLoaded: true });
       const accountList = Array.isArray(accounts) ? accounts : (accounts.accounts ?? []);
       const mapped = accountList.map((a: any) => ({
         id: a.account_id ?? a.id,
@@ -143,13 +194,14 @@ export function LoginScreen() {
       if (mapped.length > 0 && mapped[0].id !== undefined) {
         setActiveAccount(mapped[0].id);
       }
-      setWalletPassword(walletPassword);
+      setWalletPasswordState('');
+      setTotpCode('');
       setAuthenticated(true);
       useStore.getState().setView('main');
     } catch (e: any) {
-      setError(e.message || t.login.loadFailed);
+      if (mounted.current) setError(e.message || t.login.loadFailed);
     } finally {
-      setLoading(false);
+      if (mounted.current) setLoading(false);
     }
   };
 
@@ -164,6 +216,8 @@ export function LoginScreen() {
     setRestoreInput('');
     setRestoreName('');
     setRestorePassword('');
+    setRestorePassphrase('');
+    setRestoreDerivationMode('standard_bip39');
     setLegacyMode(false);
     setShowLegacyWarning(false);
     setMigrating(false);
@@ -181,22 +235,25 @@ export function LoginScreen() {
   };
 
   const doRestore = async () => {
+    if (restorePending.current) return;
+    restorePending.current = true;
     setLoading(true);
     setError(null);
     try {
       const name = restoreName.trim() || 'restored_wallet';
       if (restoreMethod === 'mnemonic') {
-        const result = await api.createWallet(restorePassword, name, restoreInput.trim());
-        setActiveWalletPath(result.wallet_path);
+        const result = await api.restoreBip39Wallet(name, restorePassword, restoreInput.trim(), restorePassphrase, restoreDerivationMode);
+        if (!mounted.current) return;
         // Skip mnemonic display/confirm for restored wallets
-        await loadWalletInfo();
+        await loadWalletInfo({ path: result.wallet_path, token: result.wallet_instance_token ?? null });
       } else if (restoreMethod === 'wif') {
         throw new Error('WIF recovery is not yet supported safely. Keep your original private key.');
       }
     } catch (e: any) {
-      setError(e.message || t.login.restoreInvalidMnemonic);
+      if (mounted.current) setError(e.message || t.login.restoreInvalidMnemonic);
     } finally {
-      setLoading(false);
+      restorePending.current = false;
+      if (mounted.current) { setRestorePassphrase(''); setLoading(false); }
     }
   };
 
@@ -209,7 +266,7 @@ export function LoginScreen() {
       // Step 1: Create new BIP39 wallet from legacy seed
       const result = await api.restoreLegacyWallet(restoreInput.trim(), restorePassword, name);
       if (result?.wallet_path) {
-        setActiveWalletPath(result.wallet_path);
+        setActiveWalletIdentity(result.wallet_path, result.wallet_instance_token ?? null);
       }
       // Step 2: Sweep legacy funds to the new wallet
       if (result?.wallet_path) {
@@ -303,8 +360,8 @@ export function LoginScreen() {
                 </button>
               </div>
             ) : (
-              <>
-                <button onClick={() => { setRestoreMethod(null); setRestoreInput(''); setError(null); setLegacyMode(false); }} className="text-xs text-gray-400 hover:text-gray-100 mb-4 transition-colors">
+              <fieldset disabled={loading || migrating}>
+                <button onClick={() => { setRestoreMethod(null); setRestoreInput(''); setRestorePassphrase(''); setRestoreDerivationMode('standard_bip39'); setError(null); setLegacyMode(false); }} className="text-xs text-gray-400 hover:text-gray-100 mb-4 transition-colors">
                   ← {t.login.restoreDesc}
                 </button>
                 <label className="block text-xs text-gray-400 mb-1">{t.login.restoreNameLabel}</label>
@@ -313,7 +370,7 @@ export function LoginScreen() {
                 <textarea value={restoreInput} onChange={(e) => setRestoreInput(e.target.value)} placeholder={restoreMethod === 'mnemonic' ? t.login.restoreMnemonicPlaceholder : t.login.restoreWifPlaceholder} className="w-full h-24 bg-void-800 border border-void-700 rounded-lg px-3 py-2 text-sm text-gray-100 font-mono focus:border-accent outline-none mb-3 resize-none" autoFocus spellCheck={false} />
                 {restoreMethod === 'mnemonic' && (
                   <button
-                    onClick={() => setLegacyMode(!legacyMode)}
+                    onClick={() => { setLegacyMode(!legacyMode); setRestorePassphrase(''); }}
                     className={`w-full rounded-lg border px-3 py-2 text-xs font-medium mb-3 transition-all ${
                       legacyMode
                         ? 'border-red-500 bg-red-500/10 text-red-400 shadow-[0_0_12px_rgba(239,68,68,0.3)]'
@@ -323,16 +380,27 @@ export function LoginScreen() {
                     {legacyMode ? '● ' : ''}{t.login.legacyToggle}
                   </button>
                 )}
-                <label className="block text-xs text-gray-400 mb-1">{t.login.restorePasswordLabel}</label>
-                <input type="password" value={restorePassword} onChange={(e) => setRestorePassword(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && canRestore && handleRestore()} className="w-full bg-void-800 border border-void-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:border-accent outline-none mb-4" />
+                {restoreMethod === 'mnemonic' && !legacyMode && <>
+                  <label htmlFor="restore-bip39-passphrase" className="block text-xs text-gray-400 mb-1">BIP39 passphrase (optional)</label>
+                  <input id="restore-bip39-passphrase" type="password" autoComplete="off" value={restorePassphrase} onChange={(e) => setRestorePassphrase(e.target.value)} className="w-full bg-void-800 border border-void-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:border-accent outline-none mb-2" />
+                  <p className="text-warning text-xs mb-3">This is separate from your wallet password. Every passphrase creates a different wallet; an incorrect passphrase cannot be detected.</p>
+                  <fieldset className="text-xs text-gray-300 mb-3">
+                    <legend className="mb-1">Passphrase derivation</legend>
+                    <label className="block"><input type="radio" name="restore-derivation" checked={restoreDerivationMode === 'standard_bip39'} onChange={() => setRestoreDerivationMode('standard_bip39')} /> Standard BIP39 (recommended)</label>
+                    <label className="block"><input type="radio" name="restore-derivation" checked={restoreDerivationMode === 'historical_mc'} onChange={() => setRestoreDerivationMode('historical_mc')} /> Historical MC Unicode derivation</label>
+                    <p className="text-warning mt-1">Unicode passphrases can produce different wallets and addresses in these modes. Choose the original derivation.</p>
+                  </fieldset>
+                </>}
+                <label htmlFor="restore-wallet-password" className="block text-xs text-gray-400 mb-1">{t.login.restorePasswordLabel}</label>
+                <input id="restore-wallet-password" type="password" value={restorePassword} onChange={(e) => setRestorePassword(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && canRestore && handleRestore()} className="w-full bg-void-800 border border-void-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:border-accent outline-none mb-4" />
                 <button onClick={handleRestore} disabled={loading || migrating || !canRestore} className="w-full bg-accent hover:bg-accent-hover text-white rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
                   {loading || migrating ? (legacyMode ? t.login.legacyMigrating : t.login.restoring) : t.login.restoreButton}
                 </button>
-              </>
+              </fieldset>
             )}
             {error && <div className="text-sm text-danger mt-3">{error}</div>}
           </div>
-          <button onClick={() => { setRestoreMethod(null); setRestoreInput(''); setError(null); setLegacyMode(false); setMode(selectedWallet ? 'login' : 'create'); }} className="w-full text-center text-xs text-gray-400 hover:text-gray-100 mt-4 transition-colors">
+          <button disabled={loading || migrating} onClick={() => { setRestoreMethod(null); setRestoreInput(''); setRestorePassphrase(''); setRestoreDerivationMode('standard_bip39'); setError(null); setLegacyMode(false); setMode(selectedWallet ? 'login' : 'create'); }} className="w-full text-center text-xs text-gray-400 hover:text-gray-100 mt-4 transition-colors">
             {t.login.restoreCancel}
           </button>
         </div>
@@ -487,7 +555,7 @@ export function LoginScreen() {
                 mode === 'login' ? 'bg-void-800 text-accent' : 'text-gray-400 hover:text-gray-100'
               }`}
             >
-              {t.login.unlockWallet}
+              {t.login.existingWallet}
             </button>
             <button
               onClick={() => setMode('create')}
@@ -500,7 +568,7 @@ export function LoginScreen() {
           </div>
 
           {mode === 'login' ? (
-            <>
+            <fieldset aria-label={t.login.existingWallet}>
               <p className="text-xs text-gray-400 mb-3">
                 {selectedWallet
                   ? `${t.login.unlockSelected}`
@@ -510,22 +578,26 @@ export function LoginScreen() {
                 <input
                   type="text"
                   value={walletName}
+                  disabled={openedPath !== null}
                   onChange={(e) => setWalletName(e.target.value)}
                   placeholder={t.login.walletName}
                   className="w-full bg-void-800 border border-void-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:border-accent outline-none mb-3"
                   autoFocus
                 />
               )}
+              <label htmlFor="login-wallet-password" className="block text-xs text-gray-400 mb-1">{t.login.walletPassword}</label>
               <input
+                id="login-wallet-password"
                 type="password"
                 value={walletPassword}
                 onChange={(e) => setWalletPasswordState(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && hasToken && walletPassword.length >= 4 && !totpRequired && handleLogin()}
+                onKeyDown={(e) => e.key === 'Enter' && !recoveryMode && hasToken && walletPassword.length >= 4 && !totpRequired && handleLogin()}
                 placeholder={t.login.walletPassword}
                 className="w-full bg-void-800 border border-void-700 rounded-lg px-3 py-2 text-sm text-gray-100 focus:border-accent outline-none mb-3"
                 autoFocus={!!selectedWallet}
               />
-              {totpRequired && (
+              {recoveryMode && <><p className="text-xs text-warning mb-2">Recovery disables 2FA and invalidates all recovery codes. The wallet remains locked. Enter the code exactly as shown, including case and hyphens.</p><input type="text" autoCapitalize="none" autoCorrect="off" spellCheck={false} value={recoveryCode} onChange={e => setRecoveryCode(e.target.value)} placeholder="Recovery code" className="w-full bg-void-800 border border-void-700 rounded-lg px-3 py-2 text-sm text-gray-100 mb-3" /><button disabled={loading || !walletPassword || !recoveryCode} onClick={handleRecovery}>Recover 2FA access</button></>}
+              {totpRequired && !recoveryMode && (
                 <div className="mb-3 p-3 bg-void-950 border border-warning/30 rounded-lg">
                   <div className="text-xs text-warning mb-2">
                     {t.login.totpRequired}
@@ -534,7 +606,7 @@ export function LoginScreen() {
                     type="text"
                     value={totpCode}
                     onChange={(e) => setTotpCode(e.target.value)}
-                    onKeyDown={(e) => e.key === 'Enter' && totpCode.length === 6 && handleLogin()}
+                    onKeyDown={(e) => e.key === 'Enter' && !recoveryMode && totpCode.length === 6 && handleLogin()}
                     placeholder={t.login.totpPlaceholder}
                     maxLength={6}
                     className="w-full bg-void-800 border border-void-700 rounded-lg px-3 py-2 text-sm text-gray-100 font-mono text-center focus:border-accent outline-none"
@@ -544,12 +616,13 @@ export function LoginScreen() {
               )}
               <button
                 onClick={handleLogin}
-                disabled={loading || !hasToken || (walletPassword.length < 4) || (totpRequired && totpCode.length !== 6)}
+                disabled={loading || recoveryMode || !hasToken || (walletPassword.length < 4) || (totpRequired && totpCode.length !== 6)}
                 className="w-full bg-accent hover:bg-accent-hover text-white rounded-lg px-4 py-2 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 {loading ? t.login.unlocking : totpRequired ? t.login.unlock2fa : t.login.unlockWallet}
               </button>
-            </>
+              <button type="button" onClick={() => { setRecoveryMode(!recoveryMode); setRecoveryCode(''); setError(null); }} className="mt-3 text-sm text-accent">{recoveryMode ? 'Back to unlock' : 'Use a recovery code'}</button>
+            </fieldset>
           ) : (
             <>
               <p className="text-xs text-gray-400 mb-3">
@@ -588,6 +661,7 @@ export function LoginScreen() {
             {t.login.restoreWallet}
           </button>
 
+          {recoveryNotice && <div className="text-sm text-success mt-3">{recoveryNotice}</div>}
           {error && <div className="text-sm text-danger mt-3">{error}</div>}
         </div>
 

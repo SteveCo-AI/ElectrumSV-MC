@@ -1,7 +1,7 @@
 // Receive view — address list with QR codes, Payment Requests (Phase 5)
 // QR code generated via PicQr Rust backend (replaces qrcode npm package).
 // BIP276 bitcoin-script:// URI parser added (Phase 6).
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { api } from '../api';
 import { useStore } from '../store';
 
@@ -34,7 +34,14 @@ function networkName(byte: number | null): string {
 }
 
 export function ReceiveView() {
-  const { activeAccountId, setError } = useStore();
+  const { activeAccountId, activeWalletPath, walletInstanceToken, setError } = useStore();
+  const context = useRef({ wallet: activeWalletPath, token: walletInstanceToken, account: activeAccountId, generation: 0 });
+  if (context.current.wallet !== activeWalletPath || context.current.token !== walletInstanceToken || context.current.account !== activeAccountId) {
+    context.current = { wallet: activeWalletPath, token: walletInstanceToken, account: activeAccountId, generation: context.current.generation + 1 };
+  }
+  const qrGeneration = useRef(0);
+  const requestInFlight = useRef(false);
+  const [requestBusy, setRequestBusy] = useState(false);
   const [addresses, setAddresses] = useState<AddressInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [showQR, setShowQR] = useState<string | null>(null);
@@ -51,24 +58,28 @@ export function ReceiveView() {
   const [bip276Busy, setBip276Busy] = useState(false);
   const [bip276ShowQR, setBip276ShowQR] = useState(false);
 
-  const generateQR = useCallback(async (text: string) => {
+  const generateQR = useCallback(async (text: string, generation = context.current.generation) => {
+    const request = ++qrGeneration.current;
     try {
       const result = await api.generateQr(text, {
         scale: 10,
         quietZone: 4,
       });
-      setQrSvg(result.svg);
+      if (context.current.generation === generation && qrGeneration.current === request) setQrSvg(result.svg);
     } catch {
-      setQrSvg(null);
-      setError('QR code generation failed');
+      if (context.current.generation === generation && qrGeneration.current === request) {
+        setQrSvg(null);
+        setError('QR code generation failed');
+      }
     }
   }, [setError]);
 
-  const loadAddress = async () => {
+  const loadAddress = async (generation = context.current.generation) => {
     if (activeAccountId === null) return;
     setLoading(true);
     try {
       const r = await api.getReceiveAddress(activeAccountId);
+      if (context.current.generation !== generation) return;
       const newAddr = { address: r.address || '', key_id: r.keyinstance_id ?? r.key_id ?? null };
       if (newAddr.address && newAddr.address !== 'not_available') {
         setAddresses((prev) => {
@@ -77,22 +88,34 @@ export function ReceiveView() {
         });
       }
     } catch (e: any) {
-      setError(`Receive address: ${e.message}`);
+      if (context.current.generation === generation) setError(`Receive address: ${e.message}`);
     } finally {
-      setLoading(false);
+      if (context.current.generation === generation) setLoading(false);
     }
   };
 
   useEffect(() => {
+    const generation = context.current.generation;
     setAddresses([]);
     setPaymentUri(null);
+    setShowQR(null);
+    setQrSvg(null);
+    setEditingLabel(null);
+    setBip276Result(null);
+    setBip276ShowQR(false);
+    setBip276Busy(false);
+    requestInFlight.current = false;
+    setRequestBusy(false);
     if (activeAccountId === null) return;
     setLoading(true);
     api.listReceiveAddresses(activeAccountId).then((items) => {
+      if (context.current.generation !== generation) return;
       if (items.length) setAddresses(items.map((item) => ({ address: item.address, key_id: item.keyinstance_id })));
-      else return loadAddress();
-    }).catch((e) => setError(`Receive addresses: ${String(e)}`)).finally(() => setLoading(false));
-  }, [activeAccountId]);
+      else return loadAddress(generation);
+    }).catch((e) => { if (context.current.generation === generation) setError(`Receive addresses: ${String(e)}`); })
+      .finally(() => { if (context.current.generation === generation) setLoading(false); });
+    return () => { if (context.current.generation === generation) context.current.generation++; };
+  }, [activeAccountId, activeWalletPath, walletInstanceToken]);
 
   const handleNewAddress = async () => {
     await loadAddress();
@@ -101,6 +124,7 @@ export function ReceiveView() {
   const handleShowQR = async (addr: string) => {
     setShowQR(addr);
     setPaymentUri(null);
+    setQrSvg(null);
     await generateQR(addr);
   };
 
@@ -111,45 +135,59 @@ export function ReceiveView() {
   };
 
   const handlePaymentRequest = async () => {
-    if (activeAccountId === null || !addresses.length) return;
-    const amount = parseInt(paymentAmount) || 0;
+    if (activeAccountId === null || !addresses.length || requestInFlight.current) return;
+    const generation = context.current.generation;
+    const amount = paymentAmount === '' ? null : Number(paymentAmount);
+    if (amount !== null && (!/^[1-9]\d*$/.test(paymentAmount) || !Number.isSafeInteger(amount))) {
+      setError('Enter a positive whole number of satoshis.');
+      return;
+    }
+    requestInFlight.current = true;
+    setRequestBusy(true);
     try {
       const r = await api.createPaymentRequest(activeAccountId, amount, paymentLabel || undefined);
+      if (context.current.generation !== generation) return;
       setPaymentUri(r.uri);
       setShowQR(null);
-      await generateQR(r.uri);
+      await generateQR(r.uri, generation);
     } catch (e: any) {
-      setError(`Payment request: ${e.message}`);
+      if (context.current.generation === generation) setError(`Payment request: ${e.message}`);
+    } finally {
+      if (context.current.generation === generation) { requestInFlight.current = false; setRequestBusy(false); }
     }
   };
 
   const handleSaveLabel = async (keyId: number, idx: number) => {
+    const generation = context.current.generation;
     try {
       await api.setKeyLabel(keyId, labelInput, activeAccountId!);
+      if (context.current.generation !== generation) return;
       setAddresses((prev) => prev.map((a, i) => i === idx ? { ...a, label: labelInput } : a));
     } catch (e: any) {
-      setError(`Label: ${e.message}`);
+      if (context.current.generation === generation) setError(`Label: ${e.message}`);
     }
-    setEditingLabel(null);
+    if (context.current.generation === generation) setEditingLabel(null);
   };
 
   // Parse a bitcoin-script:// BIP276 URI via the Rust backend.
   const handleParseBip276 = async () => {
     const uri = bip276Input.trim();
     if (!uri) return;
+    const generation = context.current.generation;
+    qrGeneration.current++;
     setBip276Busy(true);
     setBip276ShowQR(false);
     setQrSvg(null);
     try {
       const r = await api.parseBip276Uri(uri) as Bip276Result;
-      setBip276Result(r);
+      if (context.current.generation === generation) setBip276Result(r);
     } catch (e: any) {
-      setBip276Result({
+      if (context.current.generation === generation) setBip276Result({
         valid: false, prefix: null, version: null, network: null,
         data_hex: null, error: e?.message ?? 'parse failed',
       });
     } finally {
-      setBip276Busy(false);
+      if (context.current.generation === generation) setBip276Busy(false);
     }
   };
 
@@ -179,7 +217,9 @@ export function ReceiveView() {
         <div className="text-sm text-gray-400 mb-2">Payment Request (BIP21)</div>
         <div className="flex gap-2 mb-2">
           <input
-            type="number"
+            type="text"
+            inputMode="numeric"
+            disabled={requestBusy}
             value={paymentAmount}
             onChange={(e) => setPaymentAmount(e.target.value)}
             placeholder="Amount (satoshis)"
@@ -187,6 +227,7 @@ export function ReceiveView() {
           />
           <input
             type="text"
+            disabled={requestBusy}
             value={paymentLabel}
             onChange={(e) => setPaymentLabel(e.target.value)}
             placeholder="Label (optional)"
@@ -194,6 +235,7 @@ export function ReceiveView() {
           />
           <button
             onClick={handlePaymentRequest}
+            disabled={requestBusy}
             className="bg-accent hover:bg-accent-hover text-white rounded-lg px-4 py-2 text-sm font-medium transition-colors"
           >
             Request
@@ -278,7 +320,7 @@ export function ReceiveView() {
                   </button>
                   {showQR === addrInfo.address && (
                     <button
-                      onClick={() => { setShowQR(null); setQrSvg(null); setPaymentUri(null); }}
+                      onClick={() => { qrGeneration.current++; setShowQR(null); setQrSvg(null); setPaymentUri(null); }}
                       className="bg-void-700 hover:bg-void-600 text-gray-100 rounded-lg px-3 py-1.5 text-xs transition-colors"
                     >
                       Hide QR
@@ -336,7 +378,7 @@ export function ReceiveView() {
                   </button>
                   {bip276ShowQR && (
                     <button
-                      onClick={() => { setBip276ShowQR(false); setQrSvg(null); }}
+                      onClick={() => { qrGeneration.current++; setBip276ShowQR(false); setQrSvg(null); }}
                       className="bg-void-700 hover:bg-void-600 text-gray-100 rounded-lg px-3 py-1.5 text-xs transition-colors"
                     >
                       Hide QR

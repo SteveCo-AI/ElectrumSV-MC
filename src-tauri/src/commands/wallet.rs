@@ -40,6 +40,15 @@ pub async fn create_wallet(
     .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn restore_bip39_wallet(
+    state: State<'_, AppState>, name: String, password: String, mnemonic: String,
+    passphrase: String, mode: wallet_service::Bip39RestoreMode,
+) -> Result<wallet_service::CreateWalletResult, String> {
+    wallet_service::restore_bip39_wallet(&state, &name, &password, &mnemonic, &passphrase, mode)
+        .await.map_err(|e| e.to_string())
+}
+
 /// Open an existing wallet from disk.
 ///
 /// The wallet is opened in locked state. Call unlock_wallet to decrypt keys.
@@ -82,6 +91,16 @@ pub fn get_wallet_status(state: State<'_, AppState>) -> wallet_service::WalletSt
     wallet_service::get_wallet_status(&state)
 }
 
+#[tauri::command]
+pub async fn preview_migration(state: State<'_, AppState>, password: String, totp_code: Option<String>) -> Result<crate::services::wallet_migration::MigrationPreview, crate::services::wallet_migration::MigrationError> {
+    crate::services::wallet_migration::preview_migration(&state, &password, totp_code.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn migrate_wallet(state: State<'_, AppState>, password: String, totp_code: Option<String>, backup_path: String, confirmation_token: String) -> Result<crate::services::wallet_migration::MigrationSuccess, crate::services::wallet_migration::MigrationError> {
+    crate::services::wallet_migration::migrate_wallet(&state, &password, totp_code.as_deref(), &backup_path, &confirmation_token).await
+}
+
 // ============================================================================
 // TOTP commands (Milestone 5)
 // ============================================================================
@@ -106,6 +125,9 @@ pub async fn enable_totp(state: State<'_, AppState>, password: String) -> Result
 
 pub async fn enable_totp_inner(state: &AppState, password: String) -> Result<EnableTotpResult, String> {
     let _wallet_guard = state.wallet_operation.lock().await;
+    if crate::services::wallet_security::status_locked(state, &_wallet_guard)?.is_some() {
+        return Err("use begin_totp_setup and confirm_totp_setup for this wallet".into());
+    }
     log::info!("enable_totp");
 
     let (pool, _, wallet_name, _) = {
@@ -140,6 +162,7 @@ pub async fn enable_totp_inner(state: &AppState, password: String) -> Result<Ena
     repositories::store_totp_secret(&pool, totp.secret_bytes())
         .await
         .map_err(|e| e.to_string())?;
+    crate::services::wallet_security::invalidate_legacy_pending_locked(state, &_wallet_guard);
 
     log::info!("TOTP enabled for wallet '{}'", wallet_name);
 
@@ -149,9 +172,45 @@ pub async fn enable_totp_inner(state: &AppState, password: String) -> Result<Ena
     })
 }
 
+#[tauri::command]
+pub async fn begin_totp_setup(state: State<'_, AppState>, password: String) -> Result<EnableTotpResult, String> {
+    begin_totp_setup_inner(&state, &password).await
+}
+pub(crate) async fn begin_totp_setup_inner(state: &AppState, password: &str) -> Result<EnableTotpResult, String> {
+    let guard = state.wallet_operation.lock().await;
+    crate::services::wallet_security::begin_totp_locked(state, &guard, password).await?.ok_or("use legacy TOTP setup for this wallet".into())
+}
+#[tauri::command]
+pub async fn confirm_totp_setup(state: State<'_, AppState>, password: String, code: String) -> Result<(), String> {
+    confirm_totp_setup_inner(&state, &password, &code).await
+}
+pub(crate) async fn confirm_totp_setup_inner(state: &AppState, password: &str, code: &str) -> Result<(), String> {
+    let guard = state.wallet_operation.lock().await;
+    crate::services::wallet_security::confirm_totp_locked(state, &guard, password, code).await?.ok_or("TOTP setup is not pending".into())
+}
+#[tauri::command]
+pub async fn cancel_totp_setup(state: State<'_, AppState>) -> Result<(), String> { cancel_totp_setup_inner(&state).await }
+pub(crate) async fn cancel_totp_setup_inner(state: &AppState) -> Result<(), String> {
+    let guard = state.wallet_operation.lock().await;
+    crate::services::wallet_security::cancel_totp_locked(state, &guard)?.ok_or("TOTP setup is not pending".into())
+}
+#[tauri::command]
+pub async fn recover_totp(state: State<'_, AppState>, password: String, recovery_code: String) -> Result<(), String> {
+    recover_totp_inner(&state, &password, &recovery_code).await
+}
+pub(crate) async fn recover_totp_inner(state: &AppState, password: &str, recovery_code: &str) -> Result<(), String> {
+    let guard = state.wallet_operation.lock().await;
+    crate::services::wallet_security::recover_totp_locked(state, &guard, password, recovery_code).await?.ok_or("use legacy recovery for this wallet".into())
+}
+
 /// Disable TOTP for the current wallet.
 #[tauri::command]
 pub async fn disable_totp(state: State<'_, AppState>, password: String, code: String) -> Result<(), String> {
+    disable_totp_inner(&state, password, code).await
+}
+pub(crate) async fn disable_totp_inner(state: &AppState, password: String, code: String) -> Result<(), String> {
+    let _operation = state.wallet_operation.lock().await;
+    if crate::services::wallet_security::disable_totp_locked(&state, &_operation, &password, &code).await?.is_some() { return Ok(()); }
     log::info!("disable_totp");
 
     let (pool, _) = {
@@ -163,10 +222,27 @@ pub async fn disable_totp(state: State<'_, AppState>, password: String, code: St
 
     if !repositories::is_totp_enabled(&pool).await.map_err(|e| e.to_string())? { return Err("TOTP is not enabled".into()); }
     require_totp(&pool, Some(&code)).await?;
-    repositories::delete_recovery_codes(&pool).await.map_err(|e| e.to_string())?;
-    repositories::delete_totp_secret(&pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    crate::services::wallet_security::invalidate_legacy_pending_locked(state, &_operation);
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    let now = chrono::Utc::now().timestamp();
+    sqlx::query("INSERT INTO WalletData(key,value,date_created,date_updated) VALUES('totp_recovery_codes','[]',?,?) ON CONFLICT(key) DO UPDATE SET value='[]',date_updated=excluded.date_updated")
+        .bind(now).bind(now).execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    let mut barrier = state.active_wallet.lock().unwrap().as_mut().and_then(|a| a.commit_barrier.take());
+    #[cfg(test)]
+    if barrier.as_ref().is_some_and(|b| !b.after_commit) { let b = barrier.take().unwrap(); let _ = b.started.send(()); let _ = b.resume.await; }
+    let deleted = sqlx::query("DELETE FROM TotpSecrets WHERE id=1").execute(&mut *tx).await.map_err(|e| e.to_string())?;
+    if deleted.rows_affected() != 1 { return Err("TOTP state changed".into()); }
+    // A failed or cancelled COMMIT can leave its outcome unknown; do not retain an unlocked session.
+    let mut prior_session = {
+        let mut active = state.active_wallet.lock().unwrap();
+        let active = active.as_mut().ok_or("wallet changed")?;
+        zeroize::Zeroizing::new(active.decrypted_xprv.take())
+    };
+    tx.commit().await.map_err(|_| "TOTP update outcome unknown; reopen wallet".to_string())?;
+    #[cfg(test)]
+    if let Some(b) = barrier.take() { let _ = b.started.send(()); let _ = b.resume.await; }
+    if let Some(active) = state.active_wallet.lock().unwrap().as_mut() { active.decrypted_xprv = prior_session.take(); }
 
     log::info!("TOTP disabled");
     Ok(())
@@ -180,6 +256,7 @@ pub async fn verify_totp(state: State<'_, AppState>, code: String) -> Result<boo
 
 pub async fn verify_totp_inner(state: &AppState, code: String) -> Result<bool, String> {
     let _wallet_guard = state.wallet_operation.lock().await;
+    if crate::services::wallet_security::verify_sign_totp_locked(state, &_wallet_guard, &code)?.is_some() { return Ok(true); }
     log::info!("verify_totp");
 
     let (pool, _, wallet_name) = {
@@ -210,12 +287,13 @@ pub async fn verify_totp_inner(state: &AppState, code: String) -> Result<bool, S
 
 /// Check if TOTP is enabled for the current wallet.
 #[tauri::command]
-pub async fn is_totp_enabled_cmd(state: State<'_, AppState>) -> Result<bool, String> {
+pub async fn is_totp_enabled_cmd(state: State<'_, AppState>) -> Result<Option<bool>, String> {
     is_totp_enabled_inner(&state).await
 }
 
-pub async fn is_totp_enabled_inner(state: &AppState) -> Result<bool, String> {
+pub async fn is_totp_enabled_inner(state: &AppState) -> Result<Option<bool>, String> {
     let _wallet_guard = state.wallet_operation.lock().await;
+    if let Some(status) = crate::services::wallet_security::status_locked(state, &_wallet_guard)? { return Ok(status); }
     let (pool, _) = {
         let guard = state.active_wallet.lock().unwrap();
         let active = guard.as_ref().ok_or("no wallet is currently open")?;
@@ -224,7 +302,7 @@ pub async fn is_totp_enabled_inner(state: &AppState) -> Result<bool, String> {
 
     repositories::is_totp_enabled(&pool)
         .await
-        .map_err(|e| e.to_string())
+        .map(Some).map_err(|e| e.to_string())
 }
 
 // ============================================================================
@@ -240,6 +318,20 @@ pub async fn is_totp_enabled_inner(state: &AppState) -> Result<bool, String> {
 pub async fn generate_totp_recovery_codes(
     state: State<'_, AppState>, password: String, code: String,
 ) -> Result<Vec<String>, String> {
+    generate_totp_recovery_codes_inner(&state, password, code).await
+}
+pub(crate) async fn generate_totp_recovery_codes_inner(state: &AppState, password: String, code: String) -> Result<Vec<String>, String> {
+    generate_totp_recovery_codes_with(state, password, code, || crate::security::totp::generate_recovery_codes(10)).await
+}
+async fn generate_totp_recovery_codes_with(state: &AppState, password: String, code: String, generate: impl FnOnce() -> Result<Vec<String>, crate::security::totp::TotpError> + Send) -> Result<Vec<String>, String> {
+    let _operation = state.wallet_operation.lock().await;
+    let secure = {
+        let active = state.active_wallet.lock().unwrap();
+        active.as_ref().ok_or("no wallet is currently open")?.secure_wallet.is_some()
+    };
+    if secure {
+        return crate::services::wallet_security::generate_recovery_codes_locked_with(state, &_operation, &password, &code, generate).await?.ok_or("wallet changed".into());
+    }
     log::info!("generate_totp_recovery_codes");
 
     let pool = {
@@ -253,7 +345,7 @@ pub async fn generate_totp_recovery_codes(
     require_totp(&pool, Some(&code)).await?;
 
     // Generate 10 random recovery codes
-    let codes = crate::security::totp::generate_recovery_codes(10);
+    let codes = zeroize::Zeroizing::new(generate().map_err(|_| "recovery code generation failed")?);
 
     // Hash each code and store the hashes
     let hashed_codes: Vec<String> = codes
@@ -261,12 +353,18 @@ pub async fn generate_totp_recovery_codes(
         .map(|c| crate::security::totp::hash_recovery_code(c))
         .collect();
 
+    #[cfg(test)]
+    let mut barrier = state.active_wallet.lock().unwrap().as_mut().and_then(|a| a.commit_barrier.take());
+    #[cfg(test)]
+    if barrier.as_ref().is_some_and(|b| !b.after_commit) { let b = barrier.take().unwrap(); let _ = b.started.send(()); let _ = b.resume.await; }
     repositories::store_recovery_codes(&pool, &hashed_codes)
         .await
         .map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    if let Some(b) = barrier.take() { let _ = b.started.send(()); let _ = b.resume.await; }
 
     log::info!("Generated {} TOTP recovery codes", codes.len());
-    Ok(codes)
+    Ok(codes.to_vec())
 }
 
 /// Recover access using a recovery code.
@@ -279,16 +377,14 @@ pub async fn totp_recover(
     state: State<'_, AppState>,
     recovery_code: String,
 ) -> Result<bool, String> {
+    totp_recover_inner(&state, &recovery_code).await
+}
+pub(crate) async fn totp_recover_inner(state: &AppState, recovery_code: &str) -> Result<bool, String> {
+    let _operation = state.wallet_operation.lock().await;
+    if crate::services::wallet_security::status_locked(state, &_operation)?.is_some() { return Err("password required for secure recovery".into()); }
     log::info!("totp_recover");
 
-    let pool = {
-        let guard = state.active_wallet.lock().unwrap();
-        let active = guard.as_ref().ok_or("no wallet is currently open")?;
-        active.db_pool.clone()
-    };
-
-    let code_hash = crate::security::totp::hash_recovery_code(&recovery_code);
-    repositories::recover_totp_atomically(&pool, &code_hash).await.map_err(|e| e.to_string())
+    crate::services::wallet_security::legacy_recover_code_locked(state, &_operation, recovery_code).await
 }
 
 // ============================================================================
@@ -382,6 +478,10 @@ pub async fn export_seed(
     password: String,
     totp_code: Option<String>,
 ) -> Result<ExportSeedResult, String> {
+    let operation = state.wallet_operation.lock().await;
+    if let Some(auth) = crate::services::wallet_security::authenticate_locked(&state, &operation, &password, totp_code.as_deref(), true).await? {
+        return Ok(ExportSeedResult { has_seed: true, mnemonic: Some(auth.mnemonic().to_string()) });
+    }
     log::info!("export_seed");
 
     let (keystore_data, pool) = {
@@ -444,14 +544,22 @@ pub async fn change_password(
     state: State<'_, AppState>,
     old_password: String,
     new_password: String,
+    totp_code: Option<String>,
 ) -> Result<(), String> {
-    change_password_impl(&state, &old_password, &new_password).await
+    change_password_authorized(&state, &old_password, &new_password, totp_code.as_deref()).await
 }
 
 pub(crate) async fn change_password_impl(state: &AppState, old_password: &str, new_password: &str) -> Result<(), String> {
+    change_password_authorized(state, old_password, new_password, None).await
+}
+
+pub(crate) async fn change_password_authorized(state: &AppState, old_password: &str, new_password: &str, code: Option<&str>) -> Result<(), String> {
     let _operation = state.wallet_operation.lock().await;
     log::info!("change_password");
     if new_password.is_empty() { return Err("new password must not be empty".into()); }
+    if let Some(auth) = crate::services::wallet_security::authenticate_locked(state, &_operation, old_password, code, true).await? {
+        return crate::services::wallet_security::rotate_password_locked(state, &_operation, auth, new_password).await;
+    }
 
     let (pool, keystore_data) = {
         let guard = state.active_wallet.lock().unwrap();
@@ -539,6 +647,8 @@ pub(crate) async fn change_password_impl(state: &AppState, old_password: &str, n
     let mut guard = state.active_wallet.lock().unwrap();
     let active = guard.as_mut().expect("wallet operation guard keeps active wallet stable");
     active.keystore_data = new_keystore_data;
+    drop(guard);
+    crate::services::wallet_security::invalidate_legacy_pending_locked(state, &_operation);
 
     log::info!("Password changed successfully");
     Ok(())
@@ -553,19 +663,25 @@ pub async fn delete_wallet(
     state: State<'_, AppState>,
     wallet_path: String,
     password: String,
+    totp_code: Option<String>,
 ) -> Result<(), String> {
-    delete_wallet_impl(&state, &wallet_path, &password).await
+    delete_wallet_authorized(&state, &wallet_path, &password, totp_code.as_deref()).await
 }
 
 async fn delete_wallet_impl(state: &AppState, wallet_path: &str, password: &str) -> Result<(), String> {
+    delete_wallet_authorized(state, wallet_path, password, None).await
+}
+async fn delete_wallet_authorized(state: &AppState, wallet_path: &str, password: &str, code: Option<&str>) -> Result<(), String> {
     let _operation = state.wallet_operation.lock().await;
     log::info!("delete_wallet — path: {}", wallet_path);
+
+    let secure = crate::services::wallet_security::authenticate_locked(state, &_operation, password, code, true).await?;
 
     let pool = {
         let guard = state.active_wallet.lock().map_err(|_| "wallet state unavailable")?;
         let active = guard.as_ref().ok_or("open this wallet before deleting it")?;
         if active.wallet_path != wallet_path { return Err("wallet is not the active wallet".into()); }
-        if !keystore::verify_password(&active.keystore_data, &password) { return Err("incorrect password".into()); }
+        if secure.is_none() && !keystore::verify_password(&active.keystore_data, &password) { return Err("incorrect password".into()); }
         active.db_pool.clone()
     };
 
@@ -629,6 +745,8 @@ pub async fn export_privkey(
     all: Option<bool>,
     totp_code: Option<String>,
 ) -> Result<ExportPrivkeyResult, String> {
+    let operation = state.wallet_operation.lock().await;
+    let secure = crate::services::wallet_security::authenticate_locked(&state, &operation, &password, totp_code.as_deref(), true).await?;
     log::info!(
         "export_privkey — address: {:?}, all: {:?}",
         address,
@@ -647,12 +765,12 @@ pub async fn export_privkey(
     };
 
     // Verify password
-    if !keystore::verify_password(&keystore_data, &password) {
+    if secure.is_none() && !keystore::verify_password(&keystore_data, &password) {
         return Err("incorrect password".to_string());
     }
 
     // If TOTP is enabled, verify the TOTP code before revealing private keys
-    let totp_enabled = repositories::is_totp_enabled(&pool)
+    let totp_enabled = secure.is_none() && repositories::is_totp_enabled(&pool)
         .await
         .map_err(|e| e.to_string())?;
     if totp_enabled {
@@ -818,6 +936,8 @@ pub async fn sign_message(
     password: String,
     totp_code: Option<String>,
 ) -> Result<SignMessageResult, String> {
+    let operation = state.wallet_operation.lock().await;
+    let secure = crate::services::wallet_security::authenticate_locked(&state, &operation, &password, totp_code.as_deref(), true).await?;
     log::info!("sign_message — address: {}", address);
 
     let (pool, account_id, xprv_opt, keystore_data) = {
@@ -832,11 +952,11 @@ pub async fn sign_message(
     };
 
     // Verify password
-    if !keystore::verify_password(&keystore_data, &password) {
+    if secure.is_none() && !keystore::verify_password(&keystore_data, &password) {
         return Err("incorrect password".to_string());
     }
 
-    require_totp(&pool, totp_code.as_deref()).await?;
+    if secure.is_none() { require_totp(&pool, totp_code.as_deref()).await?; }
 
     // Need unlocked wallet for key derivation
     let xprv_str = xprv_opt.ok_or("wallet is locked — unlock first")?;
@@ -1101,7 +1221,7 @@ mod tests {
         wallet_service::close_wallet(&state).await.unwrap();
         wallet_service::open_wallet(&state, &wallet_path).await.unwrap();
 
-        assert!(wallet_service::unlock_wallet(&state, "pw123").is_ok());
+        assert!(wallet_service::unlock_wallet_authorized(&state, "pw123", None).await.is_ok());
         let status = wallet_service::get_wallet_status(&state);
         assert!(status.is_unlocked);
 
@@ -1119,8 +1239,7 @@ mod tests {
         wallet_service::close_wallet(&state).await.unwrap();
         wallet_service::open_wallet(&state, &wallet_path).await.unwrap();
 
-        let err = wallet_service::unlock_wallet(&state, "wrong_pw").unwrap_err();
-        assert!(matches!(err, wallet_service::WalletError::WrongPassword));
+        assert!(wallet_service::unlock_wallet_authorized(&state, "wrong_pw", None).await.is_err());
 
         let status = wallet_service::get_wallet_status(&state);
         assert!(!status.is_unlocked);
@@ -1228,6 +1347,231 @@ mod tests {
     // --------------------------------------------------------------------
 
     #[tokio::test]
+    async fn legacy_disable_failure_preserves_totp_and_recovery_codes() {
+        let state = make_test_state("legacy_disable_atomic");
+        wallet_service::create_legacy_fixture(&state, "legacy", "pw", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None).await.unwrap();
+        let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+        let secret = [7u8;20]; repositories::store_totp_secret(&pool, &secret).await.unwrap();
+        let codes = vec![crate::security::totp::hash_recovery_code("ABCD-EFGH")];
+        repositories::store_recovery_codes(&pool, &codes).await.unwrap();
+        sqlx::query("CREATE TRIGGER reject_legacy_totp_delete BEFORE DELETE ON TotpSecrets BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END").execute(&pool).await.unwrap();
+        let totp = crate::security::totp::TotpInstance::from_secret_bytes(&secret, "ElectrumSV-Mc", "wallet").unwrap();
+        assert!(disable_totp_inner(&state, "pw".into(), totp.generate_current().unwrap()).await.is_err());
+        assert!(repositories::is_totp_enabled(&pool).await.unwrap());
+        assert_eq!(repositories::load_recovery_codes(&pool).await.unwrap(), codes);
+        wallet_service::close_wallet(&state).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_cancellation_locks_session_and_reopens_actual_state() {
+        for after_commit in [false, true] {
+            let state = std::sync::Arc::new(make_test_state(&format!("legacy_recovery_cancel_{after_commit}")));
+            wallet_service::create_legacy_fixture(&state, "legacy", "pw", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None).await.unwrap();
+            let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+            repositories::store_totp_secret(&pool, &[7;20]).await.unwrap();
+            repositories::store_recovery_codes(&pool, &[crate::security::totp::hash_recovery_code("ABCD-EFGH")]).await.unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel(); let (_resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            state.active_wallet.lock().unwrap().as_mut().unwrap().commit_barrier = Some(crate::state::TestCommitBarrier { after_commit, started: started_tx, resume: resume_rx });
+            let worker = state.clone(); let task = tokio::spawn(async move { recover_totp_inner(&worker, "pw", "ABCD-EFGH").await });
+            tokio::time::timeout(std::time::Duration::from_secs(20),started_rx).await.unwrap().unwrap();
+            assert!(!wallet_service::get_wallet_status(&state).is_unlocked);
+            task.abort(); let _ = task.await;
+            wallet_service::close_wallet(&state).await.unwrap(); wallet_service::open_wallet(&state, "legacy").await.unwrap();
+            let current = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+            assert_eq!(repositories::is_totp_enabled(&current).await.unwrap(), !after_commit);
+            assert_eq!(!repositories::load_recovery_codes(&current).await.unwrap().is_empty(), !after_commit);
+            wallet_service::close_wallet(&state).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_disable_cancellation_preserves_database_atomicity() {
+        for after_commit in [false, true] {
+            let state = std::sync::Arc::new(make_test_state(&format!("legacy_disable_cancel_{after_commit}")));
+            wallet_service::create_legacy_fixture(&state, "legacy", "pw", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None).await.unwrap();
+            let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+            let secret = [7u8;20]; repositories::store_totp_secret(&pool, &secret).await.unwrap();
+            repositories::store_recovery_codes(&pool, &[crate::security::totp::hash_recovery_code("ABCD-EFGH")]).await.unwrap();
+            let code = crate::security::totp::TotpInstance::from_secret_bytes(&secret,"ElectrumSV-Mc","wallet").unwrap().generate_current().unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel(); let (_resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            state.active_wallet.lock().unwrap().as_mut().unwrap().commit_barrier = Some(crate::state::TestCommitBarrier { after_commit, started: started_tx, resume: resume_rx });
+            let worker = state.clone(); let task = tokio::spawn(async move { disable_totp_inner(&worker,"pw".into(),code).await });
+            tokio::time::timeout(std::time::Duration::from_secs(20),started_rx).await.unwrap().unwrap();
+            assert_eq!(wallet_service::get_wallet_status(&state).is_unlocked, !after_commit);
+            task.abort(); let _ = task.await;
+            wallet_service::close_wallet(&state).await.unwrap(); wallet_service::open_wallet(&state, "legacy").await.unwrap();
+            let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+            assert_eq!(repositories::is_totp_enabled(&pool).await.unwrap(), !after_commit);
+            assert_eq!(!repositories::load_recovery_codes(&pool).await.unwrap().is_empty(), !after_commit);
+            wallet_service::close_wallet(&state).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess recovery crash harness"]
+    async fn recovery_crash_child_harness() {
+        use std::io::Write;
+        let mut state = AppState::new(); state.data_dir = std::env::var("WALLET_P2_CRASH_DIR").unwrap();
+        let state = std::sync::Arc::new(state);
+        let legacy = std::env::var("WALLET_P2_CRASH_FORMAT").unwrap() == "33";
+        let after_commit = std::env::var("WALLET_P2_CRASH_PHASE").unwrap() == "after";
+        let action = std::env::var("WALLET_P2_CRASH_ACTION").unwrap();
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        if legacy { wallet_service::create_legacy_fixture(&state, "legacy", "pw", phrase, None).await.unwrap(); }
+        else { wallet_service::create_wallet(&state, "legacy", "pw", Some(phrase), None).await.unwrap(); }
+        let setup = begin_totp_setup_inner(&state, "pw").await.unwrap();
+        let secret = totp_rs::Secret::Encoded(setup.secret_base32).to_bytes().unwrap();
+        let totp = crate::security::totp::TotpInstance::from_secret_bytes(&secret, "ElectrumSV-Mc", "wallet").unwrap();
+        confirm_totp_setup_inner(&state, "pw", &totp.generate_current().unwrap()).await.unwrap();
+        generate_totp_recovery_codes_with(&state, "pw".into(), totp.generate_current().unwrap(), || Ok(vec!["ABCD-EFGH".into()])).await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel(); let (_resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        state.active_wallet.lock().unwrap().as_mut().unwrap().commit_barrier = Some(crate::state::TestCommitBarrier { after_commit, started: started_tx, resume: resume_rx });
+        let worker = state.clone(); let code = totp.generate_current().unwrap();
+        let task = tokio::spawn(async move {
+            match action.as_str() {
+                "disable" => disable_totp_inner(&worker, "pw".into(), code).await.map(|_| ()),
+                "recover" => recover_totp_inner(&worker, "pw", "ABCD-EFGH").await,
+                "generate" => generate_totp_recovery_codes_inner(&worker, "pw".into(), code).await.map(|_| ()),
+                _ => panic!("invalid synthetic test action"),
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(90),started_rx).await.unwrap().unwrap();
+        println!("RECOVERY_TEST_READY"); std::io::stdout().flush().unwrap();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn killed_recovery_process_preserves_atomic_code_state() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        for (legacy, action) in [(true,"disable"), (true,"recover"), (false,"recover"), (true,"generate"), (false,"generate")] {
+            for after_commit in [false, true] {
+                let state = make_test_state(&format!("kill_{legacy}_{action}_{after_commit}"));
+                let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--ignored", "--exact", "commands::wallet::tests::recovery_crash_child_harness", "--nocapture"])
+                    .env("WALLET_P2_CRASH_DIR", &state.data_dir).env("WALLET_P2_CRASH_FORMAT", if legacy { "33" } else { "34" })
+                    .env("WALLET_P2_CRASH_PHASE", if after_commit { "after" } else { "before" }).env("WALLET_P2_CRASH_ACTION", action)
+                    .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).kill_on_drop(true).spawn().unwrap();
+                let mut output = BufReader::new(child.stdout.take().unwrap());
+                tokio::time::timeout(std::time::Duration::from_secs(120), async {
+                    loop { let mut line = String::new(); assert!(output.read_line(&mut line).await.unwrap()>0, "child exited before barrier"); if line.contains("RECOVERY_TEST_READY") { break; } }
+                }).await.expect("child did not reach commit barrier");
+                child.kill().await.unwrap(); assert!(!child.wait().await.unwrap().success());
+                wallet_service::open_wallet(&state, "legacy").await.unwrap();
+                let (enabled, old_present, count) = if legacy {
+                    let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+                    let codes = repositories::load_recovery_codes(&pool).await.unwrap();
+                    (repositories::is_totp_enabled(&pool).await.unwrap(), codes.contains(&crate::security::totp::hash_recovery_code("ABCD-EFGH")), codes.len())
+                } else {
+                    let guard = state.wallet_operation.lock().await;
+                    let auth = crate::services::wallet_security::authenticate_locked(&state, &guard, "pw", None, false).await.unwrap().unwrap();
+                    (auth.totp_enabled(), auth.has_recovery_code("ABCD-EFGH"), auth.recovery_count())
+                };
+                let disabled = after_commit && action != "generate";
+                assert_eq!(enabled, !disabled);
+                assert_eq!(old_present, !after_commit);
+                assert_eq!(count, if disabled { 0 } else if after_commit { 10 } else { 1 });
+                assert_eq!(recover_totp_inner(&state, "pw", "ABCD-EFGH").await.is_ok(), !after_commit);
+                if !after_commit { assert!(recover_totp_inner(&state, "pw", "ABCD-EFGH").await.is_err()); }
+                wallet_service::close_wallet(&state).await.unwrap(); std::fs::remove_dir_all(&state.data_dir).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_recovery_and_regeneration_are_serialized_without_lost_updates() {
+        use std::{future::Future, task::Poll};
+        for legacy in [true, false] {
+            for recover_first in [true, false] {
+                let state = make_test_state(&format!("recovery_race_{legacy}_{recover_first}"));
+                let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+                if legacy { wallet_service::create_legacy_fixture(&state, "race", "pw", phrase, None).await.unwrap(); }
+                else { wallet_service::create_wallet(&state, "race", "pw", Some(phrase), None).await.unwrap(); }
+                let setup = begin_totp_setup_inner(&state, "pw").await.unwrap();
+                let secret = totp_rs::Secret::Encoded(setup.secret_base32).to_bytes().unwrap();
+                let totp = crate::security::totp::TotpInstance::from_secret_bytes(&secret, "ElectrumSV-Mc", "wallet").unwrap();
+                confirm_totp_setup_inner(&state, "pw", &totp.generate_current().unwrap()).await.unwrap();
+                let old = "ABCD-EFGH";
+                generate_totp_recovery_codes_with(&state, "pw".into(), totp.generate_current().unwrap(), || Ok(vec![old.to_string()])).await.unwrap();
+                let gate = state.wallet_operation.lock().await;
+                let code = totp.generate_current().unwrap();
+                let mut recover = Box::pin(recover_totp_inner(&state, "pw", old));
+                let mut regenerate = Box::pin(generate_totp_recovery_codes_inner(&state, "pw".into(), code));
+                std::future::poll_fn(|cx| {
+                    if recover_first {
+                        assert!(matches!(recover.as_mut().poll(cx), Poll::Pending));
+                        assert!(matches!(regenerate.as_mut().poll(cx), Poll::Pending));
+                    } else {
+                        assert!(matches!(regenerate.as_mut().poll(cx), Poll::Pending));
+                        assert!(matches!(recover.as_mut().poll(cx), Poll::Pending));
+                    }
+                    Poll::Ready(())
+                }).await;
+                drop(gate);
+                let (recovered, generated) = tokio::time::timeout(
+                    std::time::Duration::from_secs(180), async { tokio::join!(recover, regenerate) },
+                ).await.expect("recovery race timed out");
+                if recover_first {
+                    assert!(recovered.is_ok());
+                    assert!(generated.is_err());
+                } else {
+                    assert!(recovered.is_err());
+                    let codes = generated.unwrap();
+                    assert_eq!(codes.len(), 10);
+                    recover_totp_inner(&state, "pw", &codes[0]).await.unwrap();
+                    assert!(recover_totp_inner(&state, "pw", &codes[0]).await.is_err());
+                }
+                assert!(recover_totp_inner(&state, "pw", old).await.is_err());
+                assert_eq!(is_totp_enabled_inner(&state).await.unwrap(), if legacy { Some(false) } else { None });
+                wallet_service::close_wallet(&state).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_generation_preserves_existing_codes_on_rng_and_sql_failure() {
+        for legacy in [true, false] {
+            let state = make_test_state(if legacy { "recovery_rng_legacy" } else { "recovery_rng_secure" });
+            let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+            if legacy { wallet_service::create_legacy_fixture(&state, "recovery", "pw", phrase, None).await.unwrap(); }
+            else { wallet_service::create_wallet(&state, "recovery", "pw", Some(phrase), None).await.unwrap(); }
+            let setup = begin_totp_setup_inner(&state, "pw").await.unwrap();
+            let secret = totp_rs::Secret::Encoded(setup.secret_base32).to_bytes().unwrap();
+            let totp = crate::security::totp::TotpInstance::from_secret_bytes(&secret, "ElectrumSV-Mc", "wallet").unwrap();
+            confirm_totp_setup_inner(&state, "pw", &totp.generate_current().unwrap()).await.unwrap();
+            let old = "ABCD-EFGH".to_string();
+            let long = "ABCD-EFGH-JKLM-NPQR-STUV-WXYZ-2345-6789".to_string();
+            generate_totp_recovery_codes_with(&state, "pw".into(), totp.generate_current().unwrap(), || Ok(vec![old.clone(), long.clone()])).await.unwrap();
+            let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+            let before_key = repositories::get_first_master_key(&pool).await.unwrap().unwrap().derivation_data;
+            let before_codes = repositories::get_wallet_data(&pool, repositories::TOTP_RECOVERY_CODES_KEY).await.unwrap();
+            let failed = generate_totp_recovery_codes_with(&state, "pw".into(), totp.generate_current().unwrap(), || Err(crate::security::totp::TotpError::RecoveryGeneration)).await;
+            assert!(failed.is_err());
+            assert_eq!(repositories::get_first_master_key(&pool).await.unwrap().unwrap().derivation_data, before_key);
+            assert_eq!(repositories::get_wallet_data(&pool, repositories::TOTP_RECOVERY_CODES_KEY).await.unwrap(), before_codes);
+            let trigger = if legacy { "CREATE TRIGGER recovery_fail BEFORE UPDATE ON WalletData WHEN OLD.key='totp_recovery_codes' BEGIN SELECT RAISE(ABORT,'test'); END" } else { "CREATE TRIGGER recovery_fail BEFORE UPDATE ON MasterKeys BEGIN SELECT RAISE(ABORT,'test'); END" };
+            sqlx::query(trigger).execute(&pool).await.unwrap();
+            assert!(generate_totp_recovery_codes_inner(&state, "pw".into(), totp.generate_current().unwrap()).await.is_err());
+            assert_eq!(repositories::get_first_master_key(&pool).await.unwrap().unwrap().derivation_data, before_key);
+            assert_eq!(repositories::get_wallet_data(&pool, repositories::TOTP_RECOVERY_CODES_KEY).await.unwrap(), before_codes);
+            sqlx::query("DROP TRIGGER recovery_fail").execute(&pool).await.unwrap();
+            assert!(recover_totp_inner(&state, "pw", &old.to_lowercase()).await.is_err());
+            recover_totp_inner(&state, "pw", &old).await.unwrap();
+            assert!(recover_totp_inner(&state, "pw", &old).await.is_err());
+            let setup = begin_totp_setup_inner(&state, "pw").await.unwrap();
+            let secret = totp_rs::Secret::Encoded(setup.secret_base32).to_bytes().unwrap();
+            let totp = crate::security::totp::TotpInstance::from_secret_bytes(&secret, "ElectrumSV-Mc", "wallet").unwrap();
+            confirm_totp_setup_inner(&state, "pw", &totp.generate_current().unwrap()).await.unwrap();
+            let fresh = generate_totp_recovery_codes_inner(&state, "pw".into(), totp.generate_current().unwrap()).await.unwrap();
+            assert_eq!(fresh.len(), 10);
+            assert!(fresh.iter().all(|code| code.len() == 39 && code.split('-').count() == 8));
+            assert!(recover_totp_inner(&state, "pw", &fresh[0].replace('-', "")).await.is_err());
+            recover_totp_inner(&state, "pw", &fresh[0]).await.unwrap();
+            assert!(recover_totp_inner(&state, "pw", &fresh[0]).await.is_err());
+            wallet_service::close_wallet(&state).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn test_recovery_codes_generate_and_consume() {
         let state = make_test_state("recovery_codes");
         wallet_service::create_wallet(&state, "test_recovery", "pw123", None, None)
@@ -1240,13 +1584,13 @@ mod tests {
         };
 
         // Generate 10 recovery codes
-        let codes = crate::security::totp::generate_recovery_codes(10);
+        let codes = crate::security::totp::generate_recovery_codes(10).unwrap();
         assert_eq!(codes.len(), 10);
 
-        // Each code should be in XXXX-XXXX format (9 chars including dash)
+        // Each code contains 32 symbols in eight groups of four.
         for code in &codes {
-            assert_eq!(code.len(), 9);
-            assert!(code.chars().nth(4).unwrap() == '-');
+            assert_eq!(code.len(), 39);
+            assert!(code.split('-').count() == 8 && code.split('-').all(|part| part.len() == 4));
         }
 
         // Hash and store
@@ -1331,7 +1675,7 @@ mod tests {
     async fn test_export_seed_correct_password() {
         let state = make_test_state("export_seed_ok");
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        wallet_service::create_wallet(&state, "test_export", "pw123", Some(mnemonic), None)
+        wallet_service::create_legacy_fixture(&state, "test_export", "pw123", mnemonic, None)
             .await
             .unwrap();
 
@@ -1354,7 +1698,7 @@ mod tests {
     async fn test_export_seed_wrong_password() {
         let state = make_test_state("export_seed_wrong");
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        wallet_service::create_wallet(&state, "test_export_w", "pw123", Some(mnemonic), None)
+        wallet_service::create_legacy_fixture(&state, "test_export_w", "pw123", mnemonic, None)
             .await
             .unwrap();
 
@@ -1377,7 +1721,7 @@ mod tests {
     #[tokio::test]
     async fn password_change_rejects_empty_auth_and_seed_mismatch_without_mutating_wallet() {
         let state = make_test_state("pw_strict_auth");
-        let created = wallet_service::create_wallet(&state, "strict", "secret", None, None).await.unwrap();
+        let created = wallet_service::create_legacy_fixture(&state, "strict", "secret", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None).await.unwrap();
         let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
         let original = repositories::get_first_master_key(&pool).await.unwrap().unwrap().derivation_data;
         assert!(change_password_impl(&state, "", "new").await.is_err());
@@ -1400,7 +1744,7 @@ mod tests {
     async fn password_change_preserves_bip39_passphrase_and_refuses_unknown_legacy_seed() {
         let state = make_test_state("pw_bip39_passphrase");
         let words = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        wallet_service::create_wallet(&state, "passphrase", "old", Some(words), Some("TREZOR")).await.unwrap();
+        wallet_service::create_legacy_fixture(&state, "passphrase", "old", words, Some("TREZOR")).await.unwrap();
         let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
         change_password_impl(&state, "old", "new").await.unwrap();
         let saved = repositories::get_first_master_key(&pool).await.unwrap().unwrap().derivation_data;
@@ -1433,7 +1777,7 @@ mod tests {
     #[tokio::test]
     async fn plaintext_legacy_wallet_may_change_to_nonempty_password() {
         let state = make_test_state("pw_plaintext_legacy");
-        wallet_service::create_wallet(&state, "legacy", "old", None, None).await.unwrap();
+        wallet_service::create_legacy_fixture(&state, "legacy", "old", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None).await.unwrap();
         let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
         let mut legacy = state.active_wallet.lock().unwrap().as_ref().unwrap().keystore_data.clone();
         legacy.xprv = keystore::decrypt_xprv(&legacy, "old").unwrap();
@@ -1452,7 +1796,7 @@ mod tests {
     #[tokio::test]
     async fn password_change_rolls_back_token_failure_and_updates_memory() {
         let state = make_test_state("password_atomic");
-        wallet_service::create_wallet(&state, "atomic", "old", None, None).await.unwrap();
+        wallet_service::create_legacy_fixture(&state, "atomic", "old", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None).await.unwrap();
         let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
         sqlx::query("CREATE TRIGGER reject_token BEFORE UPDATE ON WalletData WHEN OLD.key = 'password-token' BEGIN SELECT RAISE(ABORT, 'token failure'); END")
             .execute(&pool).await.unwrap();
@@ -1493,7 +1837,7 @@ mod tests {
         let state = make_test_state("change_pw");
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let result =
-            wallet_service::create_wallet(&state, "test_changepw", "old_pw", Some(mnemonic), None)
+            wallet_service::create_legacy_fixture(&state, "test_changepw", "old_pw", mnemonic, None)
                 .await
                 .unwrap();
         let wallet_path = result.wallet_path;
@@ -1815,7 +2159,7 @@ mod tests {
         let state = make_test_state("chpw_no_pt");
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let result =
-            wallet_service::create_wallet(&state, "test_nopt", "old_pw", Some(mnemonic), None)
+            wallet_service::create_legacy_fixture(&state, "test_nopt", "old_pw", mnemonic, None)
                 .await
                 .unwrap();
         let wallet_path = result.wallet_path;

@@ -21,6 +21,26 @@ fn temp_dir() -> std::path::PathBuf {
     dir
 }
 
+fn setup_secure_totp(dir: &std::path::Path, name: &str, password: &str) -> TotpInstance {
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard { fn drop(&mut self) { if self.0.try_wait().ok().flatten().is_none() { let _=self.0.kill(); let _=self.0.wait(); } } }
+    let mut child=ChildGuard(Command::new(env!("CARGO_BIN_EXE_electrumsv-mc")).args(["--agent","--data-dir"]).arg(dir).arg("--enable-payments").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap());
+    let mut input=child.0.stdin.take().unwrap();let stdout=child.0.stdout.take().unwrap();let (tx,rx)=std::sync::mpsc::channel();
+    std::thread::spawn(move || { for line in BufReader::new(stdout).lines() { if tx.send(line).is_err() { break; } } });
+    let mut request=|id:u32,method:&str,params:Value| -> Value {
+        writeln!(input,"{}",json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})).unwrap();input.flush().unwrap();
+        let line=rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap_or_else(|_| panic!("agent timeout: {method}")).unwrap();
+        let v:Value=serde_json::from_str(&line).unwrap();assert_eq!(v["id"],id);assert!(v.get("error").is_none(),"RPC failed: {method}");v["result"].clone()
+    };
+    request(1,"open_wallet",json!({"wallet_path":name}));
+    request(2,"unlock_wallet",json!({"password":password}));
+    let setup=request(3,"begin_totp_setup",json!({"password":password}));
+    let secret=totp_rs::Secret::Encoded(setup["secret_base32"].as_str().unwrap().to_string()).to_bytes().unwrap();
+    let totp=TotpInstance::from_secret_bytes(&secret,"ElectrumSV-Mc",name).unwrap();
+    request(4,"confirm_totp_setup",json!({"password":password,"code":totp.generate_current().unwrap()}));
+    drop(request);drop(input);assert!(child.0.wait().unwrap().success());totp
+}
+
 #[test]
 fn stdio_lifecycle_and_directory_lock() {
     let dir = temp_dir();
@@ -136,22 +156,12 @@ async fn authorized_unlock_requires_valid_totp() {
     wallet_service::create_wallet(&state, "totp", "password", None, None)
         .await
         .unwrap();
-    let pool = state
-        .active_wallet
-        .lock()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .db_pool
-        .clone();
-    let totp = TotpInstance::new("ElectrumSV-Mc", "wallet").unwrap();
-    repositories::store_totp_secret(&pool, totp.secret_bytes())
-        .await
-        .unwrap();
     wallet_service::close_wallet(&state).await.unwrap();
-    pool.close().await;
-    drop(pool);
+    let totp=setup_secure_totp(&dir,"totp","password");
     wallet_service::open_wallet(&state, "totp").await.unwrap();
+    let pool=state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+    repositories::store_totp_secret(&pool, &[1u8;20]).await.unwrap();
+    drop(pool);
     assert!(
         wallet_service::unlock_wallet_authorized(&state, "wrong", None)
             .await
@@ -470,16 +480,17 @@ fn optional_capabilities_require_explicit_flags_and_do_not_connect_on_start() {
             assert_eq!(request(&mut input, &mut output, 3, "connect_server", json!({}))["error"]["code"], -32602);
             assert_eq!(request(&mut input, &mut output, 4, "prepare_tx", json!({"outputs":[]}))["error"]["code"], -32602);
             assert!(request(&mut input, &mut output, 5, "create_wallet", json!({"name":"test", "password":"test-password"}))["result"].is_object());
-            writeln!(input, "{}", json!({"jsonrpc":"2.0", "method":"enable_totp", "params":{"password":"test-password"}})).unwrap();
+            writeln!(input, "{}", json!({"jsonrpc":"2.0", "method":"begin_totp_setup", "params":{"password":"test-password"}})).unwrap();
             input.flush().unwrap();
             assert_eq!(request(&mut input, &mut output, 6, "is_totp_enabled", json!({}))["result"], false);
-            assert_eq!(request(&mut input, &mut output, 7, "enable_totp", json!({"password":"wrong"}))["error"]["code"], -32000);
-            let setup = request(&mut input, &mut output, 8, "enable_totp", json!({"password":"test-password"}));
+            assert_eq!(request(&mut input, &mut output, 7, "begin_totp_setup", json!({"password":"wrong"}))["error"]["code"], -32000);
+            let setup = request(&mut input, &mut output, 8, "begin_totp_setup", json!({"password":"test-password"}));
             let secret = totp_rs::Secret::Encoded(setup["result"]["secret_base32"].as_str().unwrap().to_string()).to_bytes().unwrap();
             let code = TotpInstance::from_secret_bytes(&secret, "ElectrumSV-Mc", "test").unwrap().generate_current().unwrap();
-            assert_eq!(request(&mut input, &mut output, 9, "is_totp_enabled", json!({}))["result"], true);
+            assert_eq!(request(&mut input, &mut output, 9, "is_totp_enabled", json!({}))["result"], false);
+            assert!(request(&mut input, &mut output, 91, "confirm_totp_setup", json!({"password":"test-password", "code":code}))["error"].is_null());
             assert_eq!(request(&mut input, &mut output, 10, "verify_totp", json!({"code":code}))["result"], true);
-            assert_eq!(request(&mut input, &mut output, 11, "enable_totp", json!({"password":"test-password"}))["error"]["code"], -32000);
+            assert_eq!(request(&mut input, &mut output, 11, "begin_totp_setup", json!({"password":"test-password"}))["error"]["code"], -32000);
         }
         drop(input); assert!(child.wait().unwrap().success());
     }
@@ -511,11 +522,10 @@ async fn signed_plan_and_reservation_survive_process_crash() {
     let hash = electrumsv_mc_lib::core::address::hex_str_to_hash(&funding.id().unwrap()).unwrap();
     repositories::upsert_transaction(&pool, &hash, Some(10), Some(&hex::decode(funding.to_hex().unwrap()).unwrap())).await.unwrap();
     repositories::upsert_transaction_output(&pool, &hash, 0, 100_000, key, 0, Some(&hex::encode(script.to_binary()))).await.unwrap();
-    let totp = TotpInstance::from_secret_bytes(&[7u8; 20], "ElectrumSV-Mc", "synthetic").unwrap();
-    repositories::store_totp_secret(&pool, totp.secret_bytes()).await.unwrap();
     pool.close().await;
     drop(pool);
     wallet_service::close_wallet(&state).await.unwrap();
+    let totp=setup_secure_totp(&dir,"synthetic","test-password");
     fn spawn(dir: &std::path::Path) -> std::process::Child {
         Command::new(env!("CARGO_BIN_EXE_electrumsv-mc")).args(["--agent", "--data-dir"]).arg(dir).arg("--enable-payments").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap()
     }
@@ -639,4 +649,83 @@ fn maintenance_capability_backup_password_restart_and_restore() {
     drop(input); assert!(child.wait().unwrap().success());
     std::fs::remove_dir_all(dir).unwrap();
     std::fs::remove_dir_all(restore).unwrap();
+}
+
+#[test]
+fn secure_wallet_totp_setup_reauth_recovery_and_backup() {
+    let dir = temp_dir();
+    let backup = dir.join("backup.sqlite");
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard { fn drop(&mut self) { if self.0.try_wait().ok().flatten().is_none() { let _ = self.0.kill(); let _ = self.0.wait(); } } }
+    let child = Command::new(env!("CARGO_BIN_EXE_electrumsv-mc"))
+        .args(["--agent", "--data-dir"]).arg(&dir)
+        .args(["--enable-payments", "--enable-wallet-maintenance"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut child = ChildGuard(child);
+    let mut input = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let (sender, output) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { for line in BufReader::new(stdout).lines() { if sender.send(line).is_err() { break; } } });
+    fn call(input: &mut impl Write, output: &std::sync::mpsc::Receiver<std::io::Result<String>>, id: u32, method: &str, params: Value) -> Value {
+        writeln!(input, "{}", json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params})).unwrap();
+        input.flush().unwrap();
+        let line=output.recv_timeout(std::time::Duration::from_secs(30)).unwrap_or_else(|_| panic!("agent RPC timeout: {method}")).unwrap();
+        let value:Value=serde_json::from_str(&line).unwrap(); assert_eq!(value["id"],id); value
+    }
+    assert!(call(&mut input,&output,1,"create_wallet",json!({"name":"secure","password":"old-password"}))["result"].is_object());
+    assert!(call(&mut input,&output,2,"enable_totp",json!({"password":"old-password"}))["error"].is_object());
+    let pending=call(&mut input,&output,3,"begin_totp_setup",json!({"password":"old-password"}));
+    let secret=totp_rs::Secret::Encoded(pending["result"]["secret_base32"].as_str().unwrap().to_string()).to_bytes().unwrap();
+    let totp=TotpInstance::from_secret_bytes(&secret,"ElectrumSV-Mc","secure").unwrap();
+    assert!(call(&mut input,&output,4,"confirm_totp_setup",json!({"password":"old-password","code":"invalid"}))["error"].is_object());
+    assert_eq!(call(&mut input,&output,5,"is_totp_enabled",json!({}))["result"],false);
+    assert!(call(&mut input,&output,6,"confirm_totp_setup",json!({"password":"old-password","code":totp.generate_current().unwrap()}))["error"].is_null());
+    assert_eq!(call(&mut input,&output,7,"is_totp_enabled",json!({}))["result"],true);
+    let path=backup.to_str().unwrap();
+    assert!(call(&mut input,&output,8,"backup_wallet",json!({"backup_path":path,"password":"old-password"}))["error"].is_object());
+    assert!(!backup.exists());
+    assert!(call(&mut input,&output,9,"backup_wallet",json!({"backup_path":path,"password":"old-password","totp_code":totp.generate_current().unwrap()}))["error"].is_null());
+    assert!(call(&mut input,&output,10,"change_password",json!({"old_password":"old-password","new_password":"new-password","totp_code":"invalid"}))["error"].is_object());
+    assert!(call(&mut input,&output,11,"change_password",json!({"old_password":"old-password","new_password":"new-password","totp_code":totp.generate_current().unwrap()}))["error"].is_null());
+    let codes=call(&mut input,&output,12,"generate_totp_recovery_codes",json!({"password":"new-password","code":totp.generate_current().unwrap()}));
+    let recovery=codes["result"][0].as_str().unwrap().to_string();
+    assert!(call(&mut input,&output,13,"close_wallet",json!({}))["error"].is_null());
+    assert!(call(&mut input,&output,14,"open_wallet",json!({"wallet_path":"secure"}))["result"].is_object());
+    assert!(call(&mut input,&output,15,"is_totp_enabled",json!({}))["result"].is_null());
+    assert!(call(&mut input,&output,16,"unlock_wallet",json!({"password":"new-password"}))["error"].is_object());
+    assert!(call(&mut input,&output,17,"unlock_wallet",json!({"password":"new-password","totp_code":totp.generate_current().unwrap()}))["error"].is_null());
+    assert!(call(&mut input,&output,18,"recover_totp",json!({"password":"wrong","recovery_code":recovery}))["error"].is_object());
+    assert!(call(&mut input,&output,19,"recover_totp",json!({"password":"new-password","recovery_code":recovery}))["error"].is_null());
+    assert!(call(&mut input,&output,20,"is_totp_enabled",json!({}))["result"].is_null());
+    assert!(call(&mut input,&output,21,"unlock_wallet",json!({"password":"new-password"}))["error"].is_null());
+    assert_eq!(call(&mut input,&output,22,"is_totp_enabled",json!({}))["result"],false);
+    drop(input);assert!(child.0.wait().unwrap().success());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn migration_requires_maintenance_and_notifications_do_nothing() {
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard { fn drop(&mut self) { if self.0.try_wait().ok().flatten().is_none() { let _=self.0.kill(); let _=self.0.wait(); } } }
+    let dir=temp_dir();let backup=dir.join("never.sqlite");
+    for enabled in [false,true] {
+        let mut cmd=Command::new(env!("CARGO_BIN_EXE_electrumsv-mc"));cmd.args(["--agent","--data-dir"]).arg(&dir);
+        if enabled { cmd.arg("--enable-wallet-maintenance"); }
+        let mut child=ChildGuard(cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap());
+        let mut input=child.0.stdin.take().unwrap();let stdout=child.0.stdout.take().unwrap();let (tx,rx)=std::sync::mpsc::channel();
+        std::thread::spawn(move || { for line in BufReader::new(stdout).lines() { if tx.send(line).is_err(){break;} } });
+        for method in ["preview_migration","migrate_wallet"] {
+            writeln!(input,"{}",json!({"jsonrpc":"2.0","method":method,"params":{"password":"synthetic","backup_path":backup,"confirmation_token":"invalid"}})).unwrap();
+        }
+        writeln!(input,"{}",json!({"jsonrpc":"2.0","id":1,"method":"get_wallet_status"})).unwrap();input.flush().unwrap();
+        let line=rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();let response:Value=serde_json::from_str(&line.unwrap()).unwrap();assert_eq!(response["id"],1);assert_eq!(response["result"]["is_open"],false);assert!(!backup.exists());
+        if !enabled {
+            for (id,method) in [(2,"preview_migration"),(3,"migrate_wallet")] {
+                writeln!(input,"{}",json!({"jsonrpc":"2.0","id":id,"method":method,"params":{}})).unwrap();input.flush().unwrap();
+                let response:Value=serde_json::from_str(&rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap().unwrap()).unwrap();assert_eq!(response["error"]["code"],-32000);
+            }
+        }
+        drop(input);assert!(child.0.wait().unwrap().success());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }

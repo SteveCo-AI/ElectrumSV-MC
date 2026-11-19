@@ -7,12 +7,13 @@ interface ModalProps {
   onClose: () => void;
   children: ReactNode;
   width?: string;
+  disableClose?: boolean;
 }
 
-export function Modal({ title, open, onClose, children, width = 'max-w-md' }: ModalProps) {
+export function Modal({ title, open, onClose, children, width = 'max-w-md', disableClose = false }: ModalProps) {
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={disableClose ? undefined : onClose}>
       <div
         className={`bg-void-900 border border-void-700 rounded-xl shadow-2xl ${width} w-full mx-4`}
         onClick={(e) => e.stopPropagation()}
@@ -21,6 +22,7 @@ export function Modal({ title, open, onClose, children, width = 'max-w-md' }: Mo
           <h3 className="text-sm font-semibold text-accent">{title}</h3>
           <button
             onClick={onClose}
+            disabled={disableClose}
             className="text-gray-400 hover:text-gray-100 text-lg leading-none"
           >
             ×

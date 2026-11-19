@@ -20,14 +20,20 @@ use tauri::State;
 /// TOTP scope: "login" (only at unlock) or "tx" (also for every transaction).
 #[derive(Debug, serde::Serialize)]
 pub struct TotpScopeInfo {
-    pub enabled: bool,
+    pub enabled: Option<bool>,
     pub scope: String,
-    pub recovery_codes_remaining: i64,
+    pub recovery_codes_remaining: Option<i64>,
+    pub scope_editable: bool,
 }
 
 /// Get TOTP status including scope.
 #[tauri::command]
 pub async fn get_totp_status(state: State<'_, AppState>) -> Result<TotpScopeInfo, String> {
+    let operation = state.wallet_operation.lock().await;
+    if let Some(enabled) = crate::services::wallet_security::status_locked(&state, &operation)? {
+        let count = crate::services::wallet_security::recovery_count_locked(&state, &operation)?.flatten();
+        return Ok(TotpScopeInfo { enabled, scope: "tx".into(), recovery_codes_remaining: count, scope_editable: false });
+    }
     let pool = {
         let guard = state.active_wallet.lock().unwrap();
         let active = guard.as_ref().ok_or("no wallet is currently open")?;
@@ -48,9 +54,10 @@ pub async fn get_totp_status(state: State<'_, AppState>) -> Result<TotpScopeInfo
         .unwrap_or(0);
 
     Ok(TotpScopeInfo {
-        enabled,
+        enabled: Some(enabled),
         scope,
-        recovery_codes_remaining: recovery_remaining,
+        recovery_codes_remaining: Some(recovery_remaining),
+        scope_editable: true,
     })
 }
 
@@ -63,6 +70,8 @@ pub async fn set_totp_scope(
     scope: String,
     code: Option<String>,
 ) -> Result<String, String> {
+    let operation = state.wallet_operation.lock().await;
+    if crate::services::wallet_security::status_locked(&state, &operation)?.is_some() { return Err("TOTP scope changes are unavailable for this wallet".into()); }
     log::info!("set_totp_scope — scope: {}", scope);
 
     if scope != "login" && scope != "tx" {
@@ -210,8 +219,10 @@ pub async fn backup_wallet(
     state: State<'_, AppState>,
     backup_path: String,
     password: String,
+    totp_code: Option<String>,
+    expected_instance_token: String,
 ) -> Result<String, String> {
-    backup_wallet_inner(&state, backup_path, password).await
+    backup_wallet_authorized_bound(&state, backup_path, password, totp_code, Some(&expected_instance_token)).await
 }
 
 pub async fn backup_wallet_inner(
@@ -219,16 +230,41 @@ pub async fn backup_wallet_inner(
     backup_path: String,
     password: String,
 ) -> Result<String, String> {
+    backup_wallet_authorized(state, backup_path, password, None).await
+}
+
+pub async fn backup_wallet_authorized(state: &AppState, backup_path: String, password: String, totp_code: Option<String>) -> Result<String, String> {
+    backup_wallet_authorized_bound(state, backup_path, password, totp_code, None).await
+}
+
+pub(crate) async fn backup_wallet_authorized_bound(state: &AppState, backup_path: String, password: String, totp_code: Option<String>, expected_instance_token: Option<&str>) -> Result<String, String> {
     let _operation = state.wallet_operation.lock().await;
+    if let Some(expected) = expected_instance_token {
+        let guard = state.active_wallet.lock().unwrap();
+        if expected.is_empty() || guard.as_ref().map(|wallet| wallet.instance_token.as_str()) != Some(expected) {
+            return Err("wallet instance changed; reopen backup dialog".into());
+        }
+    }
     log::info!("backup_wallet — to: {}", backup_path);
 
-    let (wallet_path, pool) = {
+    let secure = crate::services::wallet_security::authenticate_locked(state, &_operation, &password, totp_code.as_deref(), true).await?;
+
+    {
         let guard = state.active_wallet.lock().unwrap();
         let active = guard.as_ref().ok_or("no wallet is currently open")?;
-        if !crate::core::keystore::verify_password(&active.keystore_data, &password) { return Err("incorrect password".into()); }
-        (active.wallet_path.clone(), active.db_pool.clone())
-    };
+        if secure.is_none() && !crate::core::keystore::verify_password(&active.keystore_data, &password) { return Err("incorrect password".into()); }
+    }
+    backup_snapshot_locked(state, &_operation, &backup_path).await?;
+    log::info!("Wallet backed up to: {}", backup_path);
+    Ok(backup_path)
+}
 
+pub(crate) async fn backup_snapshot_locked(state: &AppState, _operation: &tokio::sync::MutexGuard<'_, ()>, backup_path: &str) -> Result<verified_backup::VerifiedBackup, String> {
+    let (wallet_path, pool, instance) = {
+        let guard = state.active_wallet.lock().unwrap();
+        let active = guard.as_ref().ok_or("no wallet is currently open")?;
+        (active.wallet_path.clone(), active.db_pool.clone(), active.instance_id.clone())
+    };
     if !std::path::Path::new(&wallet_path).exists() {
         return Err(format!("wallet file not found: {}", wallet_path));
     }
@@ -238,12 +274,12 @@ pub async fn backup_wallet_inner(
 
     #[cfg(target_os = "linux")]
     {
-    let target = secure_backup::Target::new(&state.data_dir, &backup_path)?;
+    let target = std::sync::Arc::new(secure_backup::Target::new(&state.data_dir, backup_path)?);
     let result = sqlx::query("VACUUM INTO ?").bind(target.sqlite_path()).execute(&pool).await;
     result.map_err(|e| format!("backup failed: {e}"))?;
-    target.publish()?;
-    log::info!("Wallet backed up to: {}", backup_path);
-    Ok(backup_path)
+    let verified = verified_backup::VerifiedBackup::open(target.open_snapshot()?, instance, target.clone()).await?;
+    target.publish(verified.snapshot_file())?;
+    Ok(verified)
     }
 }
 
@@ -258,7 +294,7 @@ mod secure_backup {
     fn owned(fd: i32) -> Result<OwnedFd, String> {
         if fd < 0 { Err(std::io::Error::last_os_error().to_string()) } else { Ok(unsafe { OwnedFd::from_raw_fd(fd) }) }
     }
-    pub struct Target { parent: OwnedFd, stage: OwnedFd, stage_name: CString, leaf: CString }
+    pub struct Target { parent: OwnedFd, stage: OwnedFd, stage_name: CString, leaf: CString, snapshot_identity: Option<(u64,u64)> }
     impl Target {
         pub fn new(data_dir: &str, backup: &str) -> Result<Self, String> {
             let root = Path::new(data_dir).canonicalize().map_err(|e| e.to_string())?;
@@ -282,29 +318,186 @@ mod secure_backup {
                     Ok(v) => v,
                     Err(e) => { unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR); } return Err(e); }
                 };
-                let target = Self { parent, stage, stage_name: name, leaf };
+                let mut target = Self { parent, stage, stage_name: name, leaf, snapshot_identity: None };
                 let snapshot = CString::new("snapshot").unwrap();
                 let fd = owned(unsafe { libc::openat(target.stage.as_raw_fd(), snapshot.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0o600) })?;
-                drop(fd);
+                let file: std::fs::File = fd.into();
+                use std::os::unix::fs::MetadataExt;
+                let meta=file.metadata().map_err(|_| "backup staging metadata failed")?;
+                target.snapshot_identity=Some((meta.dev(),meta.ino()));
                 return Ok(target);
             }
             Err("could not create unique backup staging directory".into())
         }
         pub fn sqlite_path(&self) -> String { format!("/proc/self/fd/{}/snapshot", self.stage.as_raw_fd()) }
-        pub fn publish(&self) -> Result<(), String> {
+        pub fn open_snapshot(&self) -> Result<std::fs::File, String> {
             let name = CString::new("snapshot").unwrap();
             let file = owned(unsafe { libc::openat(self.stage.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) })?;
+            Ok(file.into())
+        }
+        pub fn publish(&self, verified: &std::fs::File) -> Result<(), String> {
+            use std::os::unix::fs::MetadataExt;
+            let name = CString::new("snapshot").unwrap();
+            let file = self.open_snapshot()?;
+            let a = verified.metadata().map_err(|_| "verified backup metadata failed")?;
+            let b = file.metadata().map_err(|_| "backup metadata failed")?;
+            if (a.dev(),a.ino()) != (b.dev(),b.ino()) { return Err("backup staging file changed".into()); }
             if unsafe { libc::fsync(file.as_raw_fd()) } != 0 { return Err(format!("backup sync: {}", std::io::Error::last_os_error())); }
             if unsafe { libc::linkat(self.stage.as_raw_fd(), name.as_ptr(), self.parent.as_raw_fd(), self.leaf.as_ptr(), 0) } != 0 { return Err(format!("backup publication: {}", std::io::Error::last_os_error())); }
+            let published = owned(unsafe { libc::openat(self.parent.as_raw_fd(), self.leaf.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) })?;
+            let published: std::fs::File = published.into();
+            let c = published.metadata().map_err(|_| "published backup metadata failed")?;
+            if (a.dev(),a.ino()) != (c.dev(),c.ino()) { return Err("published backup file changed".into()); }
             if unsafe { libc::fsync(self.parent.as_raw_fd()) } != 0 { return Err(format!("backup published but directory sync failed: {}", std::io::Error::last_os_error())); }
             Ok(())
         }
     }
     impl Drop for Target {
         fn drop(&mut self) {
+            use std::os::unix::fs::MetadataExt;
             let name = CString::new("snapshot").unwrap();
-            unsafe { libc::unlinkat(self.stage.as_raw_fd(), name.as_ptr(), 0); libc::unlinkat(self.parent.as_raw_fd(), self.stage_name.as_ptr(), libc::AT_REMOVEDIR); }
+            if let Ok(file)=self.open_snapshot() {
+                if file.metadata().ok().is_some_and(|m| Some((m.dev(),m.ino())) == self.snapshot_identity) {
+                    unsafe { libc::unlinkat(self.stage.as_raw_fd(), name.as_ptr(), 0); }
+                }
+            }
+            let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let mut held = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let same = unsafe {
+                libc::fstatat(self.parent.as_raw_fd(),self.stage_name.as_ptr(),current.as_mut_ptr(),libc::AT_SYMLINK_NOFOLLOW)==0 &&
+                libc::fstat(self.stage.as_raw_fd(),held.as_mut_ptr())==0 && {
+                    let a=current.assume_init();let b=held.assume_init();a.st_dev==b.st_dev && a.st_ino==b.st_ino
+                }
+            };
+            if same { unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.stage_name.as_ptr(), libc::AT_REMOVEDIR); } }
         }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) mod verified_backup { pub(crate) struct VerifiedBackup; }
+
+#[cfg(target_os = "linux")]
+pub(crate) mod verified_backup {
+    use sha2::{Digest, Sha256};
+    use sqlx::{Row, TypeInfo, ValueRef, SqliteConnection, SqlitePool, Transaction, Sqlite};
+    use std::os::fd::AsRawFd;
+
+    const MAX_TABLES: usize = 512;
+    const MAX_ROWS: usize = 100_000;
+    const MAX_ROW_BYTES: i64 = 1024 * 1024;
+    const MAX_TOTAL_BYTES: i64 = 512 * 1024 * 1024;
+    const MAX_COLUMNS: usize = 128;
+    const BATCH_ROWS: usize = 16;
+
+    /// Owns the published inode; no migration hooks are run on its readonly connection.
+    pub(crate) struct VerifiedBackup { pool: SqlitePool, _file: std::sync::Arc<std::fs::File>, instance: std::sync::Arc<()> }
+
+    impl VerifiedBackup {
+        pub(super) async fn open(file: std::fs::File, instance: std::sync::Arc<()>, staging: std::sync::Arc<super::secure_backup::Target>) -> Result<Self, String> {
+            let file = std::sync::Arc::new(file);
+            let file_owner = file.clone();
+            let path = format!("/proc/self/fd/{}", file.as_raw_fd());
+            let options = sqlx::sqlite::SqliteConnectOptions::new().filename(path).read_only(true).immutable(true);
+            // The private staging name remains linked while this object lives;
+            // SQLite may resolve /proc/self/fd to that name when reconnecting.
+            let pool = sqlx::sqlite::SqlitePoolOptions::new().min_connections(2).max_connections(2)
+                .idle_timeout(None).max_lifetime(None).acquire_timeout(std::time::Duration::from_secs(3))
+                .after_connect(move |_, _| { let owner = staging.clone(); let descriptor = file_owner.clone(); Box::pin(async move { drop((owner, descriptor)); Ok(()) }) })
+                .connect_with(options).await.map_err(|_| "backup readonly open failed")?;
+            let rows: Vec<(String,)> = sqlx::query_as("PRAGMA integrity_check").fetch_all(&pool).await.map_err(|_| "backup integrity check failed")?;
+            if rows.len() != 1 || rows[0].0 != "ok" { return Err("backup integrity check failed".into()); }
+            Ok(Self { pool, _file: file, instance })
+        }
+
+        pub(super) fn snapshot_file(&self) -> &std::fs::File { &self._file }
+        /// This pool is read-only and immutable; it does not imply secret authentication.
+        pub(crate) fn readonly_pool(&self) -> &SqlitePool { &self.pool }
+
+        /// Holds the same IMMEDIATE transaction for the caller's subsequent inventory and CAS.
+        pub(crate) async fn begin_verified_source(&self, state: &crate::state::AppState, _operation: &tokio::sync::MutexGuard<'_, ()>) -> Result<Transaction<'static, Sqlite>, String> {
+            let pool = {
+                let active = state.active_wallet.lock().map_err(|_| "wallet state unavailable")?;
+                let active = active.as_ref().ok_or("wallet is not open")?;
+                if !std::sync::Arc::ptr_eq(&self.instance, &active.instance_id) { return Err("wallet changed after backup".into()); }
+                active.db_pool.clone()
+            };
+            let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(|_| "source write lock failed")?;
+            let mut snapshot = self.pool.acquire().await.map_err(|_| "backup readonly open failed")?;
+            let expected = migration_snapshot_digest(&mut snapshot).await?;
+            let actual = migration_snapshot_digest(&mut tx).await?;
+            if expected != actual { return Err("wallet changed after backup".into()); }
+            Ok(tx)
+        }
+    }
+
+    fn add(hash: &mut Sha256, data: &[u8]) -> Result<(), String> {
+        if data.len() > MAX_ROW_BYTES as usize { return Err("backup comparison field limit exceeded".into()); }
+        hash.update((data.len() as u64).to_le_bytes()); hash.update(data); Ok(())
+    }
+
+    pub(crate) async fn migration_snapshot_digest(conn: &mut SqliteConnection) -> Result<[u8;32], String> {
+        let schema_bounds: (i64,i64,i64) = sqlx::query_as("SELECT COUNT(*),COALESCE(MAX(length(CAST(COALESCE(sql,'') AS BLOB))+length(CAST(name AS BLOB))+length(CAST(tbl_name AS BLOB))),0),COALESCE(SUM(length(CAST(COALESCE(sql,'') AS BLOB))+length(CAST(name AS BLOB))+length(CAST(tbl_name AS BLOB))),0) FROM sqlite_schema").fetch_one(&mut *conn).await.map_err(|_| "wallet schema bounds failed")?;
+        if schema_bounds.0 > (MAX_TABLES * 8) as i64 || schema_bounds.1 > MAX_ROW_BYTES || schema_bounds.2 > 8*1024*1024 { return Err("backup comparison schema limit exceeded".into()); }
+        let schema: Vec<(String, String, String, Option<String>)> = sqlx::query_as("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name,tbl_name").fetch_all(&mut *conn).await.map_err(|_| "wallet schema read failed")?;
+        if schema.len() > MAX_TABLES * 8 { return Err("backup comparison schema limit exceeded".into()); }
+        let mut result = Sha256::new();
+        for pragma in ["PRAGMA user_version", "PRAGMA application_id"] {
+            let n: (i64,) = sqlx::query_as(pragma).fetch_one(&mut *conn).await.map_err(|_| "wallet metadata read failed")?;
+            result.update(n.0.to_le_bytes());
+        }
+        let mut tables = Vec::new();
+        for (kind, name, owner, sql) in schema {
+            add(&mut result,kind.as_bytes())?; add(&mut result,name.as_bytes())?; add(&mut result,owner.as_bytes())?;
+            match &sql { Some(value) => {result.update([1]); add(&mut result,value.as_bytes())?;}, None => result.update([0]) }
+            if kind == "table" {
+                if sql.as_deref().is_some_and(|s| s.trim_start().to_ascii_uppercase().starts_with("CREATE VIRTUAL TABLE")) { return Err("virtual tables are not supported for migration".into()); }
+                tables.push(name);
+            }
+        }
+        if tables.len() > MAX_TABLES { return Err("backup comparison table limit exceeded".into()); }
+        let mut total = 0usize;
+        let mut total_bytes = 0i64;
+        for table in tables {
+            let quoted = table.replace('"',"\"\"");
+            let column_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pragma_table_xinfo(?)").bind(&table).fetch_one(&mut *conn).await.map_err(|_| "wallet columns read failed")?;
+            if column_count.0 <= 0 || column_count.0 > MAX_COLUMNS as i64 { return Err("unsupported wallet table columns".into()); }
+            let columns: Vec<(String, i64)> = sqlx::query_as("SELECT name,hidden FROM pragma_table_xinfo(?) ORDER BY cid").bind(&table).fetch_all(&mut *conn).await.map_err(|_| "wallet columns read failed")?;
+            if columns.is_empty() || columns.len() > MAX_COLUMNS || columns.iter().any(|(_, hidden)| *hidden == 1) { return Err("unsupported wallet table columns".into()); }
+            let sizes = columns.iter().map(|(name,_)| format!("CASE WHEN typeof(\"{}\") IN ('text','blob') THEN length(CAST(\"{}\" AS BLOB)) ELSE 8 END",name.replace('"',"\"\""),name.replace('"',"\"\""))).collect::<Vec<_>>().join("+");
+            let bounds = format!("SELECT COALESCE(MAX({sizes}),0),COALESCE(SUM({sizes}),0),COUNT(*) FROM \"{quoted}\"");
+            let (max_row, bytes, count): (i64,i64,i64) = sqlx::query_as(&bounds).fetch_one(&mut *conn).await.map_err(|_| "wallet comparison bounds failed")?;
+            if max_row > MAX_ROW_BYTES || count < 0 || bytes < 0 { return Err("backup comparison row limit exceeded".into()); }
+            total_bytes = total_bytes.checked_add(bytes).ok_or("backup comparison byte limit exceeded")?;
+            if total_bytes > MAX_TOTAL_BYTES || total.checked_add(count as usize).filter(|n| *n <= MAX_ROWS).is_none() { return Err("backup comparison limit exceeded".into()); }
+            let query = format!("SELECT * FROM \"{quoted}\" LIMIT {BATCH_ROWS} OFFSET ?");
+            let mut offset = 0i64; let mut hashes = Vec::new();
+            loop {
+                let rows = sqlx::query(&query).bind(offset).fetch_all(&mut *conn).await.map_err(|_| "wallet data read failed")?;
+                let count = rows.len();
+                for row in rows {
+                    total += 1; if total > MAX_ROWS { return Err("backup comparison row limit exceeded".into()); }
+                    let mut h=Sha256::new();
+                    for i in 0..row.columns().len() {
+                        let raw=row.try_get_raw(i).map_err(|_| "wallet value read failed")?;
+                        if raw.is_null() { h.update([0]); continue; }
+                        match raw.type_info().name() {
+                            "INTEGER" => {h.update([1]);let v:i64=row.try_get(i).map_err(|_| "wallet integer read failed")?;h.update(v.to_le_bytes());},
+                            "REAL" => {h.update([2]);let v:f64=row.try_get(i).map_err(|_| "wallet real read failed")?;h.update(v.to_bits().to_le_bytes());},
+                            "TEXT" => {h.update([3]);let v:String=row.try_get(i).map_err(|_| "wallet text read failed")?;add(&mut h,v.as_bytes())?;},
+                            "BLOB" => {h.update([4]);let v:Vec<u8>=row.try_get(i).map_err(|_| "wallet blob read failed")?;add(&mut h,&v)?;},
+                            _ => return Err("unsupported SQLite value type".into()),
+                        }
+                    }
+                    hashes.push(<[u8;32]>::from(h.finalize()));
+                }
+                if count < BATCH_ROWS { break; }
+                offset += count as i64;
+            }
+            hashes.sort_unstable(); add(&mut result, table.as_bytes())?; result.update((hashes.len() as u64).to_le_bytes());
+            for h in hashes { result.update(h); }
+        }
+        Ok(result.finalize().into())
     }
 }
 
@@ -388,14 +581,17 @@ pub async fn send(
     log::info!("send — to: {}, amount: {}", address, amount);
 
     // Verify password before proceeding (same check as export_seed/export_privkey).
+    let operation = state.wallet_operation.lock().await;
+    let secure = crate::services::wallet_security::authenticate_locked(&state, &operation, &password, Some(&totp_code), true).await?;
     let keystore_data = {
         let guard = state.active_wallet.lock().unwrap();
         let active = guard.as_ref().ok_or("no wallet is currently open")?;
         active.keystore_data.clone()
     };
-    if !crate::core::keystore::verify_password(&keystore_data, &password) {
+    if secure.is_none() && !crate::core::keystore::verify_password(&keystore_data, &password) {
         return Err("incorrect password".to_string());
     }
+    drop(operation);
 
     // Prepare
     let outputs = vec![crate::core::transaction::PaymentOutput {
@@ -494,6 +690,9 @@ pub async fn import_privkey(
     password: String,
 ) -> Result<ImportPrivkeyResult, String> {
     let _ = (state, wif, password);
+    import_privkey_disabled()
+}
+fn import_privkey_disabled() -> Result<ImportPrivkeyResult, String> {
     Err("Private-key import is disabled until imported outputs can be synchronized and spent safely".into())
 }
 
@@ -509,6 +708,112 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn backup_instance_token_rejects_wallet_switch_and_reopen() {
+        use std::future::Future;
+        use std::task::Poll;
+        let state = make_test_state("backup_instance");
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        wallet_service::create_legacy_fixture(&state, "a", "password", phrase, None).await.unwrap();
+        wallet_service::create_legacy_fixture(&state, "b", "password", phrase, None).await.unwrap();
+        let a = wallet_service::open_wallet(&state, "a").await.unwrap();
+        let again = wallet_service::open_wallet(&state, "a").await.unwrap();
+        assert_eq!(a.wallet_instance_token, again.wallet_instance_token);
+        assert_eq!(wallet_service::get_wallet_status(&state).wallet_instance_token.as_deref(), Some(a.wallet_instance_token.as_str()));
+        let destination = std::path::Path::new(&state.data_dir).join("race.sqlite");
+        let destination_string = destination.to_string_lossy().into_owned();
+        let operation = state.wallet_operation.lock().await;
+        let switch = wallet_service::open_wallet(&state, "b");
+        let backup = backup_wallet_authorized_bound(&state, destination_string.clone(), "password".into(), None, Some(&a.wallet_instance_token));
+        tokio::pin!(switch, backup);
+        std::future::poll_fn(|cx| {
+            assert!(matches!(switch.as_mut().poll(cx), Poll::Pending));
+            assert!(matches!(backup.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        }).await;
+        drop(operation);
+        let (switched, rejected) = tokio::time::timeout(std::time::Duration::from_secs(15), async { tokio::join!(switch, backup) }).await.unwrap();
+        switched.unwrap();
+        assert_eq!(rejected.unwrap_err(), "wallet instance changed; reopen backup dialog");
+        assert!(!destination.exists());
+
+        let current_a = wallet_service::open_wallet(&state, "a").await.unwrap();
+        wallet_service::close_wallet(&state).await.unwrap();
+        assert!(wallet_service::get_wallet_status(&state).wallet_instance_token.is_none());
+        let reopened_a = wallet_service::open_wallet(&state, "a").await.unwrap();
+        assert_ne!(current_a.wallet_instance_token, reopened_a.wallet_instance_token);
+        assert!(backup_wallet_authorized_bound(&state, destination_string.clone(), "password".into(), None, Some(&current_a.wallet_instance_token)).await.is_err());
+        assert!(backup_wallet_authorized_bound(&state, destination_string.clone(), "password".into(), None, Some("")).await.is_err());
+        assert!(!destination.exists());
+        backup_wallet_authorized_bound(&state, destination_string, "password".into(), None, Some(&reopened_a.wallet_instance_token)).await.unwrap();
+        assert!(destination.exists());
+        wallet_service::close_wallet(&state).await.unwrap();
+        std::fs::remove_dir_all(&state.data_dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn verified_backup_compares_full_typed_rows_under_immediate_lock() {
+        let state=make_test_state("verified_typed");
+        wallet_service::create_legacy_fixture(&state,"source","password","abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",None).await.unwrap();
+        let pool=state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+        sqlx::query("CREATE TABLE compare_test(v)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO compare_test VALUES (NULL),(1),(1),(1.5),('1'),(x'0031')").execute(&pool).await.unwrap();
+        let guard=state.wallet_operation.lock().await;
+        let dest=std::path::Path::new(&state.data_dir).join("backup.sqlite");
+        let backup=backup_snapshot_locked(&state,&guard,dest.to_str().unwrap()).await.unwrap();
+        // A caller may have a readonly snapshot transaction open while comparison starts.
+        let snapshot_tx=backup.readonly_pool().begin().await.unwrap();
+        let concurrent=tokio::time::timeout(std::time::Duration::from_secs(5),backup.begin_verified_source(&state,&guard)).await.expect("comparison must not wait for the existing snapshot reader").unwrap();
+        concurrent.rollback().await.unwrap();snapshot_tx.rollback().await.unwrap();
+        let tx=backup.begin_verified_source(&state,&guard).await.unwrap();
+        tx.rollback().await.unwrap();
+        assert!(sqlx::query("INSERT INTO compare_test VALUES (2)").execute(backup.readonly_pool()).await.is_err());
+        sqlx::query("DELETE FROM compare_test WHERE typeof(v)='text'").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO compare_test VALUES (x'31')").execute(&pool).await.unwrap();
+        assert!(backup.begin_verified_source(&state,&guard).await.is_err());
+        assert!(dest.exists(),"published backup is retained after mismatch");
+        let snapshot_pool=backup.readonly_pool().clone();
+        drop(backup);
+        let first=snapshot_pool.acquire().await.unwrap();let second=snapshot_pool.acquire().await.unwrap();
+        first.close().await.unwrap();second.close().await.unwrap();
+        let rows:(i64,)=sqlx::query_as("SELECT COUNT(*) FROM compare_test").fetch_one(&snapshot_pool).await.unwrap();
+        assert_eq!(rows.0,6,"a cloned readonly pool must reconnect to the held snapshot");
+        snapshot_pool.close().await;drop(snapshot_pool);drop(guard);drop(pool);
+        wallet_service::close_wallet(&state).await.unwrap();
+        std::fs::remove_dir_all(&state.data_dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn corrupt_staging_rejected_before_publication() {
+        let state=make_test_state("corrupt_stage");
+        let dest=std::path::Path::new(&state.data_dir).join("backup.sqlite");
+        let target=std::sync::Arc::new(secure_backup::Target::new(&state.data_dir,dest.to_str().unwrap()).unwrap());
+        std::fs::write(target.sqlite_path(), b"not a sqlite database").unwrap();
+        let opened=verified_backup::VerifiedBackup::open(target.open_snapshot().unwrap(),std::sync::Arc::new(()),target.clone()).await;
+        assert!(opened.is_err());assert!(!dest.exists());drop(target);
+        std::fs::remove_dir_all(&state.data_dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn snapshot_comparison_rejects_oversized_row_without_deleting_backup() {
+        let state=make_test_state("oversized_snapshot");
+        wallet_service::create_legacy_fixture(&state,"source","password","abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",None).await.unwrap();
+        let pool=state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+        sqlx::query("CREATE TABLE large_test(v BLOB)").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO large_test VALUES(zeroblob(1048577))").execute(&pool).await.unwrap();
+        let guard=state.wallet_operation.lock().await;
+        let dest=std::path::Path::new(&state.data_dir).join("backup.sqlite");
+        let backup=backup_snapshot_locked(&state,&guard,dest.to_str().unwrap()).await.unwrap();
+        assert!(backup.begin_verified_source(&state,&guard).await.is_err());
+        assert!(dest.exists());drop(backup);drop(guard);drop(pool);
+        wallet_service::close_wallet(&state).await.unwrap();
+        std::fs::remove_dir_all(&state.data_dir).unwrap();
+    }
 
     #[tokio::test]
     async fn actual_backup_checks_password_and_snapshots_live_wal() {
@@ -722,88 +1027,25 @@ mod tests {
         wallet_service::close_wallet(&state).await.unwrap();
     }
 
-    /// import_privkey: a valid WIF key produces an address; wrong password is rejected.
+    /// Disabled import must not write key instances in either wallet format.
     #[tokio::test]
-    async fn test_import_privkey_valid_and_wrong_password() {
-        let state = make_test_state("import_pk");
-        wallet_service::create_wallet(&state, "test_import", "pw123", None, None)
-            .await
-            .unwrap();
-
-        let (pool, account_id, keystore_data) = {
-            let guard = state.active_wallet.lock().unwrap();
-            let active = guard.as_ref().unwrap();
-            (
-                active.db_pool.clone(),
-                active.account_id,
-                active.keystore_data.clone(),
-            )
-        };
-
-        // A well-known BSV testnet WIF — but the wallet is mainnet by default.
-        // Use a mainnet WIF for correctness: L4s7vQwW5t7N5tZ5tR5tZ5tR5tZ5tR5tZ5tR5tZ5tR
-        // We use a known-valid mainnet WIF key.
-        let wif = "L4s7vQwW5t7N5tZ5tR5tZ5tR5tZ5tR5tZ5tR5tZ5tR5tZ5tR";
-        // If the WIF is invalid, from_wif will error; we handle both cases gracefully.
-        let priv_key_result =
-            bsv::primitives::private_key::PrivateKey::from_wif(wif);
-        // We only proceed if the WIF is valid for this network
-        if let Ok(priv_key) = priv_key_result {
-            let pubkey = priv_key.to_public_key();
-            let address = crate::core::address::pubkey_to_p2pkh_address(&pubkey);
-            assert!(
-                address.starts_with('1'),
-                "mainnet P2PKH address should start with '1', got: {}",
-                address
-            );
-
-            // Verify password check: correct password
-            assert!(crate::core::keystore::verify_password(&keystore_data, "pw123"));
-            // Wrong password
-            assert!(!crate::core::keystore::verify_password(&keystore_data, "wrong"));
-
-            // Insert the keyinstance (replicating import_privkey logic)
-            let derivation_data = serde_json::json!({
-                "type": "imported_privkey",
-                "wif_encrypted": crate::security::encryption::pw_encode(wif, "pw123"),
-            })
-            .to_string()
-            .into_bytes();
-
-            let mk_row = repositories::get_first_master_key(&pool).await.unwrap();
-            let masterkey_id = mk_row.map(|mk| mk.masterkey_id);
-
-            let ki_id = repositories::insert_keyinstance(
-                &pool,
-                account_id,
-                masterkey_id,
-                1, // IMPORTED_PRIVATE_KEY
-                &derivation_data,
-                repositories::script_type::P2PKH,
-                0,
-                None,
-            )
-            .await
-            .unwrap();
-
-            assert!(ki_id > 0, "keyinstance_id should be positive");
-
-            // Read it back and verify
-            let ki = repositories::get_keyinstance(&pool, ki_id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(ki.account_id, account_id);
-            assert_eq!(ki.script_type, repositories::script_type::P2PKH);
+    async fn test_import_privkey_fails_closed_without_writes() {
+        for legacy in [false, true] {
+            let state = make_test_state(if legacy { "import_legacy" } else { "import_secure" });
+            if legacy {
+                wallet_service::create_legacy_fixture(&state, "test_import", "pw123", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None).await.unwrap();
+            } else {
+                wallet_service::create_wallet(&state, "test_import", "pw123", None, None).await.unwrap();
+            }
+            let pool = state.active_wallet.lock().unwrap().as_ref().unwrap().db_pool.clone();
+            let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM KeyInstances").fetch_one(&pool).await.unwrap();
+            assert!(import_privkey_disabled().is_err());
+            let after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM KeyInstances").fetch_one(&pool).await.unwrap();
+            assert_eq!(before, after);
+            drop(pool); wallet_service::close_wallet(&state).await.unwrap();
+            wallet_service::open_wallet(&state, "test_import").await.unwrap();
+            wallet_service::close_wallet(&state).await.unwrap();
         }
-        // If the WIF is invalid on this network, skip the address check but still
-        // verify the password verification logic (which doesn't depend on the WIF).
-        // Verify password logic independently:
-        assert!(crate::core::keystore::verify_password(&keystore_data, "pw123"));
-        assert!(!crate::core::keystore::verify_password(&keystore_data, "wrong"));
-
-        pool.close().await;
-        wallet_service::close_wallet(&state).await.unwrap();
     }
 
     /// get_transaction: querying a nonexistent txid should return "transaction not found".
@@ -860,7 +1102,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_totp_scope_valid_and_invalid() {
         let state = make_test_state("totp_scope");
-        wallet_service::create_wallet(&state, "test_totp", "pw123", None, None)
+        wallet_service::create_legacy_fixture(&state, "test_totp", "pw123", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", None)
             .await
             .unwrap();
 

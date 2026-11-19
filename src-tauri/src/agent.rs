@@ -123,17 +123,53 @@ struct Password {
 struct BackupWallet {
     backup_path: String,
     password: String,
+    totp_code: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChangePassword {
     old_password: String,
     new_password: String,
+    totp_code: Option<String>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationPreviewRequest { password: String, totp_code: Option<String> }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationRequest { password: String, totp_code: Option<String>, backup_path: String, confirmation_token: String }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetupConfirm { password: String, code: String }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Recovery { password: String, recovery_code: String }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TotpCode {
     code: String,
+}
+
+fn migration_rpc_error(e: crate::services::wallet_migration::MigrationError) -> (i64, String, Option<Value>) {
+    match serde_json::to_value(e) {
+        Ok(data) => (-32000, "migration failed".into(), Some(data)),
+        Err(_) => (-32603, "Internal error".into(), None),
+    }
+}
+
+async fn dispatch_migration(state: &AppState, caps: Capabilities, method: &str, params: Value) -> Result<Value, (i64, String, Option<Value>)> {
+    if !caps.wallet_maintenance { return Err((-32000, "wallet maintenance capability disabled".into(), None)); }
+    if method == "preview_migration" {
+        let p: MigrationPreviewRequest=serde_json::from_value(params).map_err(|_| (-32602,"Invalid params".into(),None))?;
+        let result=crate::services::wallet_migration::preview_migration(state,&p.password,p.totp_code.as_deref()).await
+            .map_err(migration_rpc_error)?;
+        serde_json::to_value(result).map_err(|_| (-32603,"Internal error".into(),None))
+    } else {
+        let p: MigrationRequest=serde_json::from_value(params).map_err(|_| (-32602,"Invalid params".into(),None))?;
+        let result=crate::services::wallet_migration::migrate_wallet(state,&p.password,p.totp_code.as_deref(),&p.backup_path,&p.confirmation_token).await
+            .map_err(migration_rpc_error)?;
+        serde_json::to_value(result).map_err(|_| (-32603,"Internal error".into(),None))
+    }
 }
 
 async fn dispatch(state: &AppState, caps: Capabilities, method: &str, params: Value) -> Result<Value, (i64, String)> {
@@ -160,6 +196,7 @@ async fn dispatch_inner(
             | "disconnect_server"
             | "list_spend_plans"
             | "is_totp_enabled"
+            | "cancel_totp_setup"
     ) && params != json!({})
     {
         return Err((-32602, "Invalid params".into()));
@@ -177,6 +214,7 @@ async fn dispatch_inner(
             | "enable_totp"
             | "is_totp_enabled"
             | "verify_totp"
+            | "begin_totp_setup" | "confirm_totp_setup" | "cancel_totp_setup"
     ) && !caps.payments
     {
         return Err((-32000, "payments capability disabled".into()));
@@ -191,7 +229,7 @@ async fn dispatch_inner(
     if method == "broadcast_plan" && !caps.broadcast {
         return Err((-32000, "broadcast capability disabled".into()));
     }
-    if matches!(method, "backup_wallet" | "change_password") && !caps.wallet_maintenance {
+    if matches!(method, "backup_wallet" | "change_password" | "recover_totp" | "disable_totp" | "generate_totp_recovery_codes") && !caps.wallet_maintenance {
         return Err((-32000, "wallet maintenance capability disabled".into()));
     }
     match method {
@@ -200,12 +238,18 @@ async fn dispatch_inner(
         }
         "backup_wallet" => {
             let p: BackupWallet = parse(params)?;
-            output(crate::commands::extra::backup_wallet_inner(state, p.backup_path, p.password).await)
+            output(crate::commands::extra::backup_wallet_authorized(state, p.backup_path, p.password, p.totp_code).await)
         }
         "change_password" => {
             let p: ChangePassword = parse(params)?;
-            output(crate::commands::wallet::change_password_impl(state, &p.old_password, &p.new_password).await)
+            output(crate::commands::wallet::change_password_authorized(state, &p.old_password, &p.new_password, p.totp_code.as_deref()).await)
         }
+        "begin_totp_setup" => { let p: Password = parse(params)?; output(crate::commands::wallet::begin_totp_setup_inner(state, &p.password).await) }
+        "confirm_totp_setup" => { let p: SetupConfirm = parse(params)?; output(crate::commands::wallet::confirm_totp_setup_inner(state, &p.password, &p.code).await) }
+        "cancel_totp_setup" => output(crate::commands::wallet::cancel_totp_setup_inner(state).await),
+        "recover_totp" => { let p: Recovery = parse(params)?; output(crate::commands::wallet::recover_totp_inner(state, &p.password, &p.recovery_code).await) }
+        "disable_totp" => { let p: SetupConfirm = parse(params)?; output(crate::commands::wallet::disable_totp_inner(state, p.password, p.code).await) }
+        "generate_totp_recovery_codes" => { let p: SetupConfirm = parse(params)?; output(crate::commands::wallet::generate_totp_recovery_codes_inner(state, p.password, p.code).await) }
         "enable_totp" => {
             let p: Password = parse(params)?;
             output(crate::commands::wallet::enable_totp_inner(state, p.password).await)
@@ -404,13 +448,20 @@ pub fn run(data_dir: String, caps: Capabilities) -> Result<(), String> {
                     {
                         continue;
                     }
-                    let result = runtime.block_on(dispatch(&state, caps, method.unwrap(), params));
-                    id.map(|id| match result {
-                        Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
-                        Err((code, message)) => {
-                            json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
-                        }
-                    })
+                    if matches!(method.unwrap(), "preview_migration" | "migrate_wallet") {
+                        let result=runtime.block_on(dispatch_migration(&state,caps,method.unwrap(),params));
+                        id.map(|id| match result {
+                            Ok(value)=>json!({"jsonrpc":"2.0","id":id,"result":value}),
+                            Err((code,message,Some(data)))=>json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message,"data":data}}),
+                            Err((code,message,None))=>json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}),
+                        })
+                    } else {
+                        let result = runtime.block_on(dispatch(&state, caps, method.unwrap(), params));
+                        id.map(|id| match result {
+                            Ok(value) => json!({"jsonrpc":"2.0","id":id,"result":value}),
+                            Err((code, message)) => json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
+                        })
+                    }
                 }
             }
         };
@@ -428,6 +479,22 @@ mod payment_dispatch_tests {
     use super::*;
     use crate::db::repositories;
     use crate::security::totp::TotpInstance;
+
+    #[test]
+    fn migration_unknown_outcome_remains_structured_in_rpc_error() {
+        let error = crate::services::wallet_migration::MigrationError {
+            phase: "commit", outcome: "unknown", reopen_required: true,
+            backup_path: Some("backup.sqlite".into()), backup_outcome: "published",
+            message: "commit outcome uncertain",
+        };
+        let (code, _, data) = migration_rpc_error(error);
+        let data = data.unwrap();
+        assert_eq!(code, -32000);
+        assert_eq!(data["outcome"], "unknown");
+        assert_eq!(data["reopen_required"], true);
+        assert_eq!(data["backup_outcome"], "published");
+        assert_eq!(data["backup_path"], "backup.sqlite");
+    }
 
     #[test]
     fn invalid_capabilities_are_rejected_before_directory_creation() {
@@ -535,7 +602,7 @@ mod payment_dispatch_tests {
         let setup = dispatch(
             &state,
             caps,
-            "enable_totp",
+            "begin_totp_setup",
             json!({"password":"test-password"}),
         )
         .await
@@ -547,6 +614,7 @@ mod payment_dispatch_tests {
             .unwrap()
             .generate_current()
             .unwrap();
+        dispatch(&state, caps, "confirm_totp_setup", json!({"password":"test-password", "code":code})).await.unwrap();
         let plan = dispatch(&state, caps, "prepare_tx", json!({"outputs":[{"address":"1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa","satoshis":10000}], "fee_rate":1})).await.unwrap();
         let plan_id = plan["plan_id"].as_str().unwrap();
         assert!(dispatch(
@@ -577,6 +645,22 @@ mod payment_dispatch_tests {
         .await
         .unwrap();
         assert!(signed["txid"].is_string());
+        let tx = Transaction::from_hex(signed["signed_tx_hex"].as_str().unwrap()).unwrap();
+        assert_eq!(tx.inputs[0].source_txid.as_deref(), Some(id.as_str()));
+        let mut spend = bsv::script::spend::Spend::new(bsv::script::spend::SpendParams {
+            locking_script: script,
+            unlocking_script: tx.inputs[0].unlocking_script.clone().unwrap(),
+            source_txid: id,
+            source_output_index: 0,
+            source_satoshis: 100_000,
+            transaction_version: tx.version,
+            transaction_lock_time: tx.lock_time,
+            transaction_sequence: tx.inputs[0].sequence,
+            other_inputs: vec![],
+            other_outputs: tx.outputs.clone(),
+            input_index: 0,
+        });
+        assert!(spend.validate().unwrap());
         let net = state.network.lock().unwrap();
         assert!(!net.connected && net.client.is_none() && net.woc_client.is_none());
         drop(net);

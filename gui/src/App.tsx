@@ -40,24 +40,28 @@ function getTabs(t: ReturnType<typeof useTranslation>['t']) {
 
 import { useTranslation } from './i18n';
 
-function AccountSidebar() {
+function AccountSidebar({ balanceStatus, retryBalance }: { balanceStatus: 'loading' | 'error' | 'ready'; retryBalance: () => void }) {
   const { walletName, balances, activeAccountId, accounts, setActiveAccount } = useStore();
   const { t } = useTranslation();
-  const totalBalance = Object.values(balances).reduce<number>((a, b) => a + (b.total || 0), 0);
-  const confirmedBalance = Object.values(balances).reduce<number>((a, b) => a + (b.confirmed || 0), 0);
-  const unconfirmedBalance = Object.values(balances).reduce<number>((a, b) => a + (b.unconfirmed || 0), 0);
+  const known = balanceStatus === 'ready' && accounts.length > 0 && accounts.every(a => balances[String(a.id)]);
+  const totalBalance = known ? accounts.reduce((n, a) => n + balances[String(a.id)].total, 0) : null;
+  const confirmedBalance = known ? accounts.reduce((n, a) => n + balances[String(a.id)].confirmed, 0) : null;
+  const unconfirmedBalance = known ? accounts.reduce((n, a) => n + balances[String(a.id)].unconfirmed, 0) : null;
   const balanceValues = accounts.map(a => balances[String(a.id)]);
-  const reservedBalance = balanceValues.length && balanceValues.every(b => b?.reserved != null) ? balanceValues.reduce((sum, b) => sum + b.reserved!, 0) : null;
-  const availableBalance = balanceValues.length && balanceValues.every(b => b?.available != null) ? balanceValues.reduce((sum, b) => sum + b.available!, 0) : null;
+  const reservedBalance = known && balanceValues.length && balanceValues.every(b => b?.reserved != null) ? balanceValues.reduce((sum, b) => sum + b.reserved!, 0) : null;
+  const availableBalance = known && balanceValues.length && balanceValues.every(b => b?.available != null) ? balanceValues.reduce((sum, b) => sum + b.available!, 0) : null;
   const [fiatTotal, setFiatTotal] = useState<number | null>(null);
   const [fiatCurrency, setFiatCurrency] = useState('USD');
 
   // Fetch exchange rate and show fiat equivalent
   useEffect(() => {
-    if (totalBalance === 0) { setFiatTotal(null); return; }
+    if (totalBalance === null || totalBalance === 0) { setFiatTotal(null); return; }
+    let cancelled = false;
+    setFiatTotal(null);
     api.satoshisToFiat(totalBalance, fiatCurrency)
-      .then(setFiatTotal)
-      .catch(() => setFiatTotal(null));
+      .then(value => { if (!cancelled) setFiatTotal(value); })
+      .catch(() => { if (!cancelled) setFiatTotal(null); });
+    return () => { cancelled = true; };
   }, [totalBalance, fiatCurrency]);
 
   return (
@@ -71,7 +75,8 @@ function AccountSidebar() {
       {/* Balance summary */}
       <div className="p-3 border-b border-void-700">
         <div className="text-xs text-gray-400 mb-1">{t.sidebar.totalBalance}</div>
-        <div className="text-lg font-semibold text-yellow-400">{totalBalance.toLocaleString()} sat</div>
+        <div className="text-lg font-semibold text-yellow-400">{totalBalance === null ? (balanceStatus === 'error' ? 'Balance unavailable' : 'Balance loading...') : `${totalBalance.toLocaleString()} sat`}</div>
+        {balanceStatus === 'error' && <button onClick={retryBalance}>Retry balance</button>}
         <div className="text-xs text-gray-400">Last synced balance; refresh by syncing the wallet.</div>
         {fiatTotal !== null && (
           <div className="text-xs text-gray-400 mt-0.5">
@@ -83,11 +88,11 @@ function AccountSidebar() {
           <div className="flex justify-between text-xs"><span>Available</span><span>{availableBalance == null ? 'unknown' : `${availableBalance.toLocaleString()} sat`}</span></div>
           <div className="flex justify-between text-xs">
             <span className="text-gray-400">{t.sidebar.confirmed}</span>
-            <span className="text-success">{confirmedBalance.toLocaleString()}</span>
+            <span className="text-success">{confirmedBalance === null ? 'unknown' : confirmedBalance.toLocaleString()}</span>
           </div>
           <div className="flex justify-between text-xs">
             <span className="text-gray-400">{t.sidebar.unconfirmed}</span>
-            <span className="text-warning">{unconfirmedBalance.toLocaleString()}</span>
+            <span className="text-warning">{unconfirmedBalance === null ? 'unknown' : unconfirmedBalance.toLocaleString()}</span>
           </div>
         </div>
       </div>
@@ -131,60 +136,74 @@ function MainView() {
   const {
     activeTab, setActiveTab,
     setNetworkInfo, setWalletInfo, setAccounts, setActiveAccount,
-    updateBalance, activeAccountId, isAuthenticated, setError,
-    triggerHistoryRefresh,
+    updateBalance, activeAccountId, activeWalletPath, walletInstanceToken, isAuthenticated, setError, migrationMessage,
+    triggerHistoryRefresh, balanceRefreshKey,
   } = useStore();
   const { t } = useTranslation();
   const TABS = getTabs(t);
+  const [balanceAttempt, setBalanceAttempt] = useState(0);
+  const [balanceState, setBalanceState] = useState<{ path: string | null; token: string | null; status: 'loading' | 'error' | 'ready' }>({ path: null, token: null, status: 'loading' });
+  const balanceStatus = balanceState.path === activeWalletPath && balanceState.token === walletInstanceToken ? balanceState.status : 'loading';
 
   // Load data on mount
   useEffect(() => {
     if (!isAuthenticated) return;
+    let cancelled = false;
 
     api.getNetworkInfo()
       .then((info: any) => {
+        if (cancelled) return;
         setNetworkInfo({
           connected: info.connected ?? false,
           network: useStore.getState().network,
           blockHeight: info.tip_height ?? 0,
         });
       })
-      .catch((e: Error) => setError(`Network info: ${e.message}`));
+      .catch((e: Error) => { if (!cancelled) setError(`Network info: ${e.message}`); });
 
     api.getWalletInfo()
       .then((r: any) => {
-        setWalletInfo({ walletName: r.wallet_name ?? '', walletLoaded: true });
+        if (!cancelled) setWalletInfo({ walletName: r.wallet_name ?? '', walletLoaded: true });
       })
-      .catch((e: Error) => setError(`Wallet info: ${e.message}`));
+      .catch((e: Error) => { if (!cancelled) setError(`Wallet info: ${e.message}`); });
 
-    api.getAccounts()
-      .then((accounts: any) => {
-        const accountList = Array.isArray(accounts) ? accounts : (accounts.accounts ?? []);
-        const mapped = accountList.map((a: any) => ({
-          id: a.account_id ?? a.id,
-          name: a.account_name ?? a.name ?? '',
-          type: 'standard',
+    return () => { cancelled = true; };
+  }, [isAuthenticated, activeWalletPath, walletInstanceToken]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let cancelled = false;
+    setBalanceState({ path: activeWalletPath, token: walletInstanceToken, status: 'loading' });
+    useStore.setState({ balances: {} });
+    (async () => {
+      try {
+        const result: any = await api.getAccounts();
+        const list = Array.isArray(result) ? result : result.accounts;
+        if (!Array.isArray(list) || !list.length) throw new Error('No accounts');
+        const mapped = list.map((a: any) => ({ id: a.account_id ?? a.id, name: a.account_name ?? a.name ?? '', type: 'standard' }));
+        if (mapped.some((a: any) => !Number.isSafeInteger(a.id)) || new Set(mapped.map((a: any) => a.id)).size !== mapped.length) throw new Error('Invalid account');
+        const entries = await Promise.all(mapped.map(async (a: any) => {
+          const bal = await api.getBalance(a.id);
+          if (![bal.total, bal.confirmed, bal.unconfirmed].every(Number.isSafeInteger) ||
+              [bal.reserved, bal.available].some(v => v != null && !Number.isSafeInteger(v))) throw new Error('Invalid balance');
+          return [String(a.id), { ...bal, unmatured: 0 }] as const;
         }));
-        setAccounts(mapped);
-        if (mapped.length > 0 && mapped[0].id !== undefined) {
-          setActiveAccount(mapped[0].id);
-          for (const acc of mapped) {
-            api.getBalance(acc.id)
-              .then((bal: any) => {
-                updateBalance(String(acc.id), {
-                  confirmed: bal.confirmed ?? 0,
-                  unconfirmed: bal.unconfirmed ?? 0,
-                  unmatured: 0,
-                  total: bal.total ?? 0,
-                  reserved: bal.reserved, available: bal.available,
-                });
-              })
-              .catch((e: Error) => setError(`Balance for account ${acc.id}: ${e.message}`));
-          }
+        for (const field of ['total', 'confirmed', 'unconfirmed', 'reserved', 'available'] as const) {
+          const values = entries.map(([, b]) => b[field]);
+          if (values.every(v => v != null) && !Number.isSafeInteger(values.reduce<number>((sum, v) => sum + v!, 0))) throw new Error('Invalid aggregate');
         }
-      })
-      .catch((e: Error) => setError(`Accounts: ${e.message}`));
-  }, [isAuthenticated]);
+        if (cancelled || useStore.getState().activeWalletPath !== activeWalletPath || useStore.getState().walletInstanceToken !== walletInstanceToken || !useStore.getState().isAuthenticated) return;
+        setAccounts(mapped);
+        const selected = useStore.getState().activeAccountId;
+        setActiveAccount(mapped.some((a: any) => a.id === selected) ? selected! : mapped[0].id);
+        useStore.setState({ balances: Object.fromEntries(entries) });
+        setBalanceState({ path: activeWalletPath, token: walletInstanceToken, status: 'ready' });
+      } catch {
+        if (!cancelled) setBalanceState({ path: activeWalletPath, token: walletInstanceToken, status: 'error' });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isAuthenticated, activeWalletPath, walletInstanceToken, balanceAttempt, balanceRefreshKey]);
 
   // Tauri Events: Live updates (replaces SSE/EventSource)
   useEffect(() => {
@@ -198,37 +217,18 @@ function MainView() {
       if (cancelled) return;
 
       const unlisten1 = await listen('new_transaction', (event) => {
+        if (cancelled) return;
         const data = event.payload as any;
         triggerHistoryRefresh();
-        if (data.account_id !== undefined) {
-          api.getBalance(data.account_id)
-            .then((bal: any) => {
-              updateBalance(String(data.account_id), {
-                confirmed: bal.confirmed ?? 0,
-                unconfirmed: bal.unconfirmed ?? 0,
-                unmatured: 0,
-                total: bal.total ?? 0,
-                  reserved: bal.reserved, available: bal.available,
-              });
-            })
-            .catch(() => {});
-        }
+        if (data.account_id !== undefined) setBalanceAttempt(n => n + 1);
       });
 
       const unlisten2 = await listen('balance_changed', (event) => {
-        const data = event.payload as any;
-        if (data.account_id !== undefined) {
-          updateBalance(String(data.account_id), {
-            confirmed: data.confirmed ?? 0,
-            unconfirmed: data.unconfirmed ?? 0,
-            unmatured: 0,
-            total: data.total ?? 0,
-            reserved: data.reserved, available: data.available,
-          });
-        }
+        if (!cancelled && event.payload) setBalanceAttempt(n => n + 1);
       });
 
       const unlisten3 = await listen('new_block', (event) => {
+        if (cancelled) return;
         const data = event.payload as any;
         setNetworkInfo({
           connected: true,
@@ -238,6 +238,7 @@ function MainView() {
       });
 
       unlistenFns = [unlisten1, unlisten2, unlisten3];
+      if (cancelled) unlistenFns.forEach(fn => fn());
     })().catch(() => {
       // Tauri event listener setup failed — non-fatal
     });
@@ -246,23 +247,7 @@ function MainView() {
       cancelled = true;
       unlistenFns.forEach((fn) => fn());
     };
-  }, [isAuthenticated]);
-
-  // Refresh balance on account switch
-  useEffect(() => {
-    if (!isAuthenticated || activeAccountId === null) return;
-    api.getBalance(activeAccountId)
-      .then((bal: any) => {
-        updateBalance(String(activeAccountId), {
-          confirmed: bal.confirmed ?? 0,
-          unconfirmed: bal.unconfirmed ?? 0,
-          unmatured: bal.unmatured ?? 0,
-          total: bal.total ?? 0,
-                  reserved: bal.reserved, available: bal.available,
-        });
-      })
-      .catch((e: Error) => setError(`Balance refresh: ${e.message}`));
-  }, [activeAccountId, isAuthenticated, setError]);
+  }, [isAuthenticated, activeWalletPath, walletInstanceToken]);
 
   const handleQuit = async () => {
     // Close the active wallet before returning to landing
@@ -279,6 +264,7 @@ function MainView() {
 
   return (
     <div className="flex flex-col h-screen bg-void-950 text-gray-100">
+      {migrationMessage && <div className="p-2 text-sm text-warning" role="status">{migrationMessage}</div>}
       {/* Menu bar (top) */}
       <MenuBar onQuit={handleQuit} />
 
@@ -302,7 +288,7 @@ function MainView() {
 
       {/* Main content area: sidebar + view */}
       <div className="flex flex-1 overflow-hidden">
-        <AccountSidebar />
+        <AccountSidebar balanceStatus={balanceStatus} retryBalance={() => setBalanceAttempt(n => n + 1)} />
         <main className="flex-1 overflow-auto">
           {activeTab === 'history' && <HistoryView />}
           {activeTab === 'send' && <SendView />}
@@ -324,12 +310,87 @@ function MainView() {
   );
 }
 
+function MigrationGate() {
+  const { migrationGate, migrationMessage, resetToLanding } = useStore();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const closeAndReturn = async () => {
+    setBusy(true); setError(null);
+    try {
+      const status = await api.getWalletInfo();
+      if (typeof status?.is_open !== 'boolean') throw new Error('Wallet state unavailable');
+      if (status.is_open) await api.closeWallet('');
+      resetToLanding();
+    } catch (e: any) { setError(e?.message || String(e)); }
+    finally { setBusy(false); }
+  };
+  if (migrationGate === 'pending') return <div className="p-6 text-warning" role="status">Migration in progress. Do not close the application.</div>;
+  return <div className="p-6 space-y-4" role="alert">
+    <p>{migrationMessage}</p>
+    <p>Close and reopen the wallet to check its status before using it. Do not retry the operation until its outcome is known.</p>
+    {error && <p className="text-danger">{error}</p>}
+    <button disabled={busy} onClick={closeAndReturn} className="text-accent">Close wallet and return to wallet list</button>
+  </div>;
+}
+
+function MigrationReopenCheck() {
+  const { activeWalletPath, migrationVerificationPath, migrationExpectedFormat, migrationNeedsTotpCheck, clearMigrationVerification, resetToLanding } = useStore();
+  const [differentFormat, setDifferentFormat] = useState<33 | 34 | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    let active = true;
+    api.getWalletInfo().then(async status => {
+      if (!active) return;
+      if (status?.is_open !== true || status.is_unlocked !== true || (status.wallet_format !== 33 && status.wallet_format !== 34)) {
+        setError('Wallet format or unlocked state is unknown. Close the wallet and check again.'); return;
+      }
+      let protection = '';
+      if (migrationNeedsTotpCheck) {
+        const totp = await api.getTotpStatus();
+        if (!active) return;
+        if (typeof totp.enabled !== 'boolean') { setError('2FA status is unknown. Close the wallet and check again.'); return; }
+        protection = totp.enabled ? ' 2FA is enabled.' : ' 2FA is disabled; set it up again before signing transactions.';
+      }
+      if (activeWalletPath !== migrationVerificationPath) {
+        if (migrationNeedsTotpCheck) {
+          setDifferentFormat(null);
+          setError('A different wallet was opened. Reopen the original wallet to check its 2FA status.');
+        } else {
+          setDifferentFormat(status.wallet_format);
+          setError('A different wallet was opened. Reopen the migrated wallet or explicitly continue with this different wallet.');
+        }
+        return;
+      }
+      if (migrationExpectedFormat !== null && status.wallet_format !== migrationExpectedFormat) {
+        setError('The reopened format does not match the migration outcome. Close the wallet and investigate before continuing.'); return;
+      }
+      clearMigrationVerification(`Reopened wallet reports format ${status.wallet_format}. The format marker is not an authentication proof.${protection}`);
+    }).catch(() => { if (active) setError('Could not check wallet status. Close the wallet and check again.'); });
+    return () => { active = false; };
+  }, [activeWalletPath, migrationVerificationPath, migrationExpectedFormat, migrationNeedsTotpCheck, clearMigrationVerification]);
+  const closeAndReturn = async () => {
+    setBusy(true); setError(null);
+    try { await api.closeWallet(''); resetToLanding(); }
+    catch (e: any) { setError(e?.message || String(e)); }
+    finally { setBusy(false); }
+  };
+  return <div className="p-6 space-y-4" role="status">
+    <p>Checking the reopened wallet before use.</p>
+    {error && <p className="text-warning">{error}</p>}
+    {differentFormat !== null && <button onClick={() => clearMigrationVerification(`A different wallet was explicitly selected; it reports format ${differentFormat}.`)} className="text-accent">Continue with this different wallet</button>}
+    <button disabled={busy} onClick={closeAndReturn} className="text-accent">Close wallet and return to wallet list</button>
+  </div>;
+}
+
 function App() {
-  const { view, isAuthenticated } = useStore();
+  const { view, isAuthenticated, migrationGate, migrationVerificationPath, migrationNeedsTotpCheck } = useStore();
   // useDaemonLifecycle removed — Tauri mode has no daemon
 
+  if (migrationGate && migrationGate !== 'idle') return <MigrationGate />;
   if (view === 'landing') return <LandingPage />;
   if (view === 'login' || !isAuthenticated) return <LoginScreen />;
+  if (migrationVerificationPath || migrationNeedsTotpCheck) return <MigrationReopenCheck />;
   return <MainView />;
 }
 

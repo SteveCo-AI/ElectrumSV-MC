@@ -1,5 +1,7 @@
 // services/mod.rs — Application services
 pub mod wallet_service;
+pub(crate) mod wallet_migration;
+pub(crate) mod wallet_security;
 pub mod account_service;
 pub mod transaction_service;
 // From later milestones:

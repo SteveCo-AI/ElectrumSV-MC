@@ -1335,16 +1335,21 @@ pub async fn consume_recovery_code(pool: &SqlitePool, code_hash: &str) -> anyhow
 
 pub async fn recover_totp_atomically(pool: &SqlitePool, code_hash: &str) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
-    let stored: Option<(String,)> = sqlx::query_as("SELECT value FROM WalletData WHERE key = ?").bind(TOTP_RECOVERY_CODES_KEY).fetch_optional(&mut *tx).await?;
+    if !recover_totp_in_transaction(&mut tx, code_hash).await? { return Ok(false); }
+    tx.commit().await?;
+    Ok(true)
+}
+
+pub(crate) async fn recover_totp_in_transaction(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, code_hash: &str) -> anyhow::Result<bool> {
+    let stored: Option<(String,)> = sqlx::query_as("SELECT value FROM WalletData WHERE key = ?").bind(TOTP_RECOVERY_CODES_KEY).fetch_optional(&mut **tx).await?;
     let Some((json,)) = stored else { return Ok(false); };
     let codes: Vec<String> = serde_json::from_str(&json)?;
     if !codes.iter().any(|code| code == code_hash) { return Ok(false); }
     let updated = sqlx::query("UPDATE WalletData SET value = '[]', date_updated = ? WHERE key = ? AND value = ?")
-        .bind(chrono::Utc::now().timestamp()).bind(TOTP_RECOVERY_CODES_KEY).bind(json).execute(&mut *tx).await?;
+        .bind(chrono::Utc::now().timestamp()).bind(TOTP_RECOVERY_CODES_KEY).bind(json).execute(&mut **tx).await?;
     if updated.rows_affected() != 1 { return Ok(false); }
-    let deleted = sqlx::query("DELETE FROM TotpSecrets WHERE id = 1").execute(&mut *tx).await?;
+    let deleted = sqlx::query("DELETE FROM TotpSecrets WHERE id = 1").execute(&mut **tx).await?;
     if deleted.rows_affected() != 1 { return Ok(false); }
-    tx.commit().await?;
     Ok(true)
 }
 

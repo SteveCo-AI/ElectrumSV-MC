@@ -113,9 +113,9 @@ Run the backend and frontend suites:
 (cd gui && npm ci && npm test -- --run)
 ```
 
-The current Linux offline bundle and release maintenance and payment smokes passed; the separate current TLS loopback and earlier 26 GUI tests are reported with their scope in [START_HIER_DE.md](START_HIER_DE.md#lokale-prüfung). Payment coverage includes SDK script validation, fee checks, mock broadcast and crash-restart persistence. Test fixtures do not add a production RPC. The current release hash and artifact details are recorded there.
+The current source passed the Linux offline bundle and 54 GUI tests; release migration, maintenance and payment smokes and the separate TLS loopback are reported with their scope in [START_HIER_DE.md](START_HIER_DE.md#lokale-prüfung). Payment coverage includes SDK script validation, fee checks, mock broadcast and crash-restart persistence. Test fixtures do not add a production RPC. The current release hash and artifact details are recorded there.
 
-An earlier release passed an offline agent smoke and GUI startup/wallet-list IPC smoke. Screenshots, visual interaction, full GUI payment workflows, the GUI startup of the latest build and real broadcast remain unverified. A read-only live TLS smoke on an earlier release against `electrumx.gorillapool.io:50002` completed sync, returned zero balance and 81 history entries, and disconnected cleanly. It did not verify server truth or chain consensus. Do not use real funds.
+An earlier release passed an offline agent smoke and GUI startup/wallet-list IPC smoke. Screenshots, visual interaction, full GUI payment workflows, the GUI startup of the latest build and real broadcast remain unverified. A read-only live TLS smoke on the current release against `electrumx.gorillapool.io:50002` completed sync, returned zero balance and 81 history entries, and disconnected cleanly. It did not verify server truth or chain consensus. Do not use real funds.
 
 ### QR Code Round-Trip Verification
 
