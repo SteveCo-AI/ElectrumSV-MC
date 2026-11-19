@@ -16,11 +16,11 @@ The separate publishing snapshot is at `../.electrumsv-publish-snapshot/`. The p
 
 The isolated payment test used a real Wry/Tauri send view with synthetic wallet state and a local TLS mock. It covered sync, incorrect and correct TOTP, signing, connection loss with an unknown outcome, and an explicit retry using identical transaction bytes. The mock checked the script VM and actual fee. It did not establish GUI login, GUI connection setup, persistent TOTP policy, live broadcast, or consensus. See the [roadmap](roadmap.md), [KNOWN_ISSUES.md](../KNOWN_ISSUES.md), and [test host](../tools/wry-payment/README.md) for details and boundaries.
 
-The current Linux test artifact is `src-tauri/target/release/electrumsv-mc`, SHA-256 `0e64770557616e19c9ef8762b281ce74efce462b3bba9c1625affe853f08cf5d`. It includes the still-unaccepted U1 UTXO-view changes. A separate isolated agent smoke checked startup, an empty wallet status, and disabled-by-default capabilities; it did not exercise a release-binary payment. The prior artifact is retained as `src-tauri/target/release/electrumsv-mc-18e1b1cd-teststand`, SHA-256 `18e1b1cdf19bc5abc90591f5f33acfd9edca7673240ab29e02139a126ce449d7`. Earlier checks and their source versions are described in [START_HIER_DE.md](../START_HIER_DE.md).
+The current Linux test artifact is `src-tauri/target/release/electrumsv-mc`, SHA-256 `0e64770557616e19c9ef8762b281ce74efce462b3bba9c1625affe853f08cf5d`. It includes an earlier UTXO view, but predates the accepted U1.1 and U1.2 source changes. A separate isolated agent smoke checked startup, an empty wallet status, and disabled-by-default capabilities; it did not exercise a release-binary payment. The prior artifact is retained as `src-tauri/target/release/electrumsv-mc-18e1b1cd-teststand`, SHA-256 `18e1b1cdf19bc5abc90591f5f33acfd9edca7673240ab29e02139a126ce449d7`. Earlier checks and their source versions are described in [START_HIER_DE.md](../START_HIER_DE.md).
 
 ## Current local state: U1
 
-U1 remains **in progress, not fully accepted**. The read-only UTXO view correction U1.1 was accepted after review; the related sync identifier boundary U1.2 remains under investigation. The changed UTXO view distinguishes wallet path, instance token, and account; separates stale responses, loading errors, and empty results; and validates values and duplicate outpoints. It no longer labels every non-coinbase output as P2PKH without script evidence. This is a GUI guard, not a demonstrated backend instance-CAS guarantee.
+U1 was **accepted** after the UTXO view correction and replacement of ambiguous temporary negative sync IDs with typed references. Focused database, ownership, rollback, two-pass local TLS sync and Wry payment checks passed; the full library suite passed 646 tests with 7 ignored. The changed UTXO view distinguishes wallet path, instance token, and account; separates stale responses, loading errors, and empty results; and validates values and duplicate outpoints. It no longer labels every non-coinbase output as P2PKH without script evidence. This is a GUI guard, not a demonstrated backend instance-CAS guarantee.
 
 Files and SHA-256 hashes at the pause:
 
@@ -29,9 +29,9 @@ Files and SHA-256 hashes at the pause:
 - `gui/src/__tests__/UtxoView.test.tsx`: `5a8fb90d3cb3ac4c5a7d3dce844a956193987ecf8ced44efec6f0782de1f936a`
 - `gui/src/__tests__/WalletViews.test.tsx`: `54b40d5aad248914cf469b2553a8bce49c0ae8f617d84eefd9428bc787ffef90`
 
-U1.1 removed an unnecessarily strict nonnegative check on the read-only backend ID. Two synthetic negative-ID cases failed before the fix; 38/38 focused and 175/175 GUI tests passed afterward, along with a GUI build. No real negative-ID legacy wallet has been identified. U1.2 investigates the separate ambiguity between stored negative IDs and temporary discovery sentinels; it remains unaccepted. The current release binary predates the latest U1.1 source change.
+U1.1 removed an unnecessarily strict nonnegative check on the read-only backend ID. Two synthetic negative-ID cases failed before the fix; 38/38 focused and 175/175 GUI tests passed afterward, along with a GUI build. No real negative-ID legacy wallet has been identified. U1.2 addresses the separate ambiguity between stored negative IDs and temporary discovery sentinels; the scoped package is accepted after the documented tests and source review. The current release binary predates the latest U1.1 source change.
 
-Complete U1.2 with synthetic fixtures and source review before accepting U1 in the [roadmap](roadmap.md). Keep database changes atomic and protect existing wallet data. Save subsequent changes to the designated GitHub branch; do not publish user data or test secrets.
+The next planned work is R4, an explicit bounded recovery search and conservative merge; it is not yet implemented. Keep database changes atomic and protect existing wallet data. Save subsequent changes to the designated GitHub branch; do not publish user data or test secrets.
 
 ## Architecture stage
 

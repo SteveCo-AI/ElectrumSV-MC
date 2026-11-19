@@ -605,7 +605,7 @@ mod tests {
             let delta = if key_row.keyinstance_id == change_key.keyinstance_id { change_output.satoshis.unwrap() as i64 } else { -100_000 };
             let transaction = repositories::SyncTransaction { hash: tx_hash.clone(), height: None,
                 raw: hex::decode(&signed.signed_tx_hex).unwrap().into(), delta: Some(delta) };
-            repositories::SyncKeySnapshot { key_id: key_row.keyinstance_id, transactions: vec![transaction], outputs }
+            repositories::SyncKeySnapshot { key_id: repositories::SyncKeyRef::Existing(key_row.keyinstance_id), transactions: vec![transaction], outputs }
         }).collect::<Vec<_>>();
         repositories::replace_sync_snapshot(&pool, account, &keys, None, &snapshots).await.unwrap();
         let refreshed = account_service::get_balance(&state, None).await.unwrap();
@@ -625,7 +625,7 @@ mod tests {
         assert_eq!((confirmed.confirmed, confirmed.unconfirmed, confirmed.available), (refreshed.total, 0, refreshed.total));
         let original_hash = crate::core::address::hex_str_to_hash(&funding.id().unwrap()).unwrap();
         let reorg = keys.iter().map(|k| repositories::SyncKeySnapshot {
-            key_id: k.keyinstance_id,
+            key_id: repositories::SyncKeyRef::Existing(k.keyinstance_id),
             transactions: if k.keyinstance_id == key { vec![repositories::SyncTransaction { hash: original_hash.clone(), height: Some(10), raw: raw.clone().into(), delta: Some(100_000) }] } else { vec![] },
             outputs: if k.keyinstance_id == key { vec![repositories::SyncOutput { hash: original_hash.clone(), height: Some(10), index: 0, value: 100_000, coinbase: false, script_pubkey: hex::encode(funding.outputs[0].locking_script.to_binary()) }] } else { vec![] },
         }).collect::<Vec<_>>();

@@ -20,6 +20,7 @@ use crate::network::electrumx::ElectrumXClient;
 use crate::network::header_store::{HeaderStore, ParsedHeader};
 use crate::network::server_list::{ServerStatus, ServerStatusInfo};
 use crate::state::AppState;
+use crate::db::repositories::SyncKeyRef;
 use bsv::compat::bip32::ExtendedKey;
 use tauri::State;
 
@@ -365,10 +366,10 @@ where F: FnOnce(String) -> Fut, Fut: std::future::Future<Output = Result<serde_j
 
 fn calculate_history_values(
     tx: &bsv::transaction::transaction::Transaction,
-    wallet_scripts: &std::collections::HashMap<String, i64>,
+    wallet_scripts: &std::collections::HashMap<String, SyncKeyRef>,
     parents: &RawTransactionCache,
-) -> Result<(std::collections::HashMap<i64, i64>, bool), String> {
-    let mut amounts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+) -> Result<(std::collections::HashMap<SyncKeyRef, i64>, bool), String> {
+    let mut amounts: std::collections::HashMap<SyncKeyRef, i64> = std::collections::HashMap::new();
     for output in &tx.outputs {
         let hash = crate::network::backend::scripthash_from_script(&hex::encode(output.locking_script.to_binary())).map_err(|e| e.to_string())?;
         if let Some(key) = wallet_scripts.get(&hash) {
@@ -401,7 +402,7 @@ fn validate_utxo_history(transactions: &[repositories::SyncTransaction], outputs
     Ok(())
 }
 
-fn validate_history_membership(amounts: &std::collections::HashMap<i64, i64>, owners: &std::collections::HashSet<i64>, complete: bool) -> Result<(), String> {
+fn validate_history_membership(amounts: &std::collections::HashMap<SyncKeyRef, i64>, owners: &std::collections::HashSet<SyncKeyRef>, complete: bool) -> Result<(), String> {
     if amounts.keys().any(|key| !owners.contains(key)) {
         return Err("server history omitted a wallet key involved in a transaction".into());
     }
@@ -412,7 +413,7 @@ fn validate_history_membership(amounts: &std::collections::HashMap<i64, i64>, ow
 }
 
 async fn resolve_sync_history<F, Fut>(
-    snapshots: &mut [repositories::SyncKeySnapshot], wallet_scripts: &std::collections::HashMap<String, i64>,
+    snapshots: &mut [repositories::SyncKeySnapshot], wallet_scripts: &std::collections::HashMap<String, SyncKeyRef>,
     tx_cache: &mut RawTransactionCache, raw_bytes: &mut usize, mut fetch: F,
 ) -> Result<(), String>
 where F: FnMut(String) -> Fut, Fut: std::future::Future<Output = Result<serde_json::Value, NetworkError>> {
@@ -432,7 +433,7 @@ where F: FnMut(String) -> Fut, Fut: std::future::Future<Output = Result<serde_js
             resolved.insert(id, (std::sync::Arc::<[u8]>::from(raw), amounts, complete));
         }
     }
-    let mut listed: std::collections::HashMap<String, std::collections::HashSet<i64>> = std::collections::HashMap::new();
+    let mut listed: std::collections::HashMap<String, std::collections::HashSet<SyncKeyRef>> = std::collections::HashMap::new();
     for snapshot in snapshots.iter() {
         for item in &snapshot.transactions {
             listed.entry(crate::core::address::hash_to_hex_str(&item.hash)).or_default().insert(snapshot.key_id);
@@ -538,16 +539,12 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
     let expected_keys = repositories::get_keyinstances_for_account(&pool, acct_id)
         .await.map_err(|e| format!("failed to load keyinstances: {e}"))?;
     let discovered = discover_used_keys(&client, &pool, acct_id, &account_key, &expected_keys).await?;
-    let mut key_instances = expected_keys.clone();
+    let mut key_instances: Vec<(SyncKeyRef, Vec<u8>)> = expected_keys.iter()
+        .map(|key| (SyncKeyRef::Existing(key.keyinstance_id), key.derivation_data.clone())).collect();
     if let Some(paths) = &discovered {
         for (index, (chain, child)) in paths.iter().enumerate() {
-            key_instances.push(repositories::KeyInstanceRow {
-                keyinstance_id: -(index as i64) - 1, account_id: acct_id, masterkey_id: None,
-                derivation_type: repositories::derivation_type::BIP32,
-                derivation_data: serde_json::json!({"subpath": [chain, child]}).to_string().into_bytes(),
-                script_type: repositories::script_type::P2PKH, flags: 0, description: None,
-                date_created: 0, date_updated: 0,
-            });
+            key_instances.push((SyncKeyRef::Discovered(index),
+                serde_json::json!({"subpath": [chain, child]}).to_string().into_bytes()));
         }
     }
 
@@ -574,13 +571,13 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
     let mut tx_cache = RawTransactionCache::new();
     let mut raw_bytes = 0usize;
 
-    for ki in &key_instances {
+    for (key_ref, derivation_bytes) in &key_instances {
         // Parse derivation_data to get subpath
-        let derivation_data: serde_json::Value = serde_json::from_slice(&ki.derivation_data)
+        let derivation_data: serde_json::Value = serde_json::from_slice(derivation_bytes)
             .map_err(|e| {
                 format!(
-                    "invalid derivation_data for keyinstance {}: {e}",
-                    ki.keyinstance_id
+                    "invalid derivation_data for keyinstance {:?}: {e}",
+                    key_ref
                 )
             })?;
 
@@ -589,8 +586,8 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
             .and_then(|s| s.as_array())
             .ok_or_else(|| {
                 format!(
-                    "missing subpath in derivation_data for keyinstance {}",
-                    ki.keyinstance_id
+                    "missing subpath in derivation_data for keyinstance {:?}",
+                    key_ref
                 )
             })?;
 
@@ -607,15 +604,15 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
         let derivation_path = format!("{}/{}", type_idx, addr_idx);
         let child_key = account_key.derive(&derivation_path).map_err(|e| {
             format!(
-                "derivation failed for keyinstance {}: {e}",
-                ki.keyinstance_id
+                "derivation failed for keyinstance {:?}: {e}",
+                key_ref
             )
         })?;
 
         let pubkey = child_key.public_key().map_err(|e| {
             format!(
-                "public key derivation failed for keyinstance {}: {e}",
-                ki.keyinstance_id
+                "public key derivation failed for keyinstance {:?}: {e}",
+                key_ref
             )
         })?;
 
@@ -626,19 +623,19 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
         let scripthash =
             crate::network::backend::scripthash_from_address(&addr_str).map_err(|e| {
                 format!(
-                    "scripthash computation failed for keyinstance {}: {e}",
-                    ki.keyinstance_id
+                    "scripthash computation failed for keyinstance {:?}: {e}",
+                    key_ref
                 )
             })?;
 
         let target = ScriptHash::try_from(scripthash.as_str()).map_err(|e| e.to_string())?;
-        if wallet_scripts.insert(scripthash.clone(), ki.keyinstance_id).is_some() {
+        if wallet_scripts.insert(scripthash.clone(), *key_ref).is_some() {
             return Err("duplicate wallet script".into());
         }
 
         log::debug!(
-            "sync_wallet: keyinstance {} — address {} — scripthash {}",
-            ki.keyinstance_id,
+            "sync_wallet: keyinstance {:?} — address {} — scripthash {}",
+            key_ref,
             addr_str,
             scripthash
         );
@@ -646,7 +643,7 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
         // Fetch balance from server
         let balance = match client.get_balance(&target).await {
             Ok(b) => b,
-            Err(e) => return Err(format!("keyinstance {}: balance error: {e}", ki.keyinstance_id)),
+            Err(e) => return Err(format!("keyinstance {:?}: balance error: {e}", key_ref)),
         };
 
         total_balance_confirmed = total_balance_confirmed.checked_add(balance.confirmed).ok_or("confirmed balance overflow")?;
@@ -655,7 +652,7 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
         // Fetch history from server
         let history = match client.get_history(&target).await {
             Ok(h) => h,
-            Err(e) => return Err(format!("keyinstance {}: history error: {e}", ki.keyinstance_id)),
+            Err(e) => return Err(format!("keyinstance {:?}: history error: {e}", key_ref)),
         };
 
         total_tx_count = total_tx_count.checked_add(history.len()).ok_or("history entry count overflow")?;
@@ -668,7 +665,7 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
         // Fetch UTXOs from server
         let utxos = match client.get_utxos(&target).await {
             Ok(u) => u,
-            Err(e) => return Err(format!("keyinstance {}: utxos error: {e}", ki.keyinstance_id)),
+            Err(e) => return Err(format!("keyinstance {:?}: utxos error: {e}", key_ref)),
         };
 
         let mut coinbase_txids = std::collections::HashSet::new();
@@ -714,14 +711,14 @@ pub async fn sync_wallet_inner(state: &AppState, account_id: Option<i64>) -> Res
                 value: output.value as i64, coinbase: coinbase_txids.contains(&output.tx_hash), script_pubkey });
         }
         validate_utxo_history(&transactions, &outputs)?;
-        snapshots.push(repositories::SyncKeySnapshot { key_id: ki.keyinstance_id, transactions, outputs });
+        snapshots.push(repositories::SyncKeySnapshot { key_id: *key_ref, transactions, outputs });
 
         // 6. Subscribe to scripthash updates for push notifications
         // Best-effort — don't fail the sync if subscription fails
         if let Err(e) = client.subscribe_scripthash(&target).await {
             log::warn!(
-                "sync_wallet: subscribe_scripthash failed for keyinstance {}: {e}",
-                ki.keyinstance_id
+                "sync_wallet: subscribe_scripthash failed for keyinstance {:?}: {e}",
+                key_ref
             );
         }
 
@@ -1254,8 +1251,8 @@ mod tests {
         let a = repo::insert_keyinstance(&pool, account, Some(master), repo::derivation_type::BIP32, br#"{"subpath":[0,0]}"#, repo::script_type::P2PKH, 0, None).await.unwrap();
         let b = repo::insert_keyinstance(&pool, account, Some(master), repo::derivation_type::BIP32, br#"{"subpath":[0,1]}"#, repo::script_type::P2PKH, 0, None).await.unwrap();
         let keys = repo::get_keyinstances_for_account(&pool, account).await.unwrap();
-        let scripts = [(crate::network::backend::scripthash_from_script("51").unwrap(), a),
-            (crate::network::backend::scripthash_from_script("52").unwrap(), b)].into_iter().collect();
+        let scripts = [(crate::network::backend::scripthash_from_script("51").unwrap(), repo::SyncKeyRef::Existing(a)),
+            (crate::network::backend::scripthash_from_script("52").unwrap(), repo::SyncKeyRef::Existing(b))].into_iter().collect();
         let receive = coinbase(100, 0x51);
         let transfer = spend(&receive, 90, 0x52);
         let external = coinbase(7, 0x53);
@@ -1263,8 +1260,8 @@ mod tests {
         let graphs = [&receive, &transfer, &external, &pending].into_iter()
             .map(|tx| (tx.id().unwrap(), tx.to_hex().unwrap())).collect::<std::collections::HashMap<_, _>>();
         let snapshots = || vec![
-            repo::SyncKeySnapshot { key_id: a, transactions: vec![entry(&receive), entry(&transfer)], outputs: vec![] },
-            repo::SyncKeySnapshot { key_id: b, transactions: vec![entry(&transfer), entry(&pending)], outputs: vec![] },
+            repo::SyncKeySnapshot { key_id: repo::SyncKeyRef::Existing(a), transactions: vec![entry(&receive), entry(&transfer)], outputs: vec![] },
+            repo::SyncKeySnapshot { key_id: repo::SyncKeyRef::Existing(b), transactions: vec![entry(&transfer), entry(&pending)], outputs: vec![] },
         ];
         let find_value = |rows: Vec<repo::TxDeltaHistoryRow>, tx: &Transaction| rows.into_iter().find(|r| r.tx_hash_hex == tx.id().unwrap()).unwrap().value_delta;
         let missing_id = external.id().unwrap();
@@ -1342,13 +1339,14 @@ mod tests {
 
     #[test]
     fn history_membership_rejects_omitted_and_unrelated_keys() {
-        let amounts = [(1, -100), (2, 90)].into_iter().collect();
-        let only_b = [2].into_iter().collect();
+        use super::SyncKeyRef::Existing;
+        let amounts = [(Existing(1), -100), (Existing(2), 90)].into_iter().collect();
+        let only_b = [Existing(2)].into_iter().collect();
         assert!(super::validate_history_membership(&amounts, &only_b, true).is_err());
-        let extra = [1, 2, 3].into_iter().collect();
+        let extra = [Existing(1), Existing(2), Existing(3)].into_iter().collect();
         assert!(super::validate_history_membership(&amounts, &extra, true).is_err());
         assert!(super::validate_history_membership(&amounts, &extra, false).is_ok());
-        let all = [1, 2].into_iter().collect();
+        let all = [Existing(1), Existing(2)].into_iter().collect();
         assert!(super::validate_history_membership(&amounts, &all, true).is_ok());
     }
 
@@ -1366,16 +1364,16 @@ mod tests {
         let mut tx = Transaction::new();
         tx.inputs.push(TransactionInput { source_txid: Some(parent_id.clone()), source_output_index: 0, ..Default::default() });
         tx.outputs = vec![out(25_000, 0x52), out(74_000, 0x51), out(0, 0x6a)];
-        let scripts = [(crate::network::backend::scripthash_from_script("51").unwrap(), 1),
-            (crate::network::backend::scripthash_from_script("52").unwrap(), 2)].into_iter().collect();
+        let scripts = [(crate::network::backend::scripthash_from_script("51").unwrap(), super::SyncKeyRef::Existing(-1)),
+            (crate::network::backend::scripthash_from_script("52").unwrap(), super::SyncKeyRef::Discovered(0))].into_iter().collect();
         let mut cache = super::RawTransactionCache::new();
         let (_, complete) = super::calculate_history_values(&tx, &scripts, &cache).unwrap();
         assert!(!complete);
         cache.insert(parent_id, Some((hex::decode(parent.to_hex().unwrap()).unwrap(), parent)));
         let (values, complete) = super::calculate_history_values(&tx, &scripts, &cache).unwrap();
         assert!(complete);
-        assert_eq!(values[&1], -26_000);
-        assert_eq!(values[&2], 25_000);
+        assert_eq!(values[&super::SyncKeyRef::Existing(-1)], -26_000);
+        assert_eq!(values[&super::SyncKeyRef::Discovered(0)], 25_000);
         assert_eq!(values.values().sum::<i64>(), -1_000);
         tx.inputs[0].source_output_index = 99;
         assert!(super::calculate_history_values(&tx, &scripts, &cache).is_err());

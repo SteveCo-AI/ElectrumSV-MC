@@ -32,12 +32,14 @@ Bereits vor diesem Stichtag implementierte und geprüfte Arbeiten werden nicht i
 
 ## Next stage: UTXO display
 
-Scope from 2026-11-19: **U1** at the top level. Progress: **0/1 (0%)** accepted. Completion of the previous stage does not mean the entire wallet is complete.
+Scope from 2026-11-19: **U1** at the top level. Progress: **1/1 (100%)** accepted. Completion of the previous stage does not mean the entire wallet is complete.
 
-- [ ] **U1 – Bind the UTXO display to the active wallet session:** Prevent stale or delayed data from other sessions and distinguish errors or invalid data from a genuinely empty balance. Check safe amount and duplicate handling with targeted regressions. This finding concerns the display and does not establish a signing or spending defect.
-  - Status: **in progress** after review identified an unnecessarily restrictive signed-ID display check and a related sync sentinel boundary requiring investigation. No real negative-ID legacy wallet has been established.
+- [x] **U1 – Bind the UTXO display to the active wallet session:** Prevent stale or delayed data from other sessions and distinguish errors or invalid data from a genuinely empty balance. Check safe amount and duplicate handling with targeted regressions. This finding concerns the display and does not establish a signing or spending defect.
+  - Status: **accepted** after U1.1 and U1.2 review, focused regressions, two-pass local TLS sync, a synthetic Wry payment flow, and 646/646 Rust library tests with 7 ignored. No real negative-ID legacy wallet has been established.
   - [x] U1.1: Align the read-only view with safe integer IDs from the backend DTO, preserve all other validation and session guards, and review/test both valid and invalid boundaries. The old behavior was reproduced for synthetic negative IDs; after correction 38 focused and 175 full GUI tests passed, and the build succeeded. No actual legacy negative-ID wallet has been established.
-  - [ ] U1.2: Trace and investigate how negative persisted key IDs interact with temporary discovery sentinels, including the `i64::MIN` boundary; demonstrate impact before choosing a data-preserving correction.
+  - [x] U1.2: Trace and investigate how negative persisted key IDs interact with temporary discovery sentinels, including the `i64::MIN` boundary; demonstrate impact before choosing a data-preserving correction.
+    - Synthetic SQLite reproduction: existing `-1` returned an error both alone and when colliding with discovery index 0; `i64::MIN` panicked in debug. In all error/panic cases the tested key, marker, transaction, output and delta tables were unchanged after rollback. A positive control committed. No real legacy negative-ID wallet or release-profile behavior has been established.
+    - After correction typed `SyncKeyRef` keeps existing IDs separate from discovery indices, including a newly generated negative ID. The synthetic two-pass TLS sync and isolated Wry payment test passed; the full Rust library run passed 646 with 7 ignored. The public `SyncKeySnapshot.key_id` Rust type changed, and key-row CAS now also rejects concurrent changes to flags, labels and timestamps; no complete account/master-key CAS or chain verification is claimed.
 
 ## Architecture boundary stage
 
@@ -55,3 +57,12 @@ Scope from 2026-11-19: **A1–A3** at the top level. Progress: **3/3 (100%)** ac
   - [x] A3.4: Correct backend history entries that claim `verified` solely from a positive server-reported height. Trace consumers and test that no Merkle-proof claim is made without verification.
   - [x] A3.5: Investigate and correct unchecked addition of server-reported confirmed and unconfirmed balances; reject overflow without silently displaying a wrapped value. Preserve documented negative-balance handling.
     - Source review and final isolated checks passed: 175 network/command tests, 2 local WoC integration tests, 1 agent TLS/sync test and the synthetic Wry payment test. The full library suite passed 643 tests with 7 ignored; Rustdoc passed 5 with 1 ignored. The balance check covers the constructor and both provider paths, not arbitrary struct literals or deserialization. See [network contract](network-contract.md) for the Rust API breaks, address restrictions, trust and runtime-cleanup limits.
+
+## Recovery discovery stage
+
+Scope from 2026-11-19: **R4** at the top level. Progress: **0/1 (0%)** accepted. This scope does not measure overall wallet completion.
+
+- [ ] **R4 – Explicit extended address discovery:** Provide a user-initiated bounded search beyond the default 20-address gap through a shared backend, optional agent interface and GUI. Preserve existing wallet data atomically, report conflicts, bind the operation to the wallet instance, and state server privacy and completeness limits. Existing regular sync and its marker semantics remain distinct.
+  - [ ] R4.1: Implement the bounded backend scan and an atomic conservative merge, including existing spent/unspent outputs, history, raw transactions, discovery markers, session changes, resource budgets, cancellation and rollback.
+  - [ ] R4.2: Expose the reviewed backend operation through the Tauri and explicitly enabled agent interfaces with bounded parameters and clear errors.
+  - [ ] R4.3: Add an explicit GUI action with range, privacy, progress/result and conflict handling; verify the full synthetic loopback flow before acceptance.
