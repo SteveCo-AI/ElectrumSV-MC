@@ -37,6 +37,8 @@ The GUI passes the selected account and active wallet-instance token when starti
 
 When an account has no stored keys and the initial discovery actually completes without reported activity, normal sync returns success with a bounded-search warning. It leaves the discovery marker absent so another normal sync repeats discovery. If a marker already exists and there are no stored keys, it reports non-success without claiming to have searched. A wallet or key change during the empty search and a server error abort the result. The final key recheck guards in-process operations; it does not guarantee against arbitrary external database changes or ABA races.
 
+For outputs still reported by the server, normal sync preserves their original creation timestamp and stored flag bits other than the spent/coinbase bits, which are refreshed from the new snapshot. It preserves transaction flags other than the unconfirmed bit. Outputs absent from the new server snapshot are still removed; reservations are stored separately. Preservation of other bits does not establish that their semantics are understood or enforced, particularly for legacy wallets. The separate conservative extended scan has different merge behavior.
+
 ## Rust API compatibility
 
 This stage changes the public Rust API: `NetworkBackend` now requires `QueryTarget`, query and subscription arguments use typed targets, `NetworkError` adds `Unsupported`, and `BackendBalance::new` returns `Result`. External Rust callers and trait implementers may need changes; compatibility with downstream crates has not been verified. The wallet's Tauri and agent JSON contracts were not intentionally changed by this stage.

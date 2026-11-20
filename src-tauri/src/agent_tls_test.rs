@@ -117,6 +117,30 @@ pub(crate) async fn scan_server(targets: std::collections::HashMap<String, (Stri
 }
 
 #[tokio::test]
+#[ignore = "requires an explicitly started isolated workspace scenario server"]
+async fn workspace_scenario_server_with_wallet_client() {
+    use crate::network::{backend::{NetworkBackend, NetworkError, ScriptHash}, electrumx::ElectrumXClient, server_list::ServerEntry};
+    let port: u16 = std::env::var("WS_WALLET_TEST_PORT").expect("local server port").parse().unwrap();
+    let client = ElectrumXClient::new(ServerEntry::new("127.0.0.1",port));
+    client.connect_with_test_roots(roots()).await.unwrap();
+    let target_text = "ab".repeat(32);
+    let target = ScriptHash::try_from(target_text.as_str()).unwrap();
+    let balance = client.get_balance(&target).await.unwrap();
+    assert_eq!((balance.confirmed,balance.unconfirmed,balance.total),(50000,-5,49995));
+    let history = client.get_history(&target).await.unwrap();
+    assert_eq!(history.len(),1);
+    assert_eq!(history[0].tx_hash,"11".repeat(32));
+    assert_eq!(history[0].height,123);
+    assert!(!history[0].verified);
+    let outputs = client.get_utxos(&target).await.unwrap();
+    assert_eq!(outputs.len(),1);
+    assert_eq!((outputs[0].tx_hash.as_str(),outputs[0].tx_pos,outputs[0].value,outputs[0].height), (history[0].tx_hash.as_str(),1,50000,123));
+    assert!(matches!(client.call("test.error",json!([])).await,Err(NetworkError::Server(_))));
+    assert_eq!(client.call("server.ping",json!([])).await.unwrap(),Value::Null);
+    client.disconnect().await.unwrap();
+}
+
+#[tokio::test]
 async fn agent_tls_empty_wallet_sync_and_address_lifecycle() {
     use crate::db::repositories;
     let dir = std::env::temp_dir().join(format!("electrumsv-empty-sync-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()));

@@ -766,7 +766,16 @@ pub async fn replace_sync_snapshot(
     }
     for snapshot in snapshots {
         let id = resolve(snapshot.key_id)?;
-        sqlx::query("DELETE FROM TransactionOutputs WHERE keyinstance_id = ?").bind(id).execute(&mut *tx).await?;
+        let incoming: std::collections::HashSet<(&[u8], i64)> = snapshot.outputs.iter()
+            .map(|output| (output.hash.as_slice(), output.index)).collect();
+        let stored: Vec<(Vec<u8>, i64)> = sqlx::query_as("SELECT tx_hash, tx_index FROM TransactionOutputs WHERE keyinstance_id = ?")
+            .bind(id).fetch_all(&mut *tx).await?;
+        for (hash, index) in stored {
+            if !incoming.contains(&(hash.as_slice(), index)) {
+                sqlx::query("DELETE FROM TransactionOutputs WHERE keyinstance_id = ? AND tx_hash = ? AND tx_index = ?")
+                    .bind(id).bind(hash).bind(index).execute(&mut *tx).await?;
+            }
+        }
         sqlx::query("DELETE FROM TransactionDeltas WHERE keyinstance_id = ?").bind(id).execute(&mut *tx).await?;
         for item in &snapshot.transactions {
             sync_upsert_transaction(&mut tx, &item.hash, item.height, Some(item.raw.as_ref()), now).await?;
@@ -776,8 +785,9 @@ pub async fn replace_sync_snapshot(
         for output in &snapshot.outputs {
             sync_upsert_transaction(&mut tx, &output.hash, output.height, None, now).await?;
             let flags = if output.coinbase { txo_flags::IS_COINBASE } else { 0 };
-            sqlx::query("INSERT INTO TransactionOutputs (tx_hash, tx_index, value, keyinstance_id, flags, script_pubkey, date_created, date_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tx_hash, tx_index) DO UPDATE SET value = excluded.value, flags = excluded.flags, script_pubkey = excluded.script_pubkey, date_updated = excluded.date_updated")
-                .bind(&output.hash).bind(output.index).bind(output.value).bind(id).bind(flags).bind(&output.script_pubkey).bind(now).bind(now).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO TransactionOutputs (tx_hash, tx_index, value, keyinstance_id, flags, script_pubkey, date_created, date_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tx_hash, tx_index) DO UPDATE SET value = excluded.value, flags = (TransactionOutputs.flags & ?) | excluded.flags, script_pubkey = excluded.script_pubkey, date_updated = excluded.date_updated")
+                .bind(&output.hash).bind(output.index).bind(output.value).bind(id).bind(flags).bind(&output.script_pubkey).bind(now).bind(now)
+                .bind(!(txo_flags::IS_COINBASE | txo_flags::IS_SPENT)).execute(&mut *tx).await?;
         }
     }
     tx.commit().await?;
@@ -786,8 +796,8 @@ pub async fn replace_sync_snapshot(
 
 async fn sync_upsert_transaction(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, hash: &[u8], height: Option<i64>, raw: Option<&[u8]>, now: i64) -> anyhow::Result<()> {
     let flags = if height.is_none() { tx_flags::IS_UNCONFIRMED } else { 0 };
-    sqlx::query("INSERT INTO Transactions (tx_hash, tx_data, block_height, flags, date_created, date_updated) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(tx_hash) DO UPDATE SET tx_data = COALESCE(excluded.tx_data, Transactions.tx_data), block_height = excluded.block_height, flags = excluded.flags, date_updated = excluded.date_updated")
-        .bind(hash).bind(raw).bind(height).bind(flags).bind(now).bind(now).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO Transactions (tx_hash, tx_data, block_height, flags, date_created, date_updated) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(tx_hash) DO UPDATE SET tx_data = COALESCE(excluded.tx_data, Transactions.tx_data), block_height = excluded.block_height, flags = (Transactions.flags & ?) | excluded.flags, date_updated = excluded.date_updated")
+        .bind(hash).bind(raw).bind(height).bind(flags).bind(now).bind(now).bind(!tx_flags::IS_UNCONFIRMED).execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -2096,6 +2106,39 @@ mod tests {
         assert_eq!(get_keyinstances_for_account(&pool, account).await.unwrap().len(), 3);
         assert!(get_wallet_data(&pool, &format!("address_discovery_v1_{account}")).await.unwrap().is_none());
         assert_eq!(get_balance_for_account(&pool, account).await.unwrap(), (12000, 0, 12000));
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn sync_preserves_existing_output_and_transaction_metadata() {
+        let (pool, _dir) = setup_test_db("sync_metadata").await;
+        let master = insert_master_key(&pool, None, derivation_type::BIP32, b"test").await.unwrap();
+        let account = insert_account(&pool, Some(master), script_type::P2PKH, "test").await.unwrap();
+        let key = insert_keyinstance(&pool, account, Some(master), derivation_type::BIP32, br#"{"subpath":[0,0]}"#, script_type::P2PKH, 0, None).await.unwrap();
+        let keys = get_keyinstances_for_account(&pool,account).await.unwrap();
+        let hash = vec![42;32];
+        upsert_transaction(&pool,&hash,None,Some(&[1,2,3])).await.unwrap();
+        upsert_transaction_output(&pool,&hash,0,50,key,txo_flags::IS_SPENT | txo_flags::IS_COINBASE | 64,Some("51")).await.unwrap();
+        sqlx::query("UPDATE Transactions SET flags=?, description='preserved', proof_data=? WHERE tx_hash=?")
+            .bind(tx_flags::IS_UNCONFIRMED | tx_flags::IS_COINBASE | 64).bind(vec![9u8]).bind(&hash).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE TransactionOutputs SET date_created=12345 WHERE tx_hash=?").bind(&hash).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO SpendPlans(plan_id,account_id,state,plan_json,fee_rate,expires_at,date_updated) VALUES('test',?,'SIGNED','{}',1,0,0)").bind(account).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO SpendReservations(tx_hash,tx_index,plan_id) VALUES(?,0,'test')").bind(&hash).execute(&pool).await.unwrap();
+        let snapshot = |height,coinbase| vec![SyncKeySnapshot { key_id:SyncKeyRef::Existing(key),
+            transactions:vec![SyncTransaction { hash:hash.clone(), height, raw:vec![1,2,3].into(), delta:Some(50) }],
+            outputs:vec![SyncOutput { hash:hash.clone(), height, index:0, value:50, coinbase, script_pubkey:"51".into() }] }];
+        replace_sync_snapshot(&pool,account,&keys,None,&snapshot(Some(10),false)).await.unwrap();
+        let tx: (i32,Option<String>,Option<Vec<u8>>) = sqlx::query_as("SELECT flags,description,proof_data FROM Transactions WHERE tx_hash=?").bind(&hash).fetch_one(&pool).await.unwrap();
+        assert_eq!(tx,(tx_flags::IS_COINBASE | 64,Some("preserved".into()),Some(vec![9])));
+        let out: (i32,i64) = sqlx::query_as("SELECT flags,date_created FROM TransactionOutputs WHERE tx_hash=? AND tx_index=0").bind(&hash).fetch_one(&pool).await.unwrap();
+        assert_eq!(out,(64,12345));
+        let reservation: (String,) = sqlx::query_as("SELECT plan_id FROM SpendReservations WHERE tx_hash=? AND tx_index=0").bind(&hash).fetch_one(&pool).await.unwrap();
+        assert_eq!(reservation.0,"test");
+        replace_sync_snapshot(&pool,account,&keys,None,&snapshot(None,true)).await.unwrap();
+        let tx_flags: (i32,) = sqlx::query_as("SELECT flags FROM Transactions WHERE tx_hash=?").bind(&hash).fetch_one(&pool).await.unwrap();
+        let out: (i32,i64) = sqlx::query_as("SELECT flags,date_created FROM TransactionOutputs WHERE tx_hash=? AND tx_index=0").bind(&hash).fetch_one(&pool).await.unwrap();
+        assert_eq!(tx_flags.0,tx_flags::IS_COINBASE | tx_flags::IS_UNCONFIRMED | 64);
+        assert_eq!(out,(txo_flags::IS_COINBASE | 64,12345));
         pool.close().await;
     }
 
