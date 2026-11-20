@@ -158,14 +158,13 @@ fn build_bip21_uri(address: &str, amount: Option<i64>, label: Option<&str>) -> S
 
     if let Some(amt) = amount {
         if amt > 0 {
-            // Convert satoshis to BSV (8 decimal places)
-            let bsv = amt as f64 / 1e8;
-            let formatted = format!("{:.8}", bsv);
-            // Strip trailing zeros but keep at least one decimal place
-            let trimmed = formatted
-                .trim_end_matches('0')
-                .trim_end_matches('.');
-            params.push(format!("amount={}", if trimmed.is_empty() { "0" } else { trimmed }));
+            let whole = amt / 100_000_000;
+            let fractional = amt % 100_000_000;
+            let amount = if fractional == 0 { whole.to_string() } else {
+                let decimals = format!("{fractional:08}");
+                format!("{whole}.{}", decimals.trim_end_matches('0'))
+            };
+            params.push(format!("amount={amount}"));
         }
     }
 
@@ -337,6 +336,14 @@ mod tests {
     fn test_build_bip21_uri_with_amount() {
         let uri = build_bip21_uri("1Address123", Some(100000000), None);
         assert_eq!(uri, "bitcoinsv:1Address123?amount=1");
+    }
+
+    #[test]
+    fn test_build_bip21_uri_preserves_every_satoshi() {
+        for (sats, amount) in [(1, "0.00000001"), (100000001, "1.00000001"),
+            (9007199254740990, "90071992.5474099"), (i64::MAX, "92233720368.54775807")] {
+            assert_eq!(build_bip21_uri("1Address123",Some(sats),None), format!("bitcoinsv:1Address123?amount={amount}"));
+        }
     }
 
     #[test]

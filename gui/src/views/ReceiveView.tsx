@@ -39,13 +39,15 @@ export function ReceiveView() {
   if (context.current.wallet !== activeWalletPath || context.current.token !== walletInstanceToken || context.current.account !== activeAccountId) {
     context.current = { wallet: activeWalletPath, token: walletInstanceToken, account: activeAccountId, generation: context.current.generation + 1 };
   }
-  const qrGeneration = useRef(0);
+  const qrGeneration = useRef({ address: 0, payment: 0, script: 0 });
   const requestInFlight = useRef(false);
   const [requestBusy, setRequestBusy] = useState(false);
   const [addresses, setAddresses] = useState<AddressInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [showQR, setShowQR] = useState<string | null>(null);
-  const [qrSvg, setQrSvg] = useState<string | null>(null);
+  const [addressQrSvg, setAddressQrSvg] = useState<string | null>(null);
+  const [paymentQrSvg, setPaymentQrSvg] = useState<string | null>(null);
+  const [scriptQrSvg, setScriptQrSvg] = useState<string | null>(null);
   const [paymentAmount, setPaymentAmount] = useState('');
   const [paymentLabel, setPaymentLabel] = useState('');
   const [paymentUri, setPaymentUri] = useState<string | null>(null);
@@ -58,17 +60,18 @@ export function ReceiveView() {
   const [bip276Busy, setBip276Busy] = useState(false);
   const [bip276ShowQR, setBip276ShowQR] = useState(false);
 
-  const generateQR = useCallback(async (text: string, generation = context.current.generation) => {
-    const request = ++qrGeneration.current;
+  const generateQR = useCallback(async (text: string, kind: 'address' | 'payment' | 'script', generation = context.current.generation) => {
+    const request = ++qrGeneration.current[kind];
+    const setSvg = kind === 'address' ? setAddressQrSvg : kind === 'payment' ? setPaymentQrSvg : setScriptQrSvg;
     try {
       const result = await api.generateQr(text, {
         scale: 10,
         quietZone: 4,
       });
-      if (context.current.generation === generation && qrGeneration.current === request) setQrSvg(result.svg);
+      if (context.current.generation === generation && qrGeneration.current[kind] === request) setSvg(result.svg);
     } catch {
-      if (context.current.generation === generation && qrGeneration.current === request) {
-        setQrSvg(null);
+      if (context.current.generation === generation && qrGeneration.current[kind] === request) {
+        setSvg(null);
         setError('QR code generation failed');
       }
     }
@@ -99,7 +102,9 @@ export function ReceiveView() {
     setAddresses([]);
     setPaymentUri(null);
     setShowQR(null);
-    setQrSvg(null);
+    setAddressQrSvg(null);
+    setPaymentQrSvg(null);
+    setScriptQrSvg(null);
     setEditingLabel(null);
     setBip276Result(null);
     setBip276ShowQR(false);
@@ -123,9 +128,8 @@ export function ReceiveView() {
 
   const handleShowQR = async (addr: string) => {
     setShowQR(addr);
-    setPaymentUri(null);
-    setQrSvg(null);
-    await generateQR(addr);
+    setAddressQrSvg(null);
+    await generateQR(addr, 'address');
   };
 
   const handleCopy = (addr: string) => {
@@ -144,12 +148,14 @@ export function ReceiveView() {
     }
     requestInFlight.current = true;
     setRequestBusy(true);
+    qrGeneration.current.payment++;
+    setPaymentUri(null);
+    setPaymentQrSvg(null);
     try {
       const r = await api.createPaymentRequest(activeAccountId, amount, paymentLabel || undefined);
       if (context.current.generation !== generation) return;
       setPaymentUri(r.uri);
-      setShowQR(null);
-      await generateQR(r.uri, generation);
+      await generateQR(r.uri, 'payment', generation);
     } catch (e: any) {
       if (context.current.generation === generation) setError(`Payment request: ${e.message}`);
     } finally {
@@ -174,10 +180,10 @@ export function ReceiveView() {
     const uri = bip276Input.trim();
     if (!uri) return;
     const generation = context.current.generation;
-    qrGeneration.current++;
+    qrGeneration.current.script++;
     setBip276Busy(true);
     setBip276ShowQR(false);
-    setQrSvg(null);
+    setScriptQrSvg(null);
     try {
       const r = await api.parseBip276Uri(uri) as Bip276Result;
       if (context.current.generation === generation) setBip276Result(r);
@@ -195,7 +201,7 @@ export function ReceiveView() {
   const handleBip276ShowQR = async () => {
     if (!bip276Input.trim()) return;
     setBip276ShowQR(true);
-    await generateQR(bip276Input.trim());
+    await generateQR(bip276Input.trim(), 'script');
   };
 
   return (
@@ -242,8 +248,9 @@ export function ReceiveView() {
           </button>
         </div>
         {paymentUri && (
-          <div className="text-xs font-mono text-gray-400 break-all bg-void-800 p-2 rounded">
-            {paymentUri}
+          <div>
+            <div className="text-xs font-mono text-gray-400 break-all bg-void-800 p-2 rounded">{paymentUri}</div>
+            {paymentQrSvg && <div role="img" aria-label="Payment request QR code" className="w-32 h-32 rounded-lg bg-white p-1 mt-2" dangerouslySetInnerHTML={{ __html: paymentQrSvg }} />}
           </div>
         )}
       </div>
@@ -255,11 +262,13 @@ export function ReceiveView() {
           {addresses.map((addrInfo, i) => (
             <div key={i} className="bg-void-900 rounded-lg p-4 border border-void-700 flex items-start gap-4">
               <div className="flex-shrink-0">
-                {showQR === addrInfo.address || (paymentUri && showQR === null) ? (
-                  qrSvg && (
+                {showQR === addrInfo.address ? (
+                  addressQrSvg && (
                     <div
+                      role="img"
+                      aria-label={`QR code for ${addrInfo.address}`}
                       className="w-32 h-32 rounded-lg bg-white p-1"
-                      dangerouslySetInnerHTML={{ __html: qrSvg }}
+                      dangerouslySetInnerHTML={{ __html: addressQrSvg }}
                     />
                   )
                 ) : (
@@ -320,7 +329,7 @@ export function ReceiveView() {
                   </button>
                   {showQR === addrInfo.address && (
                     <button
-                      onClick={() => { qrGeneration.current++; setShowQR(null); setQrSvg(null); setPaymentUri(null); }}
+                      onClick={() => { qrGeneration.current.address++; setShowQR(null); setAddressQrSvg(null); }}
                       className="bg-void-700 hover:bg-void-600 text-gray-100 rounded-lg px-3 py-1.5 text-xs transition-colors"
                     >
                       Hide QR
@@ -378,17 +387,19 @@ export function ReceiveView() {
                   </button>
                   {bip276ShowQR && (
                     <button
-                      onClick={() => { qrGeneration.current++; setBip276ShowQR(false); setQrSvg(null); }}
+                      onClick={() => { qrGeneration.current.script++; setBip276ShowQR(false); setScriptQrSvg(null); }}
                       className="bg-void-700 hover:bg-void-600 text-gray-100 rounded-lg px-3 py-1.5 text-xs transition-colors"
                     >
                       Hide QR
                     </button>
                   )}
                 </div>
-                {bip276ShowQR && qrSvg && (
+                {bip276ShowQR && scriptQrSvg && (
                   <div
+                    role="img"
+                    aria-label="Script URI QR code"
                     className="w-32 h-32 rounded-lg bg-white p-1 mt-2"
-                    dangerouslySetInnerHTML={{ __html: qrSvg }}
+                    dangerouslySetInnerHTML={{ __html: scriptQrSvg }}
                   />
                 )}
               </div>

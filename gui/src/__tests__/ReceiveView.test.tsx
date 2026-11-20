@@ -124,7 +124,7 @@ describe('ReceiveView', () => {
     expect(screen.getByPlaceholderText('Amount (satoshis)')).not.toBeDisabled();
   });
 
-  it('invalidates a pending address QR when parsing a BIP276 URI', async () => {
+  it('keeps a pending address QR separate when parsing a BIP276 URI', async () => {
     let finishQr!: (value: any) => void;
     mockApi.generateQr.mockReturnValueOnce(new Promise(resolve => { finishQr = resolve; }));
     mockApi.parseBip276Uri.mockResolvedValue({ valid: true, prefix: 'bitcoin-script', version: 1, network: 1, data_hex: 'deadbeef', error: null });
@@ -134,7 +134,34 @@ describe('ReceiveView', () => {
     fireEvent.click(screen.getByText('Parse'));
     await screen.findByText('deadbeef');
     await act(async () => finishQr({ svg: '<svg id="stale-qr"></svg>' }));
-    expect(document.querySelector('#stale-qr')).toBeNull();
+    expect(document.querySelector('#stale-qr')).not.toBeNull();
+  });
+
+  it('shows a payment request QR only alongside its own payment URI', async () => {
+    mockApi.listReceiveAddresses.mockResolvedValue([{ address: 'address-a', keyinstance_id: 1, derivation_index: 0 }, { address: 'address-b', keyinstance_id: 2, derivation_index: 1 }]);
+    mockApi.createPaymentRequest.mockResolvedValue({ uri: 'bitcoinsv:request-address?amount=1', address: 'request-address', amount: 100000000, label: null, paymentrequest_id: 1 });
+    mockApi.generateQr.mockResolvedValue({ svg: '<svg id="request-qr"></svg>' });
+    render(<ReceiveView />); await screen.findByText('address-a');
+    fireEvent.click(screen.getByText('Request'));
+    const uri = await screen.findByText('bitcoinsv:request-address?amount=1');
+    await waitFor(() => expect(document.querySelectorAll('#request-qr')).toHaveLength(1));
+    expect(uri.closest('.bg-void-900')?.querySelector('#request-qr')).not.toBeNull();
+    expect(screen.getAllByText('Show QR')).toHaveLength(2);
+  });
+
+  it('keeps a visible address QR separate from a later script QR', async () => {
+    mockApi.listReceiveAddresses.mockResolvedValue([{ address: 'address-a', keyinstance_id: 1, derivation_index: 0 }]);
+    mockApi.generateQr.mockResolvedValueOnce({ svg: '<svg id="address-qr"></svg>' }).mockResolvedValueOnce({ svg: '<svg id="script-qr"></svg>' });
+    mockApi.parseBip276Uri.mockResolvedValue({ valid: true, prefix: 'bitcoin-script', version: 1, network: 1, data_hex: 'deadbeef', error: null });
+    render(<ReceiveView />); await screen.findByText('address-a');
+    fireEvent.click(screen.getByText('Show QR'));
+    await waitFor(() => expect(document.querySelector('#address-qr')).not.toBeNull());
+    fireEvent.change(screen.getByPlaceholderText('bitcoin-script://...'), { target: { value: 'bitcoin-script://test' } });
+    fireEvent.click(screen.getByText('Parse'));
+    await screen.findByText('deadbeef');
+    fireEvent.click(screen.getByText('Show QR'));
+    await waitFor(() => expect(document.querySelectorAll('#script-qr')).toHaveLength(1));
+    expect(document.querySelectorAll('#address-qr')).toHaveLength(1);
   });
 
   it('New Address button calls getReceiveAddress', async () => {
